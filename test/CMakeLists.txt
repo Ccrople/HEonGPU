@@ -35,6 +35,10 @@ set(EXECUTABLES
     ckks_relinearization_testcases test_ckks_relinearization.cpp
     ckks_rotation_method_1_testcases test_ckks_rotation_method_1.cpp
     ckks_rotation_method_2_testcases test_ckks_rotation_method_2.cpp
+    ckks_batchmatrix_testcases test_ckks_batchmatrix.cpp
+    ckks_ntt_ordering_testcases test_ckks_ntt_ordering.cpp
+    ckks_batchmatrix_gpu_testcases test_ckks_batchmatrix_gpu.cpp
+    ckks_batchmatrix_sweep_testcases test_ckks_batchmatrix_sweep.cpp
 
     tfhe_gate_boot_testcases test_tfhe_gate_boot.cpp
 )

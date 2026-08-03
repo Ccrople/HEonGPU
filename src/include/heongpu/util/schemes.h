@@ -66,6 +66,8 @@ namespace heongpu
 
     template <Scheme S> class HEMultiPartyManager;
 
+    template <Scheme S> class HEBatchMatrixOperator;
+
     // Describes the type of encryption scheme to be used.
     enum class scheme_type : std::uint8_t
     {

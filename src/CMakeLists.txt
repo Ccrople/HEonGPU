@@ -78,6 +78,7 @@ set_target_properties(heongpu_util PROPERTIES
 
 set(HEONGPU_KERNEL_SOURCES
     lib/kernel/addition.cu
+    lib/kernel/batchmatrix.cu
     lib/kernel/bootstrapping.cu
     lib/kernel/contextpool.cpp
     lib/kernel/decryption.cu
@@ -171,6 +172,7 @@ set_target_properties(heongpu_host_bfv PROPERTIES
 )
 
 set(HEONGPU_HOST_CKKS_SOURCES
+    lib/host/ckks/batchmatrix.cu
     lib/host/ckks/chebyshev_interpolation.cu
     lib/host/ckks/ciphertext.cu
     lib/host/ckks/context.cu
