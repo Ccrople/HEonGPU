@@ -1034,6 +1034,64 @@ namespace heongpu
                               Galoiskey<Scheme::CKKS>& boot_key,
                               Relinkey<Scheme::CKKS>& relin_key);
 
+            /** @brief Settings of a run of blocks, one entry per block. */
+            struct TransformerStackConfig
+            {
+                /// The blocks, in the order they run.
+                ///
+                /// Every block of Llama-3 has the same shape, so these agree
+                /// on strides, degrees and head counts. They do not agree on
+                /// the intervals the approximations are fitted over: each
+                /// block meets its own distribution of activations, and a
+                /// Chebyshev fit is worth nothing outside the interval it was
+                /// fitted on. That is why a stack is a config per block and
+                /// not one config and a count.
+                std::vector<TransformerBlockConfig> blocks;
+
+                /// Refresh the stream at the seam between one block and the
+                /// next.
+                ///
+                /// A block already refreshes once, between its halves, and
+                /// hands back a stream with only what the SwiGLU half did not
+                /// spend. That is nowhere near what the next block's attention
+                /// half wants, so a stack costs two bootstraps per block and
+                /// not one.
+                bool bootstrap_between_blocks = true;
+            };
+
+            /** @brief Rotations a whole stack needs a Galois key for. */
+            static std::vector<int> transformer_stack_rotation_indices(
+                const TransformerStackConfig& config);
+
+            /**
+             * @brief A run of transformer blocks: the body of the model.
+             *
+             * The chain a stack needs is not set by the block but by the
+             * deepest *half* of a block, and that is a different number. A
+             * block starts on a full chain and only has to fit its second half
+             * into what the refresh in its middle hands back. Every block
+             * after the first starts on a refreshed chain instead, so its
+             * attention half has to fit there too — and the attention half is
+             * the deeper of the two by a long way. A chain that runs one block
+             * will therefore not run two.
+             *
+             * The stream is left as the last block produced it, unrefreshed,
+             * so a caller has the SwiGLU half's remainder to spend on whatever
+             * reads the stack.
+             *
+             * @param galois_key The blocks' rotations,
+             *                   transformer_stack_rotation_indices.
+             * @param boot_key   Bootstrapping's own rotations, which are a
+             *                   different list.
+             */
+            std::vector<Ciphertext<Scheme::CKKS>>
+            transformer_stack(std::vector<Ciphertext<Scheme::CKKS>>& x,
+                              std::vector<TransformerBlockWeights>& weights,
+                              const TransformerStackConfig& config,
+                              Galoiskey<Scheme::CKKS>& galois_key,
+                              Galoiskey<Scheme::CKKS>& boot_key,
+                              Relinkey<Scheme::CKKS>& relin_key);
+
           private:
             /// The prime the next rescale of @p ct will divide by.
             double rescale_prime(const Ciphertext<Scheme::CKKS>& ct) const;

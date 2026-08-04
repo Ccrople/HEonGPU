@@ -2530,5 +2530,65 @@ namespace heongpu
             return residual_add(stream, sublayer);
         }
 
+        std::vector<int> Llama3Operator::transformer_stack_rotation_indices(
+            const TransformerStackConfig& config)
+        {
+            // In practice this is one block's list, because the blocks of a
+            // stack agree on shape and only their fitted intervals differ.
+            // Taking the union makes that a property of the configs handed in
+            // rather than an assumption about them.
+            std::set<int> indices;
+            for (const TransformerBlockConfig& block : config.blocks)
+            {
+                for (int r : transformer_block_rotation_indices(block))
+                {
+                    indices.insert(r);
+                }
+            }
+            return std::vector<int>(indices.begin(), indices.end());
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>> Llama3Operator::transformer_stack(
+            std::vector<Ciphertext<Scheme::CKKS>>& x,
+            std::vector<TransformerBlockWeights>& weights,
+            const TransformerStackConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Galoiskey<Scheme::CKKS>& boot_key, Relinkey<Scheme::CKKS>& relin_key)
+        {
+            if (weights.empty())
+            {
+                throw std::invalid_argument("A transformer stack needs at "
+                                            "least one block");
+            }
+            if (weights.size() != config.blocks.size())
+            {
+                throw std::invalid_argument("A transformer stack needs one "
+                                            "config per block");
+            }
+
+            std::vector<Ciphertext<Scheme::CKKS>> stream =
+                transformer_block(x, weights[0], config.blocks[0], galois_key,
+                                  boot_key, relin_key);
+
+            for (std::size_t block = 1; block < weights.size(); block++)
+            {
+                // The seam is the second refresh a block costs. The stream
+                // arrives here with what the SwiGLU half left, which is a
+                // handful of levels, and the attention half about to read it
+                // wants thirty. This refresh is the same operation the block
+                // performs in its own middle; a stack simply needs one at
+                // every seam as well.
+                if (config.bootstrap_between_blocks)
+                {
+                    stream = bootstrap(stream, boot_key, relin_key);
+                }
+                stream =
+                    transformer_block(stream, weights[block],
+                                      config.blocks[block], galois_key,
+                                      boot_key, relin_key);
+            }
+            return stream;
+        }
+
     } // namespace llama
 } // namespace heongpu

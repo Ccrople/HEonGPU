@@ -49,6 +49,7 @@
 #include <memory>
 #include <random>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -384,6 +385,110 @@ namespace
                                         query[m], d);
         }
         return out;
+    }
+
+    /// The plaintext weights of one block, in the host's block form.
+    struct BlockWeightsHost
+    {
+        ChannelBlock query;
+        ChannelBlock key;
+        ChannelBlock value;
+        ChannelBlock gate;
+        ChannelBlock up;
+        ChannelBlock down;
+    };
+
+    /// What one host block leaves behind: its output, the residual stream
+    /// halfway through it, and the widest gate the SiLU fit has to cover.
+    struct BlockHostRun
+    {
+        ChannelBlock out;
+        /// After the attention half's residual, which is what the refresh in
+        /// the middle of the block is handed.
+        ChannelBlock stream;
+        double widest_gate = 0.0;
+    };
+
+    /// One whole transformer block on the host, and the calibration that goes
+    /// with it.
+    ///
+    /// The parts of @p config a caller cannot know in advance are filled in
+    /// here, because they are properties of the activations and not of the
+    /// architecture: the interval each norm's reciprocal square root is fitted
+    /// over, and the scale and shift that carry the scores into the SoftMax's
+    /// fitted interval. In a stack no two blocks see the same activations, so
+    /// no two blocks get the same numbers. The caller sets the shapes and the
+    /// degrees; this sets the ranges.
+    ///
+    /// The second norm takes its shape from the first, which is what a
+    /// pre-norm block does, and then gets its own interval.
+    ///
+    /// RoPE is not applied. Every caller here runs without it, and a
+    /// reference that pretended otherwise would be untested code.
+    BlockHostRun transformer_block_host(
+        const ChannelBlock& x, const BlockWeightsHost& w,
+        llama::Llama3Operator::TransformerBlockConfig& config,
+        const llama::MatrixLayout& layout)
+    {
+        const int d = layout.d;
+
+        const std::vector<double> x_slots = pack_blocks(x, layout);
+        square_sum_range(x_slots, config.attention_norm);
+        const ChannelBlock normed =
+            unpack_blocks(rms_norm_host(x_slots, config.attention_norm),
+                          layout);
+
+        const ChannelBlock q = matmul_block(w.query, normed, d);
+        const ChannelBlock k = matmul_block(w.key, normed, d);
+        const ChannelBlock v = matmul_block(w.value, normed, d);
+        const ChannelBlock raw = scores_host(k, q, d);
+
+        double lowest = 0.0;
+        double highest = 0.0;
+        score_range({raw}, lowest, highest);
+        config.attention.head_scale = 2.0 / (highest - lowest);
+        config.attention.score_shift = highest * config.attention.head_scale;
+
+        const ChannelBlock probabilities =
+            causal_softmax_host(raw, config.attention.head_scale,
+                                config.attention.score_shift, d);
+
+        // The residual stream after the attention half. This is what the
+        // refresh in the middle of the block is handed, and what the second
+        // norm reduces over.
+        ChannelBlock stream = matmul_block(v, probabilities, d);
+        add_into(stream, x);
+        const std::vector<double> stream_slots = pack_blocks(stream, layout);
+
+        config.feed_forward_norm = config.attention_norm;
+        square_sum_range(stream_slots, config.feed_forward_norm);
+        const ChannelBlock stream_normed = unpack_blocks(
+            rms_norm_host(stream_slots, config.feed_forward_norm), layout);
+
+        BlockHostRun run;
+        run.stream = stream;
+        run.out.resize(layout.batch);
+        for (int m = 0; m < layout.batch; m++)
+        {
+            const std::vector<double> g =
+                llama::matmul_host(w.gate[m], stream_normed[m], d);
+            const std::vector<double> u =
+                llama::matmul_host(w.up[m], stream_normed[m], d);
+            std::vector<double> hidden(g.size());
+            for (std::size_t e = 0; e < g.size(); e++)
+            {
+                run.widest_gate = std::max(run.widest_gate, std::abs(g[e]));
+                hidden[e] = silu_host(g[e]) * u[e];
+            }
+            const std::vector<double> out =
+                llama::matmul_host(w.down[m], hidden, d);
+            run.out[m].resize(out.size());
+            for (std::size_t e = 0; e < out.size(); e++)
+            {
+                run.out[m][e] = stream[m][e] + out[e];
+            }
+        }
+        return run;
     }
 
     // -----------------------------------------------------------------------
@@ -3668,11 +3773,24 @@ namespace
     {
       protected:
         static constexpr int kDegree = 4096;
-        /// A bootstrap keeps the chain less twenty five here, so this is the
-        /// SwiGLU half's twenty levels with a little in hand.
-        /// BootstrappingBuysBackTheChain measures the twenty three.
-        static constexpr int kLimbs = 48;
         static constexpr int kD = 8;
+
+        /// What each half of a block spends, as measured by
+        /// EachHalfOfABlockCostsWhatAChainMustCover at the settings both it
+        /// and the whole-block tests use. Fifty three together, which is why
+        /// a block does not fit on any chain here without a refresh.
+        static constexpr int kAttentionHalf = 32;
+        static constexpr int kSwiGLUHalf = 21;
+
+        /// The chain, which a derived fixture raises.
+        ///
+        /// Forty eight is what one block wants: a bootstrap keeps twenty five
+        /// of them and the twenty three left over cover the SwiGLU half's
+        /// twenty one. They do not cover the attention half's thirty two,
+        /// which is why a stack of blocks needs Llama3StackEnv's longer chain
+        /// and not this one. BootstrappingBuysBackTheChain measures the
+        /// twenty three.
+        virtual int limbs() const { return 48; }
         /// The shipped bootstrapping example's configuration.
         static constexpr int kCtoSPiece = 3;
         static constexpr int kStoCPiece = 3;
@@ -3705,7 +3823,7 @@ namespace
         void SetUp() override
         {
             std::vector<int> logq{60};
-            logq.insert(logq.end(), kLimbs - 1, kPrimeBits);
+            logq.insert(logq.end(), limbs() - 1, kPrimeBits);
             context->set_poly_modulus_degree(kDegree);
             context->set_coeff_modulus_bit_sizes(logq, {60, 60, 60});
             context->generate();
@@ -3776,7 +3894,13 @@ namespace
         /// Moduli still available to spend.
         int levels_left(heongpu::Ciphertext<S>& cipher) const
         {
-            return kLimbs - cipher.depth();
+            return limbs() - cipher.depth();
+        }
+
+        /// What a bootstrap hands back on this chain.
+        int levels_after_a_refresh() const
+        {
+            return limbs() - (kCtoSPiece + kTaylor + kStoCPiece + 8);
         }
     };
 
@@ -3795,7 +3919,7 @@ namespace
         const std::vector<double> packed = pack_blocks(blocks, layout);
 
         heongpu::Ciphertext<S> cipher = encrypt(packed);
-        ops->drop_to_depth(cipher, kLimbs - 1);
+        ops->drop_to_depth(cipher, limbs() - 1);
         ASSERT_EQ(levels_left(cipher), 1);
 
         heongpu::Ciphertext<S> refreshed =
@@ -3803,12 +3927,12 @@ namespace
 
         const int usable = levels_left(refreshed);
         std::cout << "[ MEASURED ] bootstrap returns " << usable << " of "
-                  << kLimbs << " levels" << std::endl;
+                  << limbs() << " levels" << std::endl;
 
         // The slice a bootstrap keeps is CtoS + taylor + StoC + 8, and that
         // is the arithmetic the whole-block test's budget rests on, so it is
         // pinned here rather than left as a comment.
-        EXPECT_EQ(usable, kLimbs - (kCtoSPiece + kTaylor + kStoCPiece + 8));
+        EXPECT_EQ(usable, levels_after_a_refresh());
 
         // Bootstrapping is the least accurate thing in this file by a wide
         // margin: the sine standing in for the modular reduction is a
@@ -3837,26 +3961,19 @@ namespace
         const double weight_scale = 1.0 / std::sqrt(static_cast<double>(d));
 
         std::mt19937_64 rng(1002);
-        const std::vector<std::vector<double>> x =
-            random_blocks(layout, 1.0, rng);
-        const std::vector<std::vector<double>> wq =
-            random_blocks(layout, weight_scale, rng);
-        const std::vector<std::vector<double>> wk =
-            random_blocks(layout, weight_scale, rng);
-        const std::vector<std::vector<double>> wv =
-            random_blocks(layout, weight_scale, rng);
-        const std::vector<std::vector<double>> gate =
-            random_blocks(layout, weight_scale, rng);
-        const std::vector<std::vector<double>> up =
-            random_blocks(layout, weight_scale, rng);
-        const std::vector<std::vector<double>> down =
-            random_blocks(layout, weight_scale, rng);
+        const ChannelBlock x = random_blocks(layout, 1.0, rng);
+        BlockWeightsHost host_weights;
+        host_weights.query = random_blocks(layout, weight_scale, rng);
+        host_weights.key = random_blocks(layout, weight_scale, rng);
+        host_weights.value = random_blocks(layout, weight_scale, rng);
+        host_weights.gate = random_blocks(layout, weight_scale, rng);
+        host_weights.up = random_blocks(layout, weight_scale, rng);
+        host_weights.down = random_blocks(layout, weight_scale, rng);
 
         llama::Llama3Operator::TransformerBlockConfig config;
         config.bootstrap = true;
 
         // The pre-attention norm, over the channels of the one block.
-        const std::vector<double> x_slots = pack_blocks(x, layout);
         config.attention_norm.stride = d * layout.batch;
         config.attention_norm.count = d;
         config.attention_norm.channels = d;
@@ -3866,105 +3983,46 @@ namespace
         // wants the level more than the norm wants its last digit, and against
         // a bootstrap's own error the difference is invisible anyway.
         config.attention_norm.newton_iterations = 0;
-        square_sum_range(x_slots, config.attention_norm);
-
-        const std::vector<std::vector<double>> normed =
-            unpack_blocks(rms_norm_host(x_slots, config.attention_norm),
-                          layout);
-
-        std::vector<std::vector<double>> q(layout.batch);
-        std::vector<std::vector<double>> k(layout.batch);
-        std::vector<std::vector<double>> v(layout.batch);
-        std::vector<std::vector<double>> raw(layout.batch);
-        double lowest = std::numeric_limits<double>::max();
-        double highest = std::numeric_limits<double>::lowest();
-        for (int m = 0; m < layout.batch; m++)
-        {
-            q[m] = llama::matmul_host(wq[m], normed[m], d);
-            k[m] = llama::matmul_host(wk[m], normed[m], d);
-            v[m] = llama::matmul_host(wv[m], normed[m], d);
-            raw[m] =
-                llama::matmul_host(llama::transpose_host(k[m], d), q[m], d);
-            for (double s : raw[m])
-            {
-                lowest = std::min(lowest, s);
-                highest = std::max(highest, s);
-            }
-        }
 
         config.attention.layout = layout;
         config.attention.causal = true;
         config.attention.rope = false;
-        config.attention.head_scale = 2.0 / (highest - lowest);
-        config.attention.score_shift = highest * config.attention.head_scale;
         config.attention.softmax.bound = 2.0;
         config.attention.softmax.iterations = 1;
         config.attention.softmax.exp_degree = 15;
         config.attention.softmax.inverse_degree = 15;
         config.attention.softmax.inverse_newton = 1;
 
-        // The residual stream after the attention half, which is what the
-        // refresh is handed and what the second norm reduces over.
-        const ChannelBlock probabilities =
-            causal_softmax_host(raw, config.attention.head_scale,
-                                config.attention.score_shift, d);
-        ChannelBlock stream = matmul_block(v, probabilities, d);
-        for (int m = 0; m < layout.batch; m++)
-        {
-            for (std::size_t e = 0; e < stream[m].size(); e++)
-            {
-                stream[m][e] += x[m][e];
-            }
-        }
-        const std::vector<double> stream_slots = pack_blocks(stream, layout);
-
-        config.feed_forward_norm = config.attention_norm;
-        square_sum_range(stream_slots, config.feed_forward_norm);
-
-        const std::vector<std::vector<double>> stream_normed = unpack_blocks(
-            rms_norm_host(stream_slots, config.feed_forward_norm), layout);
-
         config.feed_forward.layout = layout;
         config.feed_forward.silu_bound = 4.0;
         config.feed_forward.silu_degree = 31;
 
-        std::vector<std::vector<double>> want(layout.batch);
-        double widest = 0.0;
-        for (int m = 0; m < layout.batch; m++)
-        {
-            const std::vector<double> g =
-                llama::matmul_host(gate[m], stream_normed[m], d);
-            const std::vector<double> u =
-                llama::matmul_host(up[m], stream_normed[m], d);
-            std::vector<double> hidden(g.size());
-            for (std::size_t e = 0; e < g.size(); e++)
-            {
-                widest = std::max(widest, std::abs(g[e]));
-                hidden[e] = silu_host(g[e]) * u[e];
-            }
-            const std::vector<double> out =
-                llama::matmul_host(down[m], hidden, d);
-            want[m].resize(out.size());
-            for (std::size_t e = 0; e < out.size(); e++)
-            {
-                want[m][e] = stream[m][e] + out[e];
-            }
-        }
-        ASSERT_LT(widest, config.feed_forward.silu_bound);
+        // Fills in the two norms' intervals and the score scale and shift,
+        // which are the parts of the config that come from the data.
+        const BlockHostRun want =
+            transformer_block_host(x, host_weights, config, layout);
+        ASSERT_LT(want.widest_gate, config.feed_forward.silu_bound);
 
         llama::Llama3Operator::TransformerBlockWeights weights;
-        weights.attention.query = llama::BlockMatrix(flatten_block(wq));
-        weights.attention.key = llama::BlockMatrix(flatten_block(wk));
-        weights.attention.value = llama::BlockMatrix(flatten_block(wv));
-        weights.feed_forward.gate = llama::BlockMatrix(flatten_block(gate));
-        weights.feed_forward.up = llama::BlockMatrix(flatten_block(up));
-        weights.feed_forward.down = llama::BlockMatrix(flatten_block(down));
+        weights.attention.query =
+            llama::BlockMatrix(flatten_block(host_weights.query));
+        weights.attention.key =
+            llama::BlockMatrix(flatten_block(host_weights.key));
+        weights.attention.value =
+            llama::BlockMatrix(flatten_block(host_weights.value));
+        weights.feed_forward.gate =
+            llama::BlockMatrix(flatten_block(host_weights.gate));
+        weights.feed_forward.up =
+            llama::BlockMatrix(flatten_block(host_weights.up));
+        weights.feed_forward.down =
+            llama::BlockMatrix(flatten_block(host_weights.down));
 
         // Exactly the list the block advertises, and nothing more. The
         // bootstrapping indices are a separate key on purpose.
         auto key = narrow_key(
             llama::Llama3Operator::transformer_block_rotation_indices(config));
 
+        const std::vector<double> x_slots = pack_blocks(x, layout);
         std::vector<heongpu::Ciphertext<S>> in{encrypt(x_slots)};
         std::vector<heongpu::Ciphertext<S>> got = ops->transformer_block(
             in, weights, config, *key, *boot_galois, *relin);
@@ -3975,7 +4033,7 @@ namespace
         // in ten of what the bootstrap alone delivers, so the SwiGLU half that
         // follows it adds almost nothing to the error it inherits.
         EXPECT_LT(reported("transformer block", decrypt(got[0]),
-                           pack_blocks(want, layout)),
+                           pack_blocks(want.out, layout)),
                   5e-3);
 
         // And the refresh is not decorative. The same block, the same chain,
@@ -3986,6 +4044,310 @@ namespace
         std::vector<heongpu::Ciphertext<S>> again{encrypt(x_slots)};
         EXPECT_ANY_THROW(ops->transformer_block(again, weights, without, *key,
                                                 *boot_galois, *relin));
+    }
+
+    /// What each half of a block costs, which is the number that decides how
+    /// long a chain has to be.
+    ///
+    /// Neither half is bootstrapped here, so both are cheap to measure: each
+    /// one starts on a fresh chain and the depth it ends at is the depth it
+    /// spent. Only the depths are checked. The second half is run on the
+    /// stream the host says it would receive, so its config is calibrated for
+    /// what it is handed, but its output is left to the whole-block test.
+    ///
+    /// The two inequalities below are the whole of the level argument. A
+    /// refresh covers the SwiGLU half, so a block that starts on a full chain
+    /// runs. It does not cover the attention half, so a block that starts on
+    /// a refreshed one does not, and every block of a stack but the first
+    /// starts on a refreshed one.
+    TEST_F(Llama3BootstrapEnv, EachHalfOfABlockCostsWhatAChainMustCover)
+    {
+        const int d = layout.d;
+        const double weight_scale = 1.0 / std::sqrt(static_cast<double>(d));
+
+        std::mt19937_64 rng(1004);
+        const ChannelBlock x = random_blocks(layout, 1.0, rng);
+        BlockWeightsHost host_weights;
+        host_weights.query = random_blocks(layout, weight_scale, rng);
+        host_weights.key = random_blocks(layout, weight_scale, rng);
+        host_weights.value = random_blocks(layout, weight_scale, rng);
+        host_weights.gate = random_blocks(layout, weight_scale, rng);
+        host_weights.up = random_blocks(layout, weight_scale, rng);
+        host_weights.down = random_blocks(layout, weight_scale, rng);
+
+        llama::Llama3Operator::TransformerBlockConfig config;
+        config.attention_norm.stride = d * layout.batch;
+        config.attention_norm.count = d;
+        config.attention_norm.channels = d;
+        config.attention_norm.eps = 1e-5;
+        config.attention_norm.degree = 31;
+        config.attention_norm.newton_iterations = 0;
+        config.attention.layout = layout;
+        config.attention.causal = true;
+        config.attention.rope = false;
+        config.attention.softmax.bound = 2.0;
+        config.attention.softmax.iterations = 1;
+        config.attention.softmax.exp_degree = 15;
+        config.attention.softmax.inverse_degree = 15;
+        config.attention.softmax.inverse_newton = 1;
+        config.feed_forward.layout = layout;
+        config.feed_forward.silu_bound = 4.0;
+        config.feed_forward.silu_degree = 31;
+
+        const BlockHostRun host =
+            transformer_block_host(x, host_weights, config, layout);
+        ASSERT_LT(host.widest_gate, config.feed_forward.silu_bound);
+
+        llama::Llama3Operator::TransformerBlockWeights weights;
+        weights.attention.query =
+            llama::BlockMatrix(flatten_block(host_weights.query));
+        weights.attention.key =
+            llama::BlockMatrix(flatten_block(host_weights.key));
+        weights.attention.value =
+            llama::BlockMatrix(flatten_block(host_weights.value));
+        weights.feed_forward.gate =
+            llama::BlockMatrix(flatten_block(host_weights.gate));
+        weights.feed_forward.up =
+            llama::BlockMatrix(flatten_block(host_weights.up));
+        weights.feed_forward.down =
+            llama::BlockMatrix(flatten_block(host_weights.down));
+
+        auto key = narrow_key(
+            llama::Llama3Operator::transformer_block_rotation_indices(config));
+
+        std::vector<heongpu::Ciphertext<S>> first{
+            encrypt(pack_blocks(x, layout))};
+        std::vector<heongpu::Ciphertext<S>> normed =
+            ops->rms_norm(first, weights.attention_norm, config.attention_norm,
+                          *key, *relin);
+        std::vector<heongpu::Ciphertext<S>> sublayer =
+            ops->attention(normed, weights.attention, weights.rope,
+                           config.attention, *key, *relin);
+        std::vector<heongpu::Ciphertext<S>> stream =
+            ops->residual_add(first, sublayer);
+        const int attention_half = stream[0].depth();
+
+        std::vector<heongpu::Ciphertext<S>> second{
+            encrypt(pack_blocks(host.stream, layout))};
+        std::vector<heongpu::Ciphertext<S>> renormed =
+            ops->rms_norm(second, weights.feed_forward_norm,
+                          config.feed_forward_norm, *key, *relin);
+        std::vector<heongpu::Ciphertext<S>> swiglu =
+            ops->feed_forward(renormed, weights.feed_forward,
+                              config.feed_forward, *key, *relin);
+        std::vector<heongpu::Ciphertext<S>> out =
+            ops->residual_add(second, swiglu);
+        const int swiglu_half = out[0].depth();
+
+        std::cout << "[ MEASURED ] the attention half costs " << attention_half
+                  << " levels and the SwiGLU half " << swiglu_half
+                  << ", against " << levels_after_a_refresh()
+                  << " a refresh hands back on a chain of " << limbs()
+                  << std::endl;
+
+        // Why one block runs on this chain, and why it needs the refresh.
+        EXPECT_LE(swiglu_half, levels_after_a_refresh());
+        EXPECT_GT(attention_half + swiglu_half, limbs());
+
+        // And why a stack does not run on it. Every block after the first
+        // begins where a refresh left off.
+        EXPECT_GT(attention_half, levels_after_a_refresh());
+
+        // The two numbers themselves, because the stack fixture's chain is
+        // chosen from them and its leftover levels are checked against them.
+        // A change in the sublayers moves these, and this is where it should
+        // be noticed.
+        EXPECT_EQ(attention_half, kAttentionHalf);
+        EXPECT_EQ(swiglu_half, kSwiGLUHalf);
+    }
+
+    /// The same environment on the chain a run of blocks needs.
+    ///
+    /// A block gets away with forty eight because it starts on a full chain,
+    /// so only its second half has to fit into what a refresh hands back.
+    /// Every block after the first starts on a refreshed chain instead, so the
+    /// deeper half has to fit there too. Sixty leaves thirty five after a
+    /// refresh, against the attention half's thirty two: three in hand, and
+    /// fifty six would have been the smallest chain that worked at all.
+    ///
+    /// Nothing else changes: the same sparse secret, the same fifty bit primes
+    /// over a sixty bit bottom, the same bootstrapping configuration.
+    class Llama3StackEnv : public Llama3BootstrapEnv
+    {
+      protected:
+        int limbs() const override { return 60; }
+    };
+
+    /// Transformer blocks run one after another, which is the model's body.
+    ///
+    /// A stack is not a longer block. Each block refreshes once in its own
+    /// middle, and the stack refreshes again at every seam, so three blocks
+    /// cost five bootstraps and Llama-3's thirty two would cost sixty three.
+    /// The seam is not optional: a block hands back a stream with only what
+    /// its SwiGLU half did not spend, and the next block's attention half
+    /// wants a chain as long as the one the first block started on.
+    ///
+    /// The stack is run at every prefix length and not only at the full one.
+    /// What matters about a stack of thirty two is not the error at three but
+    /// how the error grows per block, and a single total cannot separate a
+    /// block that adds error from a block that multiplies it. Three points
+    /// can, which is why there are three blocks here and not two.
+    ///
+    /// It adds. Averaged over six runs the three depths came out at 5.5e-4,
+    /// 9.7e-4 and 1.3e-3, so each block contributed about 3.5e-4 of its own
+    /// and inherited the rest unamplified. That is roughly what one bootstrap
+    /// delivers, and it is the answer one would want: the pre-norm at the top
+    /// of every block rescales the stream, so an error that arrives at a block
+    /// leaves it the same size instead of being multiplied by whatever the
+    /// block does. A thirty two block model would land near a percent at these
+    /// settings, which is a number one can plan around; a compounding error
+    /// would not have been.
+    TEST_F(Llama3StackEnv, BlocksStackAcrossTheirSeams)
+    {
+        const int d = layout.d;
+        const double weight_scale = 1.0 / std::sqrt(static_cast<double>(d));
+        constexpr int kBlocks = 3;
+
+        std::mt19937_64 rng(1005);
+        const ChannelBlock x = random_blocks(layout, 1.0, rng);
+
+        std::vector<BlockWeightsHost> host_weights(kBlocks);
+        for (BlockWeightsHost& w : host_weights)
+        {
+            w.query = random_blocks(layout, weight_scale, rng);
+            w.key = random_blocks(layout, weight_scale, rng);
+            w.value = random_blocks(layout, weight_scale, rng);
+            w.gate = random_blocks(layout, weight_scale, rng);
+            w.up = random_blocks(layout, weight_scale, rng);
+            w.down = random_blocks(layout, weight_scale, rng);
+        }
+
+        llama::Llama3Operator::TransformerStackConfig config;
+        config.bootstrap_between_blocks = true;
+        config.blocks.resize(kBlocks);
+
+        // Each block is calibrated on the stream the block before it produced,
+        // which is what a config per block is for: block two meets a wider
+        // stream than block one, and a fit made for block one would be
+        // extrapolating by the time it arrived.
+        std::vector<ChannelBlock> want(kBlocks);
+        ChannelBlock stream = x;
+        for (int l = 0; l < kBlocks; l++)
+        {
+            llama::Llama3Operator::TransformerBlockConfig& block =
+                config.blocks[l];
+            block.bootstrap = true;
+            block.attention_norm.stride = d * layout.batch;
+            block.attention_norm.count = d;
+            block.attention_norm.channels = d;
+            block.attention_norm.eps = 1e-5;
+            block.attention_norm.degree = 31;
+            block.attention_norm.newton_iterations = 0;
+
+            block.attention.layout = layout;
+            block.attention.causal = true;
+            block.attention.rope = false;
+            block.attention.softmax.bound = 2.0;
+            block.attention.softmax.iterations = 1;
+            block.attention.softmax.exp_degree = 15;
+            block.attention.softmax.inverse_degree = 15;
+            block.attention.softmax.inverse_newton = 1;
+
+            block.feed_forward.layout = layout;
+            block.feed_forward.silu_degree = 31;
+
+            const BlockHostRun run =
+                transformer_block_host(stream, host_weights[l], block, layout);
+
+            // The SiLU fit covers what this block's gate actually reaches,
+            // with a fifth in hand. One fixed bound for every block would
+            // extrapolate in the later ones or waste accuracy in the earlier.
+            block.feed_forward.silu_bound = 1.2 * run.widest_gate;
+            want[l] = run.out;
+            stream = run.out;
+        }
+
+        std::vector<llama::Llama3Operator::TransformerBlockWeights> weights(
+            kBlocks);
+        for (int l = 0; l < kBlocks; l++)
+        {
+            weights[l].attention.query =
+                llama::BlockMatrix(flatten_block(host_weights[l].query));
+            weights[l].attention.key =
+                llama::BlockMatrix(flatten_block(host_weights[l].key));
+            weights[l].attention.value =
+                llama::BlockMatrix(flatten_block(host_weights[l].value));
+            weights[l].feed_forward.gate =
+                llama::BlockMatrix(flatten_block(host_weights[l].gate));
+            weights[l].feed_forward.up =
+                llama::BlockMatrix(flatten_block(host_weights[l].up));
+            weights[l].feed_forward.down =
+                llama::BlockMatrix(flatten_block(host_weights[l].down));
+        }
+
+        // The blocks agree on shape, so this is one block's list; asking the
+        // stack for it rather than assuming that is the point.
+        auto key = narrow_key(
+            llama::Llama3Operator::transformer_stack_rotation_indices(config));
+
+        const std::vector<double> x_slots = pack_blocks(x, layout);
+
+        std::vector<double> measured(kBlocks, 0.0);
+        int leftover = 0;
+        for (int n = 1; n <= kBlocks; n++)
+        {
+            llama::Llama3Operator::TransformerStackConfig prefix = config;
+            prefix.blocks.resize(n);
+            std::vector<llama::Llama3Operator::TransformerBlockWeights> few(
+                weights.begin(), weights.begin() + n);
+
+            std::vector<heongpu::Ciphertext<S>> in{encrypt(x_slots)};
+            std::vector<heongpu::Ciphertext<S>> got = ops->transformer_stack(
+                in, few, prefix, *key, *boot_galois, *relin);
+            ASSERT_EQ(got.size(), std::size_t{1});
+
+            const std::string label = "stack of " + std::to_string(n);
+            measured[n - 1] = reported(label.c_str(), decrypt(got[0]),
+                                       pack_blocks(want[n - 1], layout));
+
+            // One block's allowance per block, which is the bootstrap's own
+            // bound: the measurement is that a block *adds* error rather than
+            // multiplying what it inherits, and this is the shape of bound
+            // that says so. Over six runs the worst at one, two and three
+            // blocks was 6.6e-4, 1.2e-3 and 2.0e-3, so the headroom here is a
+            // steady eight or so at every depth rather than one that erodes.
+            // Three blocks is not yet far enough for a linear allowance and a
+            // geometric one to part company; what rules out compounding is
+            // the series printed below, where the ratio falls off as the
+            // increment stays put.
+            EXPECT_LT(measured[n - 1], n * 5e-3);
+            leftover = levels_left(got[0]);
+        }
+
+        for (int n = 1; n < kBlocks; n++)
+        {
+            std::cout << "[ MEASURED ] block " << (n + 1) << " multiplied the "
+                      << "error by " << (measured[n] / measured[n - 1])
+                      << " and added " << (measured[n] - measured[n - 1])
+                      << std::endl;
+        }
+        std::cout << "[ MEASURED ] a stack of " << kBlocks << " leaves "
+                  << leftover << " of " << limbs() << " levels" << std::endl;
+
+        // The stream comes back as the last block left it, unrefreshed, with
+        // what that block's SwiGLU half did not spend. However many blocks ran
+        // is irrelevant: every one of them started from a refresh.
+        EXPECT_EQ(leftover, levels_after_a_refresh() - kSwiGLUHalf);
+
+        // A config per block is a requirement rather than a convenience, so a
+        // list that disagrees with the weights is refused instead of being
+        // stretched to fit.
+        llama::Llama3Operator::TransformerStackConfig one = config;
+        one.blocks.resize(1);
+        std::vector<heongpu::Ciphertext<S>> in_bad{encrypt(x_slots)};
+        EXPECT_THROW(ops->transformer_stack(in_bad, weights, one, *key,
+                                            *boot_galois, *relin),
+                     std::invalid_argument);
     }
 
 } // namespace
