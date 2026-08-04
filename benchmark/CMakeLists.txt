@@ -10,6 +10,7 @@ set(EXECUTABLES
     ckks_benchmark benchmark_ckks.cpp
     tfhe_benchmark benchmark_tfhe.cpp
     ckks_profile profile_ckks.cpp
+    llama3_profile profile_llama3.cpp
 )
 
 function(add_benchmark exe source)

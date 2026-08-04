@@ -4,9 +4,12 @@
 
 #include <heongpu/host/ckks/llama3.cuh>
 
+#include <nvtx3/nvToolsExt.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -18,6 +21,40 @@ namespace heongpu
     {
         namespace
         {
+            /// Scoped NVTX range, so a capture can attribute time to the part
+            /// of the model that issued it.
+            ///
+            /// The names are dotted and the ranges nest, so an nvtxppsum rolls
+            /// a model up by structure: "block" contains "attention" contains
+            /// "attention.scores" contains "ccmm". A parent's total therefore
+            /// includes its children's, which is what makes a fraction of the
+            /// forward pass readable straight off the summary.
+            struct Range
+            {
+                explicit Range(const char* name) { nvtxRangePushA(name); }
+                Range(const Range&) = delete;
+                Range& operator=(const Range&) = delete;
+                ~Range() { nvtxRangePop(); }
+            };
+
+            /// The same, for a range whose name carries an index.
+            ///
+            /// Blocks are numbered because the question a stack raises is
+            /// whether they cost the same, and one name for all of them cannot
+            /// answer it.
+            struct IndexedRange
+            {
+                IndexedRange(const char* format, int index)
+                {
+                    char name[64];
+                    std::snprintf(name, sizeof(name), format, index);
+                    nvtxRangePushA(name);
+                }
+                IndexedRange(const IndexedRange&) = delete;
+                IndexedRange& operator=(const IndexedRange&) = delete;
+                ~IndexedRange() { nvtxRangePop(); }
+            };
+
             bool is_power_of_two(int v)
             {
                 return v > 0 && (v & (v - 1)) == 0;
@@ -660,6 +697,7 @@ namespace heongpu
             Polynomial poly(static_cast<int>(coeffs.size()) - 1, complex_coeffs,
                             true, PolyType::CHEBYSHEV, a, b);
 
+            Range _r("chebyshev");
             return evaluate_poly(t, t.scale(), poly, relin_key,
                                  ExecutionOptions());
         }
@@ -854,6 +892,8 @@ namespace heongpu
             std::vector<Ciphertext<Scheme::CKKS>> out(
                 in.size(), Ciphertext<Scheme::CKKS>(context_));
 
+            Range _r_norm("rms_norm");
+
             // Each token block normalises over its own channels, so the two
             // never mix and the sequence length only says how to walk the
             // inputs.
@@ -863,26 +903,35 @@ namespace heongpu
                 // ciphertexts, so the squares are accumulated before the
                 // reduction and the mean covers every channel.
                 Ciphertext<Scheme::CKKS> total = in[s];
-                square(total, relin_key);
-                for (int j = 1; j < channel_blocks; j++)
                 {
-                    Ciphertext<Scheme::CKKS> term = in[j * token_blocks + s];
-                    square(term, relin_key);
-                    add_same_scale(total, term, "rms_norm channel sum");
+                    Range _r("rms_norm.sum_of_squares");
+                    square(total, relin_key);
+                    for (int j = 1; j < channel_blocks; j++)
+                    {
+                        Ciphertext<Scheme::CKKS> term =
+                            in[j * token_blocks + s];
+                        square(term, relin_key);
+                        add_same_scale(total, term, "rms_norm channel sum");
+                    }
+
+                    sum_strided(total, config.stride, config.count, galois_key);
+
+                    // mean + eps. Both are one cheap step on an already reduced
+                    // value.
+                    multiply_constant(
+                        total, 1.0 / static_cast<double>(config.channels));
+                    add_constant(total, config.eps);
                 }
 
-                sum_strided(total, config.stride, config.count, galois_key);
+                Ciphertext<Scheme::CKKS> scale_factor;
+                {
+                    Range _r("rms_norm.inverse_sqrt");
+                    scale_factor =
+                        inverse_sqrt(total, lo, hi, config.degree,
+                                     config.newton_iterations, relin_key);
+                }
 
-                // mean + eps. Both are one cheap step on an already reduced
-                // value.
-                multiply_constant(
-                    total, 1.0 / static_cast<double>(config.channels));
-                add_constant(total, config.eps);
-
-                Ciphertext<Scheme::CKKS> scale_factor =
-                    inverse_sqrt(total, lo, hi, config.degree,
-                                 config.newton_iterations, relin_key);
-
+                Range _r("rms_norm.rescale_channels");
                 for (int j = 0; j < channel_blocks; j++)
                 {
                     const std::size_t at = static_cast<std::size_t>(j) *
@@ -990,25 +1039,29 @@ namespace heongpu
 
             std::vector<Ciphertext<Scheme::CKKS>> y;
             y.reserve(parts.size());
-            for (std::size_t p = 0; p < parts.size(); p++)
             {
-                y.push_back(exp_scaled_negative(parts[p], config.bound,
-                                                config.iterations,
-                                                config.exp_degree, relin_key));
-
-                // Masking the exponentials rather than the scores removes a
-                // coordinate from the numerator and from the sum at once. The
-                // rounds below normalise, so a mask weight that is constant
-                // along the reduced axis cancels and only the pattern of zeros
-                // survives.
-                if (!masks.empty() && !masks[p].empty())
+                Range _r("softmax.exp");
+                for (std::size_t p = 0; p < parts.size(); p++)
                 {
-                    multiply_vector(y.back(), masks[p]);
+                    y.push_back(exp_scaled_negative(
+                        parts[p], config.bound, config.iterations,
+                        config.exp_degree, relin_key));
+
+                    // Masking the exponentials rather than the scores removes a
+                    // coordinate from the numerator and from the sum at once.
+                    // The rounds below normalise, so a mask weight that is
+                    // constant along the reduced axis cancels and only the
+                    // pattern of zeros survives.
+                    if (!masks.empty() && !masks[p].empty())
+                    {
+                        multiply_vector(y.back(), masks[p]);
+                    }
                 }
             }
 
             for (int round = 0; round < config.iterations; round++)
             {
+                Range _r_round("softmax.normalise_round");
                 // (y_i / ||y||_2)^2 is y_i^2 / sum_j y_j^2, so one squaring
                 // serves both the numerator and the sum.
                 std::vector<Ciphertext<Scheme::CKKS>> y_squared;
@@ -1059,9 +1112,12 @@ namespace heongpu
                     hi = 1.5;
                 }
 
-                Ciphertext<Scheme::CKKS> reciprocal =
-                    inverse(total, lo, hi, config.inverse_degree,
-                            config.inverse_newton, relin_key);
+                Ciphertext<Scheme::CKKS> reciprocal;
+                {
+                    Range _r("softmax.inverse");
+                    reciprocal = inverse(total, lo, hi, config.inverse_degree,
+                                         config.inverse_newton, relin_key);
+                }
 
                 for (std::size_t p = 0; p < y.size(); p++)
                 {
@@ -1182,22 +1238,27 @@ namespace heongpu
                     "the batch, or one per batch entry");
             }
 
+            Range _r_pcmm("pcmm");
+
             // Baby step: the row rotations of the ciphertext are shared by
             // every giant step, so they are taken once.
             const int row = d * batch;
             std::vector<Ciphertext<Scheme::CKKS>> rotated;
             rotated.reserve(baby);
-            for (int i = 0; i < baby; i++)
             {
-                if (i == 0)
+                Range _r("pcmm.baby_rotations");
+                for (int i = 0; i < baby; i++)
                 {
-                    rotated.push_back(ct);
-                }
-                else
-                {
-                    Ciphertext<Scheme::CKKS> shifted(context_);
-                    rotate_rows(ct, shifted, galois_key, i * row);
-                    rotated.push_back(shifted);
+                    if (i == 0)
+                    {
+                        rotated.push_back(ct);
+                    }
+                    else
+                    {
+                        Ciphertext<Scheme::CKKS> shifted(context_);
+                        rotate_rows(ct, shifted, galois_key, i * row);
+                        rotated.push_back(shifted);
+                    }
                 }
             }
 
@@ -1215,24 +1276,34 @@ namespace heongpu
                     // The rearranged plaintext is derived here rather than
                     // stored, which is what holds the weight footprint at a
                     // single copy of the matrix.
-                    std::vector<double> slots(slot_count_, 0.0);
-                    for (int m = 0; m < batch; m++)
+                    Plaintext<Scheme::CKKS> plain(context_);
                     {
-                        const double* source =
-                            a_stored.data() +
-                            (shared ? 0 : static_cast<std::size_t>(m) * entries);
-                        std::vector<double> matrix(source, source + entries);
-                        const std::vector<double> block = pcmm_plaintext_block(
-                            matrix, d, i, j, baby, ell);
-
-                        for (std::size_t e = 0; e < entries; e++)
+                        // Deriving and encoding the weight is host work in the
+                        // middle of a device pipeline, and every call repeats
+                        // it, so it gets its own range rather than being folded
+                        // into the multiply it feeds.
+                        Range _r("pcmm.weight_encode");
+                        std::vector<double> slots(slot_count_, 0.0);
+                        for (int m = 0; m < batch; m++)
                         {
-                            slots[e * batch + m] = block[e];
+                            const double* source =
+                                a_stored.data() +
+                                (shared ? 0
+                                        : static_cast<std::size_t>(m) * entries);
+                            std::vector<double> matrix(source,
+                                                       source + entries);
+                            const std::vector<double> block =
+                                pcmm_plaintext_block(matrix, d, i, j, baby, ell);
+
+                            for (std::size_t e = 0; e < entries; e++)
+                            {
+                                slots[e * batch + m] = block[e];
+                            }
                         }
+                        plain = encode(slots, plain_scale, ct.depth());
                     }
 
-                    Plaintext<Scheme::CKKS> plain =
-                        encode(slots, plain_scale, ct.depth());
+                    Range _r("pcmm.multiply_accumulate");
                     Ciphertext<Scheme::CKKS> term(context_);
                     multiply_plain(rotated[i], plain, term);
 
@@ -1254,6 +1325,7 @@ namespace heongpu
 
                 if (j > 0)
                 {
+                    Range _r("pcmm.giant_rotation");
                     Ciphertext<Scheme::CKKS> shifted(context_);
                     rotate_rows(inner, shifted, galois_key, j * baby * row);
                     inner = shifted;
@@ -1346,6 +1418,8 @@ namespace heongpu
             const int row = d * batch;
             const double plain_scale = rescale_prime(ct);
 
+            Range _r_tau("tau");
+
             Ciphertext<Scheme::CKKS> acc(context_);
             bool started = false;
             for (int u = 0; u < d; u++)
@@ -1395,6 +1469,8 @@ namespace heongpu
             const int batch = layout.batch;
             const int step = (d - 1) * batch;
             const double plain_scale = rescale_prime(ct);
+
+            Range _r_transpose("transpose");
 
             Ciphertext<Scheme::CKKS> acc(context_);
             bool started = false;
@@ -1460,26 +1536,31 @@ namespace heongpu
             const int batch = layout.batch;
             const int row = d * batch;
 
+            Range _r_ccmm("ccmm");
+
             Ciphertext<Scheme::CKKS> lhs = a;
             Ciphertext<Scheme::CKKS> rhs = b;
             align_levels(lhs, rhs);
 
             // Right operand: tau costs one level, and the d - 1 row rotations
             // that follow it cost none.
-            Ciphertext<Scheme::CKKS> tb = tau(rhs, layout, galois_key);
             std::vector<Ciphertext<Scheme::CKKS>> right;
             right.reserve(d);
-            for (int k = 0; k < d; k++)
             {
-                if (k == 0)
+                Range _r("ccmm.right_operand");
+                Ciphertext<Scheme::CKKS> tb = tau(rhs, layout, galois_key);
+                for (int k = 0; k < d; k++)
                 {
-                    right.push_back(tb);
-                }
-                else
-                {
-                    Ciphertext<Scheme::CKKS> shifted(context_);
-                    rotate_rows(tb, shifted, galois_key, k * row);
-                    right.push_back(shifted);
+                    if (k == 0)
+                    {
+                        right.push_back(tb);
+                    }
+                    else
+                    {
+                        Ciphertext<Scheme::CKKS> shifted(context_);
+                        rotate_rows(tb, shifted, galois_key, k * row);
+                        right.push_back(shifted);
+                    }
                 }
             }
 
@@ -1491,17 +1572,20 @@ namespace heongpu
             // cost separately.
             std::vector<Ciphertext<Scheme::CKKS>> diagonal;
             diagonal.reserve(2 * d - 1);
-            for (int s = -(d - 1); s <= d - 1; s++)
             {
-                if (s == 0)
+                Range _r("ccmm.left_diagonals");
+                for (int s = -(d - 1); s <= d - 1; s++)
                 {
-                    diagonal.push_back(lhs);
-                }
-                else
-                {
-                    Ciphertext<Scheme::CKKS> shifted(context_);
-                    rotate_rows(lhs, shifted, galois_key, s * batch);
-                    diagonal.push_back(shifted);
+                    if (s == 0)
+                    {
+                        diagonal.push_back(lhs);
+                    }
+                    else
+                    {
+                        Ciphertext<Scheme::CKKS> shifted(context_);
+                        rotate_rows(lhs, shifted, galois_key, s * batch);
+                        diagonal.push_back(shifted);
+                    }
                 }
             }
 
@@ -1532,18 +1616,23 @@ namespace heongpu
                 }
 
                 Ciphertext<Scheme::CKKS> left(context_);
-                bool left_started = false;
-                for (int t = 0; t < 2 * d - 1; t++)
                 {
-                    if (masks[t].empty())
+                    Range _r("ccmm.left_masking");
+                    bool left_started = false;
+                    for (int t = 0; t < 2 * d - 1; t++)
                     {
-                        continue;
+                        if (masks[t].empty())
+                        {
+                            continue;
+                        }
+                        accumulate_masked(left, left_started, diagonal[t],
+                                          masks[t], plain_scale,
+                                          "ccmm left operand");
                     }
-                    accumulate_masked(left, left_started, diagonal[t], masks[t],
-                                      plain_scale, "ccmm left operand");
+                    rescale_inplace(left);
                 }
-                rescale_inplace(left);
 
+                Range _r("ccmm.multiply");
                 Ciphertext<Scheme::CKKS> term(context_);
                 multiply(left, right[k], term);
 
@@ -1560,6 +1649,7 @@ namespace heongpu
                 }
             }
 
+            Range _r("ccmm.relinearize");
             relinearize_inplace(product, relin_key);
             rescale_inplace(product);
             return product;
@@ -1734,6 +1824,15 @@ namespace heongpu
             std::vector<Ciphertext<Scheme::CKKS>> out;
             out.reserve(static_cast<std::size_t>(weight.out_blocks) *
                         token_blocks);
+
+            // Named after the weight, because what a capture wants to know
+            // about a block product is which of them it was. The prefix keeps
+            // it distinct from the sublayer range of the same name: "head" is
+            // the norm and the projection together, "project.head" is the
+            // projection alone.
+            char range_name[64];
+            std::snprintf(range_name, sizeof(range_name), "project.%s", name);
+            Range _r_project(range_name);
 
             for (int i = 0; i < weight.out_blocks; i++)
             {
@@ -2117,6 +2216,8 @@ namespace heongpu
             std::vector<Ciphertext<Scheme::CKKS>> key;
             std::vector<Ciphertext<Scheme::CKKS>> value;
 
+            Range _r_attention("attention");
+
             if (all_projections)
             {
                 if (weights.key.out_blocks != weights.value.out_blocks)
@@ -2127,11 +2228,15 @@ namespace heongpu
                         "of both");
                 }
 
+                Range _r("attention.qkv_projection");
                 // One tau of each input block serves all three projections,
                 // which is the only reason an isolated pcmm's tau is
                 // affordable here.
-                std::vector<Ciphertext<Scheme::CKKS>> tau_x =
-                    tau_blocks(x, layout, galois_key);
+                std::vector<Ciphertext<Scheme::CKKS>> tau_x;
+                {
+                    Range _rt("attention.qkv_projection.tau");
+                    tau_x = tau_blocks(x, layout, galois_key);
+                }
                 query = project_blocks(tau_x, weights.query, layout, giant,
                                        baby, "query", galois_key,
                                        token_blocks);
@@ -2181,6 +2286,7 @@ namespace heongpu
 
             if (config.rope)
             {
+                Range _r("attention.rope");
                 rope_blocks(query, per_head, token_blocks, rope_plain, layout,
                             galois_key);
                 rope_blocks(key, per_head, token_blocks, rope_plain, layout,
@@ -2197,9 +2303,12 @@ namespace heongpu
             // transposes are taken once here rather than inside the grid.
             std::vector<Ciphertext<Scheme::CKKS>> key_t;
             key_t.reserve(key.size());
-            for (auto& block : key)
             {
-                key_t.push_back(transpose(block, layout, galois_key));
+                Range _r("attention.key_transpose");
+                for (auto& block : key)
+                {
+                    key_t.push_back(transpose(block, layout, galois_key));
+                }
             }
 
             SoftmaxConfig softmax_config = config.softmax;
@@ -2244,6 +2353,7 @@ namespace heongpu
                         // A head wider than one block sums its blocks' scores.
                         // Each term is a ccmm at the same level and scale, so
                         // the sum over the head is free.
+                        Range _rs("attention.scores");
                         Ciphertext<Scheme::CKKS> scores = head_scores(
                             key_t, query, kv_first, q_first, per_head,
                             token_blocks, u, s, layout, head, galois_key,
@@ -2268,10 +2378,14 @@ namespace heongpu
                     // One SoftMax however many key blocks the query block
                     // sees: the denominator is summed across them before the
                     // single reduction.
-                    std::vector<Ciphertext<Scheme::CKKS>> probabilities =
-                        softmax(parts, softmax_config, masks, galois_key,
-                                relin_key);
+                    std::vector<Ciphertext<Scheme::CKKS>> probabilities;
+                    {
+                        Range _r("attention.softmax");
+                        probabilities = softmax(parts, softmax_config, masks,
+                                                galois_key, relin_key);
+                    }
 
+                    Range _rv("attention.value_product");
                     for (int t = 0; t < per_head; t++)
                     {
                         const std::size_t at =
@@ -2306,8 +2420,12 @@ namespace heongpu
 
             if (!weights.output.empty())
             {
-                std::vector<Ciphertext<Scheme::CKKS>> tau_out =
-                    tau_blocks(out, layout, galois_key);
+                Range _r("attention.output_projection");
+                std::vector<Ciphertext<Scheme::CKKS>> tau_out;
+                {
+                    Range _rt("attention.output_projection.tau");
+                    tau_out = tau_blocks(out, layout, galois_key);
+                }
                 out = project_blocks(tau_out, weights.output, layout, giant,
                                      baby, "output", galois_key, token_blocks);
             }
@@ -2409,14 +2527,22 @@ namespace heongpu
 
             // The gate and the up projection read the same input, so the tau
             // Equation (5) consumes is taken once for both.
-            std::vector<Ciphertext<Scheme::CKKS>> tau_x =
-                tau_blocks(x, layout, galois_key);
-            std::vector<Ciphertext<Scheme::CKKS>> gate =
-                project_blocks(tau_x, weights.gate, layout, giant, baby,
-                               "gate", galois_key, token_blocks);
-            std::vector<Ciphertext<Scheme::CKKS>> up =
-                project_blocks(tau_x, weights.up, layout, giant, baby, "up",
-                               galois_key, token_blocks);
+            Range _r_ffn("feed_forward");
+
+            std::vector<Ciphertext<Scheme::CKKS>> gate;
+            std::vector<Ciphertext<Scheme::CKKS>> up;
+            {
+                Range _r("feed_forward.gate_up_projection");
+                std::vector<Ciphertext<Scheme::CKKS>> tau_x;
+                {
+                    Range _rt("feed_forward.gate_up_projection.tau");
+                    tau_x = tau_blocks(x, layout, galois_key);
+                }
+                gate = project_blocks(tau_x, weights.gate, layout, giant, baby,
+                                      "gate", galois_key, token_blocks);
+                up = project_blocks(tau_x, weights.up, layout, giant, baby,
+                                    "up", galois_key, token_blocks);
+            }
 
             // SwiGLU is a map on one token's channels, so the token blocks
             // never meet and this loop covers both blockings at once.
@@ -2424,15 +2550,23 @@ namespace heongpu
             hidden.reserve(gate.size());
             for (std::size_t i = 0; i < gate.size(); i++)
             {
-                Ciphertext<Scheme::CKKS> activated =
-                    silu(gate[i], config.silu_bound, config.silu_degree,
-                         relin_key);
+                Ciphertext<Scheme::CKKS> activated;
+                {
+                    Range _r("feed_forward.silu");
+                    activated = silu(gate[i], config.silu_bound,
+                                     config.silu_degree, relin_key);
+                }
+                Range _r("feed_forward.gate_times_up");
                 hidden.push_back(
                     multiply_and_rescale(activated, up[i], relin_key));
             }
 
-            std::vector<Ciphertext<Scheme::CKKS>> tau_hidden =
-                tau_blocks(hidden, layout, galois_key);
+            Range _r("feed_forward.down_projection");
+            std::vector<Ciphertext<Scheme::CKKS>> tau_hidden;
+            {
+                Range _rt("feed_forward.down_projection.tau");
+                tau_hidden = tau_blocks(hidden, layout, galois_key);
+            }
             return project_blocks(tau_hidden, weights.down, layout, giant, baby,
                                   "down", galois_key, token_blocks);
         }
@@ -2442,6 +2576,7 @@ namespace heongpu
                                   Galoiskey<Scheme::CKKS>& boot_key,
                                   Relinkey<Scheme::CKKS>& relin_key)
         {
+            Range _r("bootstrap");
             // The procedure raises the modulus of a ciphertext that has one
             // prime left, so anything still unspent has to go first. It is
             // free to drop and it was about to be discarded regardless.
@@ -2509,24 +2644,36 @@ namespace heongpu
                                             "input");
             }
 
-            std::vector<Ciphertext<Scheme::CKKS>> normed =
-                rms_norm(x, weights.attention_norm, config.attention_norm,
-                         galois_key, relin_key);
+            std::vector<Ciphertext<Scheme::CKKS>> normed;
+            {
+                Range _r("block.attention_norm");
+                normed = rms_norm(x, weights.attention_norm,
+                                  config.attention_norm, galois_key, relin_key);
+            }
             std::vector<Ciphertext<Scheme::CKKS>> sublayer =
                 attention(normed, weights.attention, weights.rope,
                           config.attention, galois_key, relin_key);
-            std::vector<Ciphertext<Scheme::CKKS>> stream =
-                residual_add(x, sublayer);
+            std::vector<Ciphertext<Scheme::CKKS>> stream;
+            {
+                Range _r("block.residual");
+                stream = residual_add(x, sublayer);
+            }
 
             if (config.bootstrap)
             {
+                Range _r("block.bootstrap_mid");
                 stream = bootstrap(stream, boot_key, relin_key);
             }
 
-            normed = rms_norm(stream, weights.feed_forward_norm,
-                              config.feed_forward_norm, galois_key, relin_key);
+            {
+                Range _r("block.feed_forward_norm");
+                normed = rms_norm(stream, weights.feed_forward_norm,
+                                  config.feed_forward_norm, galois_key,
+                                  relin_key);
+            }
             sublayer = feed_forward(normed, weights.feed_forward,
                                     config.feed_forward, galois_key, relin_key);
+            Range _r("block.residual");
             return residual_add(stream, sublayer);
         }
 
@@ -2566,12 +2713,16 @@ namespace heongpu
                                             "config per block");
             }
 
-            std::vector<Ciphertext<Scheme::CKKS>> stream =
-                transformer_block(x, weights[0], config.blocks[0], galois_key,
-                                  boot_key, relin_key);
+            std::vector<Ciphertext<Scheme::CKKS>> stream;
+            {
+                IndexedRange _r("block.%d", 0);
+                stream = transformer_block(x, weights[0], config.blocks[0],
+                                           galois_key, boot_key, relin_key);
+            }
 
             for (std::size_t block = 1; block < weights.size(); block++)
             {
+                IndexedRange _r("block.%d", static_cast<int>(block));
                 // The seam is the second refresh a block costs. The stream
                 // arrives here with what the SwiGLU half left, which is a
                 // handful of levels, and the attention half about to read it
@@ -2580,6 +2731,7 @@ namespace heongpu
                 // every seam as well.
                 if (config.bootstrap_between_blocks)
                 {
+                    Range _rb("block.bootstrap_seam");
                     stream = bootstrap(stream, boot_key, relin_key);
                 }
                 stream =
@@ -2630,6 +2782,7 @@ namespace heongpu
             const BlockMatrix& table, const ModelConfig& config,
             Galoiskey<Scheme::CKKS>& galois_key)
         {
+            Range _r("embedding");
             // Nothing distinguishes a lookup from a projection: the one-hot
             // columns are an activation whose channel axis is the vocabulary,
             // and the table is the weight that reads it.
@@ -2647,9 +2800,12 @@ namespace heongpu
             Galoiskey<Scheme::CKKS>& galois_key,
             Relinkey<Scheme::CKKS>& relin_key)
         {
-            std::vector<Ciphertext<Scheme::CKKS>> normed =
-                rms_norm(x, norm_weights, config.final_norm, galois_key,
-                         relin_key);
+            std::vector<Ciphertext<Scheme::CKKS>> normed;
+            {
+                Range _r("final_norm");
+                normed = rms_norm(x, norm_weights, config.final_norm,
+                                  galois_key, relin_key);
+            }
 
             if (head.empty())
             {
@@ -2659,6 +2815,7 @@ namespace heongpu
                 return normed;
             }
 
+            Range _r("head");
             std::vector<Ciphertext<Scheme::CKKS>> tau_normed =
                 tau_blocks(normed, config.layout, galois_key);
             return project_blocks(tau_normed, head, config.layout, config.giant,
@@ -2671,6 +2828,8 @@ namespace heongpu
             const ModelConfig& config, Galoiskey<Scheme::CKKS>& galois_key,
             Galoiskey<Scheme::CKKS>& boot_key, Relinkey<Scheme::CKKS>& relin_key)
         {
+            Range _r("forward");
+
             std::vector<Ciphertext<Scheme::CKKS>> embedded;
             if (!weights.embedding.empty())
             {
@@ -2689,6 +2848,7 @@ namespace heongpu
 
             if (config.bootstrap_before_head)
             {
+                Range _rb("bootstrap_before_head");
                 stream = bootstrap(stream, boot_key, relin_key);
             }
 
