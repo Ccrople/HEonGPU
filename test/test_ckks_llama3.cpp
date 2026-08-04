@@ -336,6 +336,50 @@ namespace
         EXPECT_LT(max_error(got, want), 1e-5);
     }
 
+    /// Plaintext operands below the top of the chain.
+    ///
+    /// HEEncoder always encodes at the top level and multiply_plain insists
+    /// the two operands agree, so every plaintext step is a no-op away from
+    /// throwing once it runs anywhere but on a fresh ciphertext. Testing the
+    /// primitives only at depth zero hides that completely.
+    TEST_F(Llama3Env, PlaintextStepsWorkBelowTheTopLevel)
+    {
+        const int count = 32;
+        const int stride = slots / count;
+
+        const std::vector<double> values = uniform(-1.0, 1.0, 13);
+        heongpu::Ciphertext<S> cipher = encrypt(values);
+
+        ops->square(cipher, *relin);
+        ASSERT_EQ(cipher.depth(), 1);
+        ops->sum_strided(cipher, stride, count, *galois);
+        ops->multiply_constant(cipher, 0.25);
+        ASSERT_EQ(cipher.depth(), 2);
+
+        std::vector<double> mask(slots, 2.0);
+        ops->multiply_vector(cipher, mask);
+        ASSERT_EQ(cipher.depth(), 3);
+
+        const std::vector<double> got = decrypt(cipher);
+
+        std::vector<double> want(slots);
+        for (int i = 0; i < stride; i++)
+        {
+            double total = 0.0;
+            for (int j = 0; j < count; j++)
+            {
+                const double v = values[j * stride + i];
+                total += v * v;
+            }
+            for (int j = 0; j < count; j++)
+            {
+                want[j * stride + i] = total * 0.25 * 2.0;
+            }
+        }
+
+        EXPECT_LT(max_error(got, want), 1e-5);
+    }
+
     // -----------------------------------------------------------------------
     // Polynomial primitives
     // -----------------------------------------------------------------------

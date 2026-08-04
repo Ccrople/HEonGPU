@@ -203,11 +203,45 @@ namespace heongpu
         }
 
         Plaintext<Scheme::CKKS>
-        Llama3Operator::encode(const std::vector<double>& values, double scale)
+        Llama3Operator::encode(const std::vector<double>& values, double scale,
+                               int depth)
         {
+            // HEEncoder always encodes at the top of the chain, but
+            // multiply_plain checks the two operands agree on level, so the
+            // plaintext has to come down to meet the ciphertext.
             Plaintext<Scheme::CKKS> plain(context_);
             encoder_.encode(plain, values, scale);
+            for (int i = 0; i < depth; i++)
+            {
+                mod_drop_inplace(plain);
+            }
             return plain;
+        }
+
+        void Llama3Operator::multiply_plaintext(Ciphertext<Scheme::CKKS>& ct,
+                                                Plaintext<Scheme::CKKS>& plain)
+        {
+            if (plain.depth() > ct.depth())
+            {
+                throw std::invalid_argument(
+                    "Plaintext is already below the ciphertext's level");
+            }
+
+            if (plain.depth() == ct.depth())
+            {
+                multiply_plain_inplace(ct, plain);
+                return;
+            }
+
+            // Drop a copy so the caller keeps a plaintext it can reuse for the
+            // next token or the next layer.
+            Plaintext<Scheme::CKKS> dropped(context_);
+            mod_drop(plain, dropped);
+            for (int i = plain.depth() + 1; i < ct.depth(); i++)
+            {
+                mod_drop_inplace(dropped);
+            }
+            multiply_plain_inplace(ct, dropped);
         }
 
         void Llama3Operator::drop_to_depth(Ciphertext<Scheme::CKKS>& ct,
@@ -239,7 +273,8 @@ namespace heongpu
             // brings the result back to the input scale rather than to some
             // multiple of it.
             std::vector<double> values(slot_count_, c);
-            Plaintext<Scheme::CKKS> plain = encode(values, rescale_prime(ct));
+            Plaintext<Scheme::CKKS> plain =
+                encode(values, rescale_prime(ct), ct.depth());
             multiply_plain_inplace(ct, plain);
             rescale_inplace(ct);
         }
@@ -252,7 +287,8 @@ namespace heongpu
                 throw std::invalid_argument(
                     "Slot vector must hold exactly slot_count() entries");
             }
-            Plaintext<Scheme::CKKS> plain = encode(values, rescale_prime(ct));
+            Plaintext<Scheme::CKKS> plain =
+                encode(values, rescale_prime(ct), ct.depth());
             multiply_plain_inplace(ct, plain);
             rescale_inplace(ct);
         }
@@ -622,7 +658,7 @@ namespace heongpu
 
                 if (!weights.empty())
                 {
-                    multiply_plain_inplace(normalised, weights[i]);
+                    multiply_plaintext(normalised, weights[i]);
                     rescale_inplace(normalised);
                 }
 
@@ -714,11 +750,11 @@ namespace heongpu
             Ciphertext<Scheme::CKKS> swapped(context_);
             rotate_rows(ct, swapped, galois_key, swap_shift);
 
-            Ciphertext<Scheme::CKKS> direct(context_);
-            multiply_plain(ct, cos_plain, direct);
+            Ciphertext<Scheme::CKKS> direct = ct;
+            multiply_plaintext(direct, cos_plain);
             rescale_inplace(direct);
 
-            multiply_plain_inplace(swapped, sin_plain);
+            multiply_plaintext(swapped, sin_plain);
             rescale_inplace(swapped);
 
             add_inplace(direct, swapped);
@@ -847,7 +883,8 @@ namespace heongpu
                         }
                     }
 
-                    Plaintext<Scheme::CKKS> plain = encode(slots, plain_scale);
+                    Plaintext<Scheme::CKKS> plain =
+                        encode(slots, plain_scale, ct.depth());
                     Ciphertext<Scheme::CKKS> term(context_);
                     multiply_plain(rotated[i], plain, term);
 

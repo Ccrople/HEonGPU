@@ -157,6 +157,18 @@ namespace heongpu
             /** @brief Add a real constant. Consumes no level. */
             void add_constant(Ciphertext<Scheme::CKKS>& ct, double c);
 
+            /**
+             * @brief Multiply by a plaintext held at any level.
+             *
+             * multiply_plain insists the two operands sit at the same level,
+             * while HEEncoder only ever encodes at the top of the chain, so a
+             * plaintext prepared once and reused down a circuit has to be
+             * dropped first. The drop is taken on a copy, leaving the caller's
+             * plaintext reusable at its original level.
+             */
+            void multiply_plaintext(Ciphertext<Scheme::CKKS>& ct,
+                                    Plaintext<Scheme::CKKS>& plain);
+
             /** @brief Square, relinearise and rescale. */
             void square(Ciphertext<Scheme::CKKS>& ct,
                         Relinkey<Scheme::CKKS>& relin_key);
@@ -398,9 +410,9 @@ namespace heongpu
             /// The prime the next rescale of @p ct will divide by.
             double rescale_prime(const Ciphertext<Scheme::CKKS>& ct) const;
 
-            /// Encode @p values at @p scale into a fresh full-level plaintext.
+            /// Encode @p values at @p scale, dropped onto @p depth.
             Plaintext<Scheme::CKKS> encode(const std::vector<double>& values,
-                                           double scale);
+                                           double scale, int depth);
 
             HEEncoder<Scheme::CKKS> encoder_;
             /// Cached: the context hands out its modulus chain by value.
