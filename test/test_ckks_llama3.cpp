@@ -3754,6 +3754,110 @@ namespace
         }
     }
 
+    /// The embedding lookup, which is the same block product a projection is.
+    ///
+    /// The reference is built by picking columns of the table rather than by
+    /// multiplying anything, which is the claim: selecting a row of an
+    /// embedding table is a matrix multiplication against one-hot columns and
+    /// nothing more, so the token never leaves the ciphertext and a vocabulary
+    /// of any size costs one level.
+    ///
+    /// The identities are drawn per batch entry, so an embedding that ignored
+    /// the batch axis, or that let one entry's word reach another's column,
+    /// fails by a whole number rather than subtly.
+    TEST_F(Llama3LayerEnv, EmbeddingSelectsColumnsOfTheTable)
+    {
+        const int d = layout.d;
+        constexpr int kVocabBlocks = 2;
+        const int vocab = kVocabBlocks * d;
+
+        std::mt19937_64 rng(1101);
+
+        // The table, transposed like every weight here: d_model rows by vocab
+        // columns, cut into blocks along the vocabulary.
+        std::vector<ChannelBlock> table(kVocabBlocks);
+        for (ChannelBlock& block : table)
+        {
+            block = random_blocks(layout, 1.0, rng);
+        }
+
+        std::uniform_int_distribution<int> word(0, vocab - 1);
+        std::vector<std::vector<int>> ids(layout.batch,
+                                          std::vector<int>(d, 0));
+        for (std::vector<int>& row : ids)
+        {
+            for (int& id : row)
+            {
+                id = word(rng);
+            }
+        }
+
+        // One-hot block u holds vocabulary rows [u d, (u + 1) d) against the
+        // tokens, which is an activation of vocab channels in every respect.
+        std::vector<ChannelBlock> one_hot(kVocabBlocks, zero_block(layout));
+        for (int m = 0; m < layout.batch; m++)
+        {
+            for (int t = 0; t < d; t++)
+            {
+                const int id = ids[m][t];
+                one_hot[id / d][m][static_cast<std::size_t>(id % d) * d + t] =
+                    1.0;
+            }
+        }
+
+        // Column t of the result is column ids[t] of the table. No product.
+        ChannelBlock want = zero_block(layout);
+        for (int m = 0; m < layout.batch; m++)
+        {
+            for (int t = 0; t < d; t++)
+            {
+                const int id = ids[m][t];
+                for (int c = 0; c < d; c++)
+                {
+                    want[m][static_cast<std::size_t>(c) * d + t] =
+                        table[id / d][m][static_cast<std::size_t>(c) * d +
+                                         (id % d)];
+                }
+            }
+        }
+
+        llama::Llama3Operator::ModelConfig config;
+        config.layout = layout;
+        // The whole model's list, of which the embedding uses the tau and the
+        // BSGS part. The final norm's shape is what the rest of it needs, and
+        // a model always has one.
+        config.final_norm.stride = d * layout.batch;
+        config.final_norm.count = d;
+        config.final_norm.channels = d;
+
+        llama::BlockMatrix table_blocks(1, kVocabBlocks);
+        for (int u = 0; u < kVocabBlocks; u++)
+        {
+            table_blocks.at(0, u) = flatten_block(table[u]);
+        }
+
+        auto key =
+            narrow_key(llama::Llama3Operator::model_rotation_indices(config));
+
+        std::vector<heongpu::Ciphertext<S>> in;
+        for (const ChannelBlock& block : one_hot)
+        {
+            in.push_back(encrypt(pack_blocks(block, layout)));
+        }
+
+        std::vector<heongpu::Ciphertext<S>> got =
+            ops->embed(in, table_blocks, config, *key);
+        ASSERT_EQ(got.size(), std::size_t{1});
+
+        EXPECT_LT(reported("embedding", decrypt(got[0]),
+                           pack_blocks(want, layout)),
+                  1e-6);
+
+        // tau and Equation (5), one level each, however long the vocabulary
+        // is. Widening it buys ciphertexts and products, never depth.
+        EXPECT_EQ(got[0].depth(), 2);
+    }
+
     // -----------------------------------------------------------------------
     // Bootstrapping
     // -----------------------------------------------------------------------
@@ -4347,6 +4451,303 @@ namespace
         std::vector<heongpu::Ciphertext<S>> in_bad{encrypt(x_slots)};
         EXPECT_THROW(ops->transformer_stack(in_bad, weights, one, *key,
                                             *boot_galois, *relin),
+                     std::invalid_argument);
+    }
+
+    /// A whole model: token identities in, logits out.
+    ///
+    /// What this adds to the stack is the two ends, and what is worth checking
+    /// about both is that they are ordinary projections. The embedding is a
+    /// lookup performed as a product against one-hot columns, so the tokens
+    /// stay inside the ciphertext and the table stays a server plaintext; the
+    /// head is the final norm and one more product. Neither costs a refresh:
+    /// the embedding comes off the top of a full chain and the head fits in
+    /// what the last block's SwiGLU half did not spend, so a model of B blocks
+    /// costs the stack's 2B - 1 bootstraps and no more.
+    ///
+    /// Two blocks rather than three. How the error grows with depth is the
+    /// stack test's measurement and it is already made; what is new here is at
+    /// the ends, and a third block would only make it slower to see.
+    ///
+    /// The one number that surprises is the output's accuracy: the logits are
+    /// about eight times noisier than the stream that produced them. That is
+    /// the final norm and not the head, and it is not a defect of either. A
+    /// norm divides, so it scales up an inherited absolute error on exactly
+    /// the tokens whose channels are quiet, and no amount of refreshing before
+    /// it changes that. Both halves of that are measured at the end.
+    TEST_F(Llama3StackEnv, ModelRunsFromTokensToLogits)
+    {
+        const int d = layout.d;
+        const double weight_scale = 1.0 / std::sqrt(static_cast<double>(d));
+        constexpr int kBlocks = 2;
+        constexpr int kVocabBlocks = 2;
+        const int vocab = kVocabBlocks * d;
+
+        std::mt19937_64 rng(1006);
+
+        // The embedding table, at the amplitude the block tests feed their
+        // activations at: an embedded token is one of its columns, so this is
+        // what fixes the scale of everything downstream.
+        std::vector<ChannelBlock> table(kVocabBlocks);
+        for (ChannelBlock& block : table)
+        {
+            block = random_blocks(layout, 1.0, rng);
+        }
+
+        std::uniform_int_distribution<int> word(0, vocab - 1);
+        std::vector<std::vector<int>> ids(layout.batch,
+                                          std::vector<int>(d, 0));
+        for (std::vector<int>& row : ids)
+        {
+            for (int& id : row)
+            {
+                id = word(rng);
+            }
+        }
+
+        std::vector<ChannelBlock> one_hot(kVocabBlocks, zero_block(layout));
+        ChannelBlock x = zero_block(layout);
+        for (int m = 0; m < layout.batch; m++)
+        {
+            for (int t = 0; t < d; t++)
+            {
+                const int id = ids[m][t];
+                one_hot[id / d][m][static_cast<std::size_t>(id % d) * d + t] =
+                    1.0;
+                for (int c = 0; c < d; c++)
+                {
+                    x[m][static_cast<std::size_t>(c) * d + t] =
+                        table[id / d][m][static_cast<std::size_t>(c) * d +
+                                         (id % d)];
+                }
+            }
+        }
+
+        std::vector<BlockWeightsHost> host_weights(kBlocks);
+        for (BlockWeightsHost& w : host_weights)
+        {
+            w.query = random_blocks(layout, weight_scale, rng);
+            w.key = random_blocks(layout, weight_scale, rng);
+            w.value = random_blocks(layout, weight_scale, rng);
+            w.gate = random_blocks(layout, weight_scale, rng);
+            w.up = random_blocks(layout, weight_scale, rng);
+            w.down = random_blocks(layout, weight_scale, rng);
+        }
+        const ChannelBlock head_weight = random_blocks(layout, weight_scale,
+                                                       rng);
+        const ChannelBlock head_weight_high =
+            random_blocks(layout, weight_scale, rng);
+
+        llama::Llama3Operator::ModelConfig config;
+        config.layout = layout;
+        config.stack.bootstrap_between_blocks = true;
+        config.stack.blocks.resize(kBlocks);
+
+        // The body, calibrated block by block on the stream the block before
+        // it produced, exactly as the stack test does it.
+        ChannelBlock stream = x;
+        for (int l = 0; l < kBlocks; l++)
+        {
+            llama::Llama3Operator::TransformerBlockConfig& block =
+                config.stack.blocks[l];
+            block.bootstrap = true;
+            block.attention_norm.stride = d * layout.batch;
+            block.attention_norm.count = d;
+            block.attention_norm.channels = d;
+            block.attention_norm.eps = 1e-5;
+            block.attention_norm.degree = 31;
+            block.attention_norm.newton_iterations = 0;
+
+            block.attention.layout = layout;
+            block.attention.causal = true;
+            block.attention.rope = false;
+            block.attention.softmax.bound = 2.0;
+            block.attention.softmax.iterations = 1;
+            block.attention.softmax.exp_degree = 15;
+            block.attention.softmax.inverse_degree = 15;
+            block.attention.softmax.inverse_newton = 1;
+
+            block.feed_forward.layout = layout;
+            block.feed_forward.silu_degree = 31;
+
+            const BlockHostRun run =
+                transformer_block_host(stream, host_weights[l], block, layout);
+            block.feed_forward.silu_bound = 1.2 * run.widest_gate;
+            stream = run.out;
+        }
+
+        // The final norm, over the same channels the pre-norms reduce over,
+        // and without the Newton step because there is no level left for it.
+        // What that costs is measured at the end of this test.
+        config.final_norm.stride = d * layout.batch;
+        config.final_norm.count = d;
+        config.final_norm.channels = d;
+        config.final_norm.eps = 1e-5;
+        config.final_norm.degree = 31;
+        config.final_norm.newton_iterations = 0;
+
+        const std::vector<double> stream_slots = pack_blocks(stream, layout);
+        square_sum_range(stream_slots, config.final_norm);
+        const ChannelBlock normed =
+            unpack_blocks(rms_norm_host(stream_slots, config.final_norm),
+                          layout);
+
+        // Logits: vocab rows by d_model columns, so the head is as many
+        // blocks tall as the embedding was wide.
+        std::vector<ChannelBlock> want(kVocabBlocks);
+        want[0] = matmul_block(head_weight, normed, d);
+        want[1] = matmul_block(head_weight_high, normed, d);
+
+        llama::Llama3Operator::ModelWeights weights;
+        weights.embedding = llama::BlockMatrix(1, kVocabBlocks);
+        for (int u = 0; u < kVocabBlocks; u++)
+        {
+            weights.embedding.at(0, u) = flatten_block(table[u]);
+        }
+        weights.blocks.resize(kBlocks);
+        for (int l = 0; l < kBlocks; l++)
+        {
+            weights.blocks[l].attention.query =
+                llama::BlockMatrix(flatten_block(host_weights[l].query));
+            weights.blocks[l].attention.key =
+                llama::BlockMatrix(flatten_block(host_weights[l].key));
+            weights.blocks[l].attention.value =
+                llama::BlockMatrix(flatten_block(host_weights[l].value));
+            weights.blocks[l].feed_forward.gate =
+                llama::BlockMatrix(flatten_block(host_weights[l].gate));
+            weights.blocks[l].feed_forward.up =
+                llama::BlockMatrix(flatten_block(host_weights[l].up));
+            weights.blocks[l].feed_forward.down =
+                llama::BlockMatrix(flatten_block(host_weights[l].down));
+        }
+        weights.head = llama::BlockMatrix(kVocabBlocks, 1);
+        weights.head.at(0, 0) = flatten_block(head_weight);
+        weights.head.at(1, 0) = flatten_block(head_weight_high);
+
+        // The ends of a model ask for nothing the body does not already ask
+        // for. Both are projections, and the blocks are full of projections.
+        const std::vector<int> model_shifts =
+            llama::Llama3Operator::model_rotation_indices(config);
+        EXPECT_EQ(model_shifts,
+                  llama::Llama3Operator::transformer_stack_rotation_indices(
+                      config.stack));
+
+        auto key = narrow_key(model_shifts);
+
+        std::vector<heongpu::Ciphertext<S>> in;
+        for (const ChannelBlock& block : one_hot)
+        {
+            in.push_back(encrypt(pack_blocks(block, layout)));
+        }
+
+        std::vector<heongpu::Ciphertext<S>> logits =
+            ops->forward(in, weights, config, *key, *boot_galois, *relin);
+        ASSERT_EQ(logits.size(), static_cast<std::size_t>(kVocabBlocks));
+
+        double cheap_worst = 0.0;
+        for (int u = 0; u < kVocabBlocks; u++)
+        {
+            const std::string label =
+                "logits, vocabulary block " + std::to_string(u);
+            cheap_worst = std::max(cheap_worst,
+                                   reported(label.c_str(), decrypt(logits[u]),
+                                            pack_blocks(want[u], layout)));
+        }
+
+        // Twice the worst of six runs, and twice is enough because what sets
+        // this number is not noise: over those runs the logits moved by under
+        // a tenth while the stream feeding them moved by half.
+        EXPECT_LT(cheap_worst, 2e-2);
+
+        // What the head spent, and what is left after it.
+        const int left = levels_left(logits[0]);
+        std::cout << "[ MEASURED ] the head left " << left << " of the "
+                  << (levels_after_a_refresh() - kSwiGLUHalf)
+                  << " levels the stack handed it, and fits 1/sqrt over ["
+                  << config.final_norm.sum_lo << ", "
+                  << config.final_norm.sum_hi << "]" << std::endl;
+        EXPECT_GT(left, 0);
+        EXPECT_FALSE(config.bootstrap_before_head);
+
+        // Why the logits are an order noisier than the stream behind them,
+        // which is the thing to know about reading a model's output.
+        //
+        // The head adds no error of its own; it rescales what it is handed.
+        // A final norm is a division, so a token whose channels happen to be
+        // quiet has its absolute error multiplied by exactly the factor its
+        // signal is multiplied by, and the worst slot of the output is the
+        // worst slot of the stream times the largest of those factors. Two
+        // blocks of residuals leave the summed squares spanning the interval
+        // printed above, so the quietest token here is normalised up by
+        // roughly eight, and the logits come out at roughly eight times a
+        // two block stream's thousandth. Divide that factor back out and the
+        // head is as accurate as what fed it, which is the assertion.
+        const double quietest =
+            config.final_norm.sum_lo / 0.8 / config.final_norm.channels;
+        const double amplification =
+            1.0 / std::sqrt(quietest + config.final_norm.eps);
+        std::cout << "[ MEASURED ] the final norm's widest factor is "
+                  << amplification << ", so " << cheap_worst
+                  << " of logit error is " << (cheap_worst / amplification)
+                  << " of stream error" << std::endl;
+        EXPECT_LT(cheap_worst / amplification, kBlocks * 5e-3);
+
+        // And a refresh does not help, which is worth having measured rather
+        // than assumed. An inherited error is not repaired by refreshing the
+        // ciphertext carrying it, and the norm's own fit is not what is being
+        // seen: giving the head a full chain and the Newton step it cannot
+        // otherwise afford leaves the answer where it was. So the flag stays
+        // off, and it is there for a head too long to fit rather than for a
+        // head that wants to be sharper.
+        llama::Llama3Operator::ModelConfig accurate = config;
+        accurate.bootstrap_before_head = true;
+        accurate.final_norm.newton_iterations = 1;
+
+        std::vector<heongpu::Ciphertext<S>> in_again;
+        for (const ChannelBlock& block : one_hot)
+        {
+            in_again.push_back(encrypt(pack_blocks(block, layout)));
+        }
+        std::vector<heongpu::Ciphertext<S>> sharper = ops->forward(
+            in_again, weights, accurate, *key, *boot_galois, *relin);
+        ASSERT_EQ(sharper.size(), static_cast<std::size_t>(kVocabBlocks));
+
+        double sharp_worst = 0.0;
+        for (int u = 0; u < kVocabBlocks; u++)
+        {
+            const std::string label =
+                "refreshed logits, vocabulary block " + std::to_string(u);
+            sharp_worst = std::max(sharp_worst,
+                                   reported(label.c_str(), decrypt(sharper[u]),
+                                            pack_blocks(want[u], layout)));
+        }
+        std::cout << "[ MEASURED ] a refresh and a Newton step before the "
+                  << "head move the error by " << (sharp_worst / cheap_worst)
+                  << ", leaving " << levels_left(sharper[0]) << " levels"
+                  << std::endl;
+
+        // It runs, and it buys nothing: half would be a real improvement and
+        // there is none. The extra chain is real, though, and that is what
+        // the flag is for.
+        EXPECT_LT(sharp_worst, 2e-2);
+        EXPECT_GT(sharp_worst, 0.5 * cheap_worst);
+        EXPECT_GT(levels_left(sharper[0]), left);
+
+        // A table that disagrees with the one-hot blocks it is handed is
+        // refused, and refused before a single block runs.
+        llama::Llama3Operator::ModelWeights narrow = weights;
+        narrow.embedding = llama::BlockMatrix(1, kVocabBlocks + 1);
+        for (int u = 0; u <= kVocabBlocks; u++)
+        {
+            narrow.embedding.at(0, u) = flatten_block(table[0]);
+        }
+        std::vector<heongpu::Ciphertext<S>> in_bad;
+        for (const ChannelBlock& block : one_hot)
+        {
+            in_bad.push_back(encrypt(pack_blocks(block, layout)));
+        }
+        EXPECT_THROW(ops->forward(in_bad, narrow, config, *key, *boot_galois,
+                                  *relin),
                      std::invalid_argument);
     }
 

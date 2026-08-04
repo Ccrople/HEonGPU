@@ -1071,7 +1071,7 @@ namespace heongpu
              * block starts on a full chain and only has to fit its second half
              * into what the refresh in its middle hands back. Every block
              * after the first starts on a refreshed chain instead, so its
-             * attention half has to fit there too — and the attention half is
+             * attention half has to fit there too, and the attention half is
              * the deeper of the two by a long way. A chain that runs one block
              * will therefore not run two.
              *
@@ -1091,6 +1091,143 @@ namespace heongpu
                               Galoiskey<Scheme::CKKS>& galois_key,
                               Galoiskey<Scheme::CKKS>& boot_key,
                               Relinkey<Scheme::CKKS>& relin_key);
+
+            /** @brief Plaintext weights of a whole model. */
+            struct ModelWeights
+            {
+                /// The embedding table, transposed and blocked like every
+                /// other weight here: d_model rows by vocabulary columns, so
+                /// out_blocks is the width of the model and in_blocks the
+                /// vocabulary. Empty takes the input as an activation that has
+                /// already been embedded.
+                BlockMatrix embedding;
+
+                /// The body, one entry per block.
+                std::vector<TransformerBlockWeights> blocks;
+
+                /// Learned scale of the final norm, one plaintext per block of
+                /// the stream, or empty to leave the scaling out.
+                std::vector<Plaintext<Scheme::CKKS>> final_norm;
+
+                /// The output head: vocabulary rows by d_model columns. Empty
+                /// hands back the normalised stream instead of logits, which
+                /// is what a caller who runs their own head asks for.
+                BlockMatrix head;
+            };
+
+            /** @brief Shape and approximation settings for a whole model. */
+            struct ModelConfig
+            {
+                MatrixLayout layout;
+                int giant = 0; ///< BSGS split of the two ends; 0 balances.
+                int baby = 0;
+                /// Token blocks the sequence is cut into, as everywhere else.
+                int token_blocks = 1;
+                TransformerStackConfig stack;
+                RMSNormConfig final_norm;
+
+                /// Refresh between the last block and the head.
+                ///
+                /// False by default, and off is measured rather than assumed:
+                /// the head costs about ten levels, the stack hands back more
+                /// than that, and turning this on buys no accuracy at all.
+                /// The logits are noisier than the stream behind them only
+                /// because a final norm is a division and a quiet token is
+                /// divided by a small number, and refreshing a ciphertext
+                /// does not repair an error it inherited. What this is for is
+                /// a head that does not fit: a wider final norm, or one whose
+                /// Newton step has to be paid for.
+                bool bootstrap_before_head = false;
+            };
+
+            /** @brief Rotations a whole model needs a Galois key for. */
+            static std::vector<int>
+            model_rotation_indices(const ModelConfig& config);
+
+            /**
+             * @brief The embedding lookup, which is a projection like any
+             *        other.
+             *
+             * The token identities are the private input and the table is a
+             * server plaintext, so what arrives encrypted is the one-hot
+             * matrix: block u holds vocabulary rows [u d, (u + 1) d) against
+             * the tokens, in exactly the arrangement an activation is held in.
+             * Then X[channel][token] = sum_v E[channel][v] onehot[v][token] is
+             * the block product of Equation (5) with nothing added to it, so a
+             * lookup over a vocabulary of any size costs one level and buys
+             * products. Selecting a column is a matrix multiplication here,
+             * and that is the whole of the construction.
+             *
+             * It is, however, the widest thing in the model: the input is
+             * vocab / d ciphertexts per token block against the model's own
+             * d_model / d, and Llama-3's vocabulary is thirty one times its
+             * width.
+             *
+             * A caller who does not need the token itself hidden can embed on
+             * the client and hand the activation straight to the stack;
+             * ModelWeights spells that as an empty table.
+             *
+             * @param one_hot One block per vocabulary block and token block,
+             *                at index j * token_blocks + s.
+             */
+            std::vector<Ciphertext<Scheme::CKKS>>
+            embed(std::vector<Ciphertext<Scheme::CKKS>>& one_hot,
+                  const BlockMatrix& table, const ModelConfig& config,
+                  Galoiskey<Scheme::CKKS>& galois_key);
+
+            /**
+             * @brief The final norm and the projection to the vocabulary.
+             *
+             * The mirror of the embedding and wide on the other side: the
+             * result is vocab / d ciphertexts per token block. It costs the
+             * norm plus one level, which is inside what the last block's
+             * SwiGLU half leaves, so a model pays the stack's bootstraps and
+             * no more.
+             *
+             * Logits come back for every token, not only the last. Cutting to
+             * the last one would cost a masking level to hide something the
+             * client is about to decrypt anyway, so it is the client's
+             * business. The argmax is not taken either: that is a comparison
+             * circuit, and this returns the scores it would run on.
+             *
+             * Expect the logits to be noisier than the stream behind them.
+             * The norm is a division, and it divides a quiet token by a small
+             * number, so whatever absolute error arrives is scaled up along
+             * with the signal it rides on. Nothing here generates that error
+             * and nothing here can undo it.
+             */
+            std::vector<Ciphertext<Scheme::CKKS>>
+            output_head(std::vector<Ciphertext<Scheme::CKKS>>& x,
+                        std::vector<Plaintext<Scheme::CKKS>>& norm_weights,
+                        const BlockMatrix& head, const ModelConfig& config,
+                        Galoiskey<Scheme::CKKS>& galois_key,
+                        Relinkey<Scheme::CKKS>& relin_key);
+
+            /**
+             * @brief Embedding, blocks, final norm, head: the whole model.
+             *
+             * A run of B blocks costs 2B - 1 bootstraps, one in the middle of
+             * every block and one at every seam, and neither end of the model
+             * adds to that. The embedding is two levels off the top of a full
+             * chain and the head fits in what the last block left over, so
+             * what decides how long the chain has to be is still the deepest
+             * half of a block and nothing here changes it.
+             *
+             * Nor do the ends ask for a rotation the body does not already
+             * use. They are projections, and the blocks are full of
+             * projections.
+             *
+             * @param galois_key The model's rotations,
+             *                   model_rotation_indices.
+             * @param boot_key   Bootstrapping's own rotations, which are a
+             *                   different list.
+             */
+            std::vector<Ciphertext<Scheme::CKKS>>
+            forward(std::vector<Ciphertext<Scheme::CKKS>>& in,
+                    ModelWeights& weights, const ModelConfig& config,
+                    Galoiskey<Scheme::CKKS>& galois_key,
+                    Galoiskey<Scheme::CKKS>& boot_key,
+                    Relinkey<Scheme::CKKS>& relin_key);
 
           private:
             /// The prime the next rescale of @p ct will divide by.

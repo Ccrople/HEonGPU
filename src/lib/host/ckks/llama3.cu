@@ -2590,5 +2590,111 @@ namespace heongpu
             return stream;
         }
 
+        std::vector<int>
+        Llama3Operator::model_rotation_indices(const ModelConfig& config)
+        {
+            require_layout(config.layout);
+
+            int giant = config.giant;
+            int baby = config.baby;
+            bsgs_split(config.layout.d, giant, baby);
+
+            std::set<int> indices;
+            for (int r : transformer_stack_rotation_indices(config.stack))
+            {
+                indices.insert(r);
+            }
+            // The two ends of the model are projections, so they want tau and
+            // the BSGS shifts of Equation (5) and nothing else. Both lists are
+            // already inside the body's, which is why a model needs no wider a
+            // key than its blocks do; asking for them here says so rather than
+            // relying on it.
+            for (int r : tau_rotation_indices(config.layout))
+            {
+                indices.insert(r);
+            }
+            for (int r : pcmm_rotation_indices(config.layout, giant, baby))
+            {
+                indices.insert(r);
+            }
+            for (int r : strided_rotation_indices(config.final_norm.stride,
+                                                  config.final_norm.count))
+            {
+                indices.insert(r);
+            }
+            return std::vector<int>(indices.begin(), indices.end());
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>> Llama3Operator::embed(
+            std::vector<Ciphertext<Scheme::CKKS>>& one_hot,
+            const BlockMatrix& table, const ModelConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            // Nothing distinguishes a lookup from a projection: the one-hot
+            // columns are an activation whose channel axis is the vocabulary,
+            // and the table is the weight that reads it.
+            std::vector<Ciphertext<Scheme::CKKS>> tau_one_hot =
+                tau_blocks(one_hot, config.layout, galois_key);
+            return project_blocks(tau_one_hot, table, config.layout,
+                                  config.giant, config.baby, "embedding",
+                                  galois_key, config.token_blocks);
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>> Llama3Operator::output_head(
+            std::vector<Ciphertext<Scheme::CKKS>>& x,
+            std::vector<Plaintext<Scheme::CKKS>>& norm_weights,
+            const BlockMatrix& head, const ModelConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            std::vector<Ciphertext<Scheme::CKKS>> normed =
+                rms_norm(x, norm_weights, config.final_norm, galois_key,
+                         relin_key);
+
+            if (head.empty())
+            {
+                // Not a degenerate model: these are the hidden states, and a
+                // caller who means to run the head themselves wants exactly
+                // this and would have to pay a level to undo a head here.
+                return normed;
+            }
+
+            std::vector<Ciphertext<Scheme::CKKS>> tau_normed =
+                tau_blocks(normed, config.layout, galois_key);
+            return project_blocks(tau_normed, head, config.layout, config.giant,
+                                  config.baby, "head", galois_key,
+                                  config.token_blocks);
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>> Llama3Operator::forward(
+            std::vector<Ciphertext<Scheme::CKKS>>& in, ModelWeights& weights,
+            const ModelConfig& config, Galoiskey<Scheme::CKKS>& galois_key,
+            Galoiskey<Scheme::CKKS>& boot_key, Relinkey<Scheme::CKKS>& relin_key)
+        {
+            std::vector<Ciphertext<Scheme::CKKS>> embedded;
+            if (!weights.embedding.empty())
+            {
+                embedded = embed(in, weights.embedding, config, galois_key);
+            }
+            // With no table the stack runs on the caller's ciphertexts rather
+            // than on a copy, because a copy is a device allocation per block.
+            // They come back spent, as they do from transformer_stack itself:
+            // a residual drops its operands onto a common level in place.
+            std::vector<Ciphertext<Scheme::CKKS>>& entry =
+                weights.embedding.empty() ? in : embedded;
+
+            std::vector<Ciphertext<Scheme::CKKS>> stream =
+                transformer_stack(entry, weights.blocks, config.stack,
+                                  galois_key, boot_key, relin_key);
+
+            if (config.bootstrap_before_head)
+            {
+                stream = bootstrap(stream, boot_key, relin_key);
+            }
+
+            return output_head(stream, weights.final_norm, weights.head, config,
+                               galois_key, relin_key);
+        }
+
     } // namespace llama
 } // namespace heongpu
