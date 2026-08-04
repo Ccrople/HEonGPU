@@ -3526,7 +3526,10 @@ namespace
         config.token_blocks = token_blocks;
         config.eps = 1e-5;
         config.degree = 31;
-        config.newton_iterations = 0;
+        // Nothing follows this call, so unlike the pre-norm blocks it can
+        // afford the Newton step. Without it the Chebyshev fit alone holds
+        // 1e-5 and the fit error, not the indexing, would be what is measured.
+        config.newton_iterations = 1;
 
         std::vector<std::vector<double>> totals(
             token_blocks, std::vector<double>(config.stride, 0.0));
