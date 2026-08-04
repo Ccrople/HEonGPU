@@ -15,10 +15,11 @@
 //   ckks_profile relin    one relinearisation (a key switch with no automorphism)
 //   ckks_profile rotate   one rotation (the same key switch plus an automorphism)
 //   ckks_profile pcmm     one batch PCMM (Algorithm 1)
+//   ckks_profile ccmm     one batch CCMM (Algorithm 4)
 //
 // The modulus chain is the one from example/bootstrapping/5_ckks_regular_-
 // bootstrapping_v2.cpp: the only chain in this tree demonstrated to bootstrap
-// at logN = 16. Every mode shares it, so all four reports are directly
+// at logN = 16. Every mode shares it, so all five reports are directly
 // comparable with each other.
 
 #include <heongpu/heongpu.hpp>
@@ -124,9 +125,9 @@ int main(int argc, char* argv[])
 {
     const std::string mode = (argc > 1) ? argv[1] : "boot";
     if (mode != "boot" && mode != "relin" && mode != "rotate" &&
-        mode != "pcmm")
+        mode != "pcmm" && mode != "ccmm")
     {
-        std::cerr << "usage: " << argv[0] << " <boot|relin|rotate|pcmm>"
+        std::cerr << "usage: " << argv[0] << " <boot|relin|rotate|pcmm|ccmm>"
                   << std::endl;
         return EXIT_FAILURE;
     }
@@ -361,6 +362,103 @@ int main(int argc, char* argv[])
 
         std::cout << "[profile] one PCMM: " << elapsed << " ms, "
                   << out.size() << " output ciphertexts" << std::endl;
+    }
+    else if (mode == "ccmm")
+    {
+        // Shape matched to the FIDESlib BatchMatrixProfile.OneCCMM capture so
+        // the two reports differ only in the modulus chain: module rank d = 64,
+        // so k = 1024 and 512 complex 64 x 64 matrices ride together.
+        //
+        // CCMM is captured at four limbs, not at the top of the chain, for the
+        // same reason FIDESlib captures it at level 3: both operands are d full
+        // ciphertexts and the routine holds eight num_limbs x d x N working
+        // tensors on top of them, so the cost is linear in the limb count and
+        // quadratic in nothing the top of a 25-prime chain can hold.
+        const int d = EnvInt("HEONGPU_PROFILE_D", 64);
+        const int limbs = EnvInt("HEONGPU_PROFILE_LIMBS", 4);
+
+        heongpu::BatchMatrixLayout layout(static_cast<int>(kPolyModulusDegree),
+                                          d);
+        heongpu::HEBatchMatrixOperator<Scheme> op(context, layout);
+        heongpu::BatchMatrixEncoder enc(layout.k);
+        const int nslots = enc.slots();
+
+        // Asymmetric on purpose, as in the CCMM correctness test: step 1 CMTs
+        // the right operand and that key switching noise is then multiplied by
+        // the left one, so the surviving error depends on scale_b alone.
+        const double scale_a = pow(2.0, 25);
+        const double scale_b = pow(2.0, 35);
+
+        // The three internal CMTs need the automorphisms X -> X^(2kt+1).
+        std::vector<int> rot = heongpu::get_batch_cmt_rotation_indices(layout);
+        std::cout << "[profile] galois keys for CMT: " << rot.size()
+                  << std::endl;
+        heongpu::Galoiskey<Scheme> galois_key(context, rot);
+        keygen.generate_galois_key(galois_key, secret_key);
+
+        using cd = std::complex<double>;
+        auto encrypt_operand =
+            [&](cd fill, double scale,
+                std::vector<heongpu::Ciphertext<Scheme>>& cts)
+        {
+            std::vector<std::vector<cd>> M(
+                nslots, std::vector<cd>(static_cast<size_t>(d) * d, fill));
+            std::vector<int64_t> coeffs;
+            enc.encode(M, d, d, scale, coeffs);
+            std::vector<std::vector<int64_t>> columns;
+            heongpu::build_matrix_encryption_coefficients(coeffs, layout, d, d,
+                                                          columns);
+            cts.clear();
+            cts.reserve(d);
+            for (int j = 0; j < d; ++j)
+            {
+                heongpu::Plaintext<Scheme> pt(context);
+                op.load_coefficients(pt, columns[j], scale);
+                heongpu::Ciphertext<Scheme> c(context);
+                encryptor.encrypt(c, pt);
+                // mod_drop keeps the scale and simply narrows the RNS base, so
+                // a matrix encryption survives it: its coefficients are far
+                // smaller than the product of the limbs that remain.
+                while (c.level() > limbs - 1)
+                    operators.mod_drop_inplace(c);
+                cts.push_back(std::move(c));
+            }
+        };
+
+        std::vector<heongpu::Ciphertext<Scheme>> ca, cb;
+        encrypt_operand(cd(0.3, -0.2), scale_a, ca);
+        encrypt_operand(cd(0.1, 0.4), scale_b, cb);
+
+        std::vector<heongpu::Ciphertext<Scheme>*> pa, pb;
+        for (auto& c : ca)
+            pa.push_back(&c);
+        for (auto& c : cb)
+            pb.push_back(&c);
+
+        // ccmm copies the right operand before transposing it and only reads
+        // the left, so unlike bootstrapping the warm-up can share the operands.
+        {
+            std::vector<heongpu::Ciphertext<Scheme>> warm;
+            op.ccmm(warm, pa, pb, galois_key, relin_key, operators,
+                    /*rescale=*/false);
+            cudaDeviceSynchronize();
+        }
+
+        std::cout << "[profile] CCMM N=" << layout.N << " d=" << d
+                  << " k=" << layout.k << " batch=" << layout.batch
+                  << " limbs=" << (ca[0].level() + 1) << std::endl;
+
+        std::vector<heongpu::Ciphertext<Scheme>> out;
+        cudaProfilerStart();
+        RegionTimer timer;
+        op.ccmm(out, pa, pb, galois_key, relin_key, operators,
+                /*rescale=*/false);
+        cudaDeviceSynchronize();
+        const float elapsed = timer.ms();
+        cudaProfilerStop();
+
+        std::cout << "[profile] one CCMM: " << elapsed << " ms, " << out.size()
+                  << " output ciphertexts" << std::endl;
     }
     else
     {
