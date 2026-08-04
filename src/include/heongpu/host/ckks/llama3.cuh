@@ -109,6 +109,9 @@ namespace heongpu
         std::vector<double> rotate_cols_host(const std::vector<double>& a,
                                              int d, int k);
 
+        /** @brief Reference d x d transpose, for tests and for masks. */
+        std::vector<double> transpose_host(const std::vector<double>& a, int d);
+
         /** @brief Reference d x d product, for tests and for building masks. */
         std::vector<double> matmul_host(const std::vector<double>& a,
                                         const std::vector<double>& b, int d);
@@ -184,6 +187,29 @@ namespace heongpu
              */
             void multiply_plaintext(Ciphertext<Scheme::CKKS>& ct,
                                     Plaintext<Scheme::CKKS>& plain);
+
+            /**
+             * @brief Bring @p ct to exactly @p target, costing one level.
+             *
+             * Rescaling divides by a prime that only approximates the nominal
+             * scale, so two ciphertexts that have been through different
+             * numbers of products no longer agree on scale even when they
+             * agree on level. Addition needs them to agree, so a residual
+             * connection has to pay this level.
+             */
+            void match_scale(Ciphertext<Scheme::CKKS>& ct, double target);
+
+            /**
+             * @brief @p x + @p sublayer, reconciling level and scale first.
+             *
+             * The two operands of a residual connection have been through
+             * completely different circuits, so neither the level nor the
+             * scale lines up. Both are brought onto the deeper of the two and
+             * onto one scale; that costs the single level match_scale needs.
+             */
+            Ciphertext<Scheme::CKKS>
+            residual_add(Ciphertext<Scheme::CKKS>& x,
+                         Ciphertext<Scheme::CKKS>& sublayer);
 
             /** @brief Square, relinearise and rescale. */
             void square(Ciphertext<Scheme::CKKS>& ct,
@@ -371,6 +397,36 @@ namespace heongpu
                     Relinkey<Scheme::CKKS>& relin_key);
 
             /**
+             * @brief SoftMax restricted to the positions @p mask keeps.
+             *
+             * The mask is applied to the exponentials, where a zero removes a
+             * coordinate from both the numerator and the sum, which is what
+             * attention wants of a causal mask. It costs the one level a slot
+             * multiplication costs.
+             *
+             * A mask entry may be any positive weight rather than one, and
+             * this is what makes a variable-length mask usable: the rounds
+             * normalise, so a factor constant along the reduced axis cancels
+             * exactly, and choosing it as sqrt(count / kept) leaves the sum of
+             * squares in the same range a full row would produce. Without that
+             * the first round would have to approximate a reciprocal over a
+             * range that widens with every position masked off.
+             *
+             * A masked coordinate is dropped, not excused: the exponential is
+             * evaluated before the mask, so its input still has to lie in
+             * [-bound, 0]. A Chebyshev fit diverges quickly outside its
+             * interval, and a large enough garbage value would survive being
+             * multiplied by the encoding of zero.
+             *
+             * @param mask Exactly slot_count() entries, or empty for none.
+             */
+            Ciphertext<Scheme::CKKS>
+            softmax(Ciphertext<Scheme::CKKS>& ct, const SoftmaxConfig& config,
+                    const std::vector<double>& mask,
+                    Galoiskey<Scheme::CKKS>& galois_key,
+                    Relinkey<Scheme::CKKS>& relin_key);
+
+            /**
              * @brief RoPE as one plaintext-ciphertext product pair.
              *
              * out = x * cos + swap(x) * sin, where swap exchanges the two
@@ -425,6 +481,190 @@ namespace heongpu
                  const MatrixLayout& layout, int giant, int baby, int ell,
                  Galoiskey<Scheme::CKKS>& galois_key);
 
+            // ---------------------------------------------------------------
+            // Linear maps on a packed matrix, and the encrypted product
+            // ---------------------------------------------------------------
+
+            /** @brief Rotations tau needs a Galois key for. */
+            static std::vector<int>
+            tau_rotation_indices(const MatrixLayout& layout);
+
+            /** @brief Rotations transpose needs a Galois key for. */
+            static std::vector<int>
+            transpose_rotation_indices(const MatrixLayout& layout);
+
+            /** @brief Rotations ccmm needs a Galois key for. */
+            static std::vector<int>
+            ccmm_rotation_indices(const MatrixLayout& layout);
+
+            /**
+             * @brief The permutation tau of Equation (4), homomorphically.
+             *
+             * tau(X)[i][j] = X[(i + j) mod d][j]. A row rotation is an
+             * ordinary slot rotation in this layout, so this is d - 1
+             * rotations and the one level the column masks cost.
+             *
+             * Equation (5) consumes tau^{l+1} of its operand, so an isolated
+             * pcmm has to be handed tau of its input. A chain of them does not
+             * pay this per product: it feeds tau^L in once and peels one power
+             * off at each step, which is the whole point of the tau tower.
+             */
+            Ciphertext<Scheme::CKKS> tau(Ciphertext<Scheme::CKKS>& ct,
+                                         const MatrixLayout& layout,
+                                         Galoiskey<Scheme::CKKS>& galois_key);
+
+            /**
+             * @brief Matrix transpose, homomorphically.
+             *
+             * Entry (i, j) moves by (j - i)(d - 1) positions within its
+             * matrix, so the map has 2d - 1 diagonals: 2d - 2 rotations and
+             * one masking level.
+             */
+            Ciphertext<Scheme::CKKS>
+            transpose(Ciphertext<Scheme::CKKS>& ct, const MatrixLayout& layout,
+                      Galoiskey<Scheme::CKKS>& galois_key);
+
+            /**
+             * @brief @p scale * A * B with both operands encrypted.
+             *
+             * Section 4.2 covers the plaintext-weight product only, and
+             * attention needs Q^T K and V P^T, where both operands came out of
+             * a previous ciphertext. This is the Jiang-Kim-Lauter-Song
+             * identity A B = sum_k rot_C^k(sigma(A)) * rot_R^k(tau(B)) carried
+             * over to the batched layout.
+             *
+             * Depth is two rather than the usual three because sigma and the
+             * column rotation are taken together: rot_C^k(sigma(A)) reads
+             * A[i][(i + j + k) mod d], which is still one diagonal per shift of
+             * A itself, so the 2d - 2 rotations of A are shared by every k and
+             * only the masks differ. That also makes @p scale free, since it
+             * multiplies masks that are being encoded anyway.
+             *
+             * Costs 4d - 4 rotations, d(2d - 1) + d plaintext products and d
+             * encrypted products. The encrypted products are accumulated
+             * before relinearising, so there is one key switch rather than d.
+             */
+            Ciphertext<Scheme::CKKS>
+            ccmm(Ciphertext<Scheme::CKKS>& a, Ciphertext<Scheme::CKKS>& b,
+                 const MatrixLayout& layout, double scale,
+                 Galoiskey<Scheme::CKKS>& galois_key,
+                 Relinkey<Scheme::CKKS>& relin_key);
+
+            // ---------------------------------------------------------------
+            // Sublayers
+            // ---------------------------------------------------------------
+            //
+            // Both sublayers hold activations TRANSPOSED, X[channel][token],
+            // packed by MatrixLayout with the batch axis carrying independent
+            // instances such as heads. Two things fall out of that and neither
+            // is a coincidence:
+            //
+            //   - a projection is W X, so Equation (5) applies with the weight
+            //     on the left, exactly where it needs the plaintext to be;
+            //   - a sum over channels is a sum over the slow axis, which is
+            //     the exact, level-free strided reduction of Section 3.2.
+            //
+            // The weights are per block: one ciphertext holds d channels of d
+            // tokens, so a model whose width exceeds d needs the caller to sum
+            // the products of the channel blocks, the way rms_norm already
+            // accumulates over its inputs. That orchestration is Table 4 and is
+            // not attempted here.
+
+            /** @brief Plaintext weights of one attention sublayer. */
+            struct AttentionWeights
+            {
+                /// d x d, or d x d per batch entry. Empty skips the
+                /// projection and takes the input as already projected.
+                std::vector<double> query;
+                std::vector<double> key;
+                std::vector<double> value;
+                std::vector<double> output; ///< Empty skips W_o.
+            };
+
+            /** @brief Shape and approximation settings for attention. */
+            struct AttentionConfig
+            {
+                MatrixLayout layout;
+                int giant = 0; ///< BSGS split of the projections; 0 balances.
+                int baby = 0;
+                bool causal = true;   ///< Mask keys ahead of the query.
+                bool rope = false;    ///< Apply RoPE to Q and K.
+                double head_scale = 0.0;  ///< 1/sqrt(head_dim); 0 uses 1/sqrt(d).
+                /// Subtracted from the scores so they land in [-bound, 0].
+                /// Calibrated, as in the paper, not computed homomorphically.
+                double score_shift = 0.0;
+                /// bound, iterations and the degrees are the caller's; the
+                /// layout fixes strided, stride and count and they are
+                /// overwritten.
+                SoftmaxConfig softmax;
+            };
+
+            /** @brief The mask a causal attention wants, ready for softmax. */
+            static std::vector<double> causal_mask(const MatrixLayout& layout);
+
+            /** @brief Rotations attention needs a Galois key for. */
+            static std::vector<int>
+            attention_rotation_indices(const AttentionConfig& config);
+
+            /** @brief The RoPE half-swap shift implied by a layout. */
+            static int rope_swap_shift(const MatrixLayout& layout);
+
+            /**
+             * @brief One attention sublayer over a transposed activation
+             *        block.
+             *
+             * Q, K and V are projected out of @p x, optionally rotated by
+             * RoPE, and the scores are formed as K^T Q rather than Q^T K.
+             * That is deliberate: it puts the key position on the slow axis,
+             * which is the axis the free strided reduction sums over, so the
+             * SoftMax denominator costs no level and no mask. The result of
+             * the SoftMax is then already P^T, which is the operand V needs.
+             *
+             * @param rope Empty, or exactly {cos, sin} as rope() wants them.
+             */
+            Ciphertext<Scheme::CKKS>
+            attention(Ciphertext<Scheme::CKKS>& x,
+                      const AttentionWeights& weights,
+                      std::vector<Plaintext<Scheme::CKKS>>& rope_plain,
+                      const AttentionConfig& config,
+                      Galoiskey<Scheme::CKKS>& galois_key,
+                      Relinkey<Scheme::CKKS>& relin_key);
+
+            /** @brief Plaintext weights of one SwiGLU sublayer. */
+            struct FeedForwardWeights
+            {
+                std::vector<double> gate;
+                std::vector<double> up;
+                std::vector<double> down;
+            };
+
+            /** @brief Shape and approximation settings for feed_forward. */
+            struct FeedForwardConfig
+            {
+                MatrixLayout layout;
+                int giant = 0; ///< BSGS split; 0 balances.
+                int baby = 0;
+                double silu_bound = 10.8; ///< Table 2 after calibration.
+                int silu_degree = 31;     ///< Section 3.1.3.
+            };
+
+            /** @brief Rotations feed_forward needs a Galois key for. */
+            static std::vector<int>
+            feed_forward_rotation_indices(const FeedForwardConfig& config);
+
+            /**
+             * @brief The SwiGLU sublayer, W_down (SiLU(W_gate x) * W_up x).
+             *
+             * The gate and the up projection share one tau of the input, so
+             * the sublayer pays for that map once rather than twice.
+             */
+            Ciphertext<Scheme::CKKS>
+            feed_forward(Ciphertext<Scheme::CKKS>& x,
+                         const FeedForwardWeights& weights,
+                         const FeedForwardConfig& config,
+                         Galoiskey<Scheme::CKKS>& galois_key,
+                         Relinkey<Scheme::CKKS>& relin_key);
+
           private:
             /// The prime the next rescale of @p ct will divide by.
             double rescale_prime(const Ciphertext<Scheme::CKKS>& ct) const;
@@ -444,6 +684,29 @@ namespace heongpu
             /// Encode @p values at @p scale, dropped onto @p depth.
             Plaintext<Scheme::CKKS> encode(const std::vector<double>& values,
                                            double scale, int depth);
+
+            /// Multiply @p ct by @p values and fold the product into @p acc,
+            /// which is left with its rescale still pending.
+            void accumulate_masked(Ciphertext<Scheme::CKKS>& acc,
+                                   bool& started,
+                                   Ciphertext<Scheme::CKKS>& ct,
+                                   const std::vector<double>& values,
+                                   double plain_scale, const char* context);
+
+            /// Balanced BSGS factors of @p d, or the caller's if given.
+            static void bsgs_split(int d, int& giant, int& baby);
+
+            /// sigma applied to every d x d block of a stored weight.
+            static std::vector<double> sigma_blocks(const std::vector<double>& w,
+                                                    const MatrixLayout& layout,
+                                                    const char* name);
+
+            /// One W x projection: pcmm at l = 0 on an operand already tau'd.
+            Ciphertext<Scheme::CKKS>
+            project(Ciphertext<Scheme::CKKS>& tau_x,
+                    const std::vector<double>& weight,
+                    const MatrixLayout& layout, int giant, int baby,
+                    const char* name, Galoiskey<Scheme::CKKS>& galois_key);
 
             HEEncoder<Scheme::CKKS> encoder_;
             /// Cached: the context hands out its modulus chain by value.

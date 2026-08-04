@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -24,6 +26,17 @@ namespace heongpu
             {
                 int r = k % d;
                 return r < 0 ? r + d : r;
+            }
+
+            void require_layout(const MatrixLayout& layout)
+            {
+                if (!is_power_of_two(layout.d) || layout.batch <= 0 ||
+                    layout.slots != layout.d * layout.d * layout.batch)
+                {
+                    throw std::invalid_argument(
+                        "The matrix layout must be a default-constructed "
+                        "MatrixLayout(d, batch), not one assembled by hand");
+                }
             }
         } // namespace
 
@@ -144,6 +157,19 @@ namespace heongpu
                 for (int j = 0; j < d; j++)
                 {
                     out[i * d + j] = a[i * d + wrap(j + k, d)];
+                }
+            }
+            return out;
+        }
+
+        std::vector<double> transpose_host(const std::vector<double>& a, int d)
+        {
+            std::vector<double> out(static_cast<std::size_t>(d) * d);
+            for (int i = 0; i < d; i++)
+            {
+                for (int j = 0; j < d; j++)
+                {
+                    out[i * d + j] = a[j * d + i];
                 }
             }
             return out;
@@ -348,6 +374,65 @@ namespace heongpu
             relinearize_inplace(out, relin_key);
             rescale_inplace(out);
             return out;
+        }
+
+        void Llama3Operator::match_scale(Ciphertext<Scheme::CKKS>& ct,
+                                         double target)
+        {
+            if (!(target > 0.0))
+            {
+                throw std::invalid_argument("Target scale must be positive");
+            }
+
+            // A product by a plaintext at scale s takes the ciphertext to
+            // ct.scale() * s, and the rescale then divides by the prime, so
+            // encoding the constant one at target * prime / ct.scale() lands
+            // exactly on the target.
+            const double prime = rescale_prime(ct);
+            const std::vector<double> ones(slot_count_, 1.0);
+            Plaintext<Scheme::CKKS> plain =
+                encode(ones, target * prime / ct.scale(), ct.depth());
+            multiply_plain_inplace(ct, plain);
+            rescale_inplace(ct);
+        }
+
+        Ciphertext<Scheme::CKKS>
+        Llama3Operator::residual_add(Ciphertext<Scheme::CKKS>& x,
+                                     Ciphertext<Scheme::CKKS>& sublayer)
+        {
+            Ciphertext<Scheme::CKKS> skip = x;
+            Ciphertext<Scheme::CKKS> out = sublayer;
+            align_levels(skip, out);
+
+            // match_scale spends a level, so the sublayer output follows it
+            // down; the drop leaves its scale alone, which is the scale both
+            // are now on.
+            match_scale(skip, out.scale());
+            drop_to_depth(out, skip.depth());
+
+            add_same_scale(out, skip, "residual");
+            return out;
+        }
+
+        void Llama3Operator::accumulate_masked(
+            Ciphertext<Scheme::CKKS>& acc, bool& started,
+            Ciphertext<Scheme::CKKS>& ct, const std::vector<double>& values,
+            double plain_scale, const char* context)
+        {
+            Plaintext<Scheme::CKKS> plain =
+                encode(values, plain_scale, ct.depth());
+            Ciphertext<Scheme::CKKS> term(context_);
+            multiply_plain(ct, plain, term);
+
+            if (!started)
+            {
+                acc = term;
+                started = true;
+            }
+            else
+            {
+                add_same_scale(acc, term, context);
+            }
         }
 
         // -------------------------------------------------------------------
@@ -736,6 +821,23 @@ namespace heongpu
                                 Galoiskey<Scheme::CKKS>& galois_key,
                                 Relinkey<Scheme::CKKS>& relin_key)
         {
+            const std::vector<double> none;
+            return softmax(ct, config, none, galois_key, relin_key);
+        }
+
+        Ciphertext<Scheme::CKKS>
+        Llama3Operator::softmax(Ciphertext<Scheme::CKKS>& ct,
+                                const SoftmaxConfig& config,
+                                const std::vector<double>& mask,
+                                Galoiskey<Scheme::CKKS>& galois_key,
+                                Relinkey<Scheme::CKKS>& relin_key)
+        {
+            if (!mask.empty() &&
+                static_cast<int>(mask.size()) != slot_count_)
+            {
+                throw std::invalid_argument(
+                    "A SoftMax mask must hold exactly slot_count() entries");
+            }
             if (config.count <= 1 || !is_power_of_two(config.count))
             {
                 throw std::invalid_argument(
@@ -763,6 +865,15 @@ namespace heongpu
             Ciphertext<Scheme::CKKS> y = exp_scaled_negative(
                 ct, config.bound, config.iterations, config.exp_degree,
                 relin_key);
+
+            // Masking the exponentials rather than the scores removes a
+            // coordinate from the numerator and from the sum at once. The
+            // rounds below normalise, so a mask weight that is constant along
+            // the reduced axis cancels and only the pattern of zeros survives.
+            if (!mask.empty())
+            {
+                multiply_vector(y, mask);
+            }
 
             for (int round = 0; round < config.iterations; round++)
             {
@@ -1007,6 +1118,645 @@ namespace heongpu
             }
 
             return result;
+        }
+
+        // -------------------------------------------------------------------
+        // Linear maps on a packed matrix, and the encrypted product
+        // -------------------------------------------------------------------
+
+        std::vector<int>
+        Llama3Operator::tau_rotation_indices(const MatrixLayout& layout)
+        {
+            require_layout(layout);
+
+            const int row = layout.d * layout.batch;
+            std::vector<int> indices;
+            for (int u = 1; u < layout.d; u++)
+            {
+                indices.push_back(u * row);
+            }
+            return indices;
+        }
+
+        std::vector<int>
+        Llama3Operator::transpose_rotation_indices(const MatrixLayout& layout)
+        {
+            require_layout(layout);
+
+            // Entry (i, j) sits (j - i)(d - 1) positions from entry (j, i).
+            const int step = (layout.d - 1) * layout.batch;
+            std::vector<int> indices;
+            for (int s = 1; s < layout.d; s++)
+            {
+                indices.push_back(s * step);
+                indices.push_back(-s * step);
+            }
+            return indices;
+        }
+
+        std::vector<int>
+        Llama3Operator::ccmm_rotation_indices(const MatrixLayout& layout)
+        {
+            require_layout(layout);
+
+            const int row = layout.d * layout.batch;
+            std::vector<int> indices;
+            // The diagonals of the left operand, shared by every k.
+            for (int s = 1; s < layout.d; s++)
+            {
+                indices.push_back(s * layout.batch);
+                indices.push_back(-s * layout.batch);
+            }
+            // tau of the right operand and the row rotations that follow it
+            // ask for the same shifts.
+            for (int u = 1; u < layout.d; u++)
+            {
+                indices.push_back(u * row);
+            }
+            return indices;
+        }
+
+        Ciphertext<Scheme::CKKS>
+        Llama3Operator::tau(Ciphertext<Scheme::CKKS>& ct,
+                            const MatrixLayout& layout,
+                            Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            require_layout(layout);
+            if (layout.slots != slot_count_)
+            {
+                throw std::invalid_argument(
+                    "The matrix layout must fill the slot vector exactly");
+            }
+
+            const int d = layout.d;
+            const int batch = layout.batch;
+            const int row = d * batch;
+            const double plain_scale = rescale_prime(ct);
+
+            Ciphertext<Scheme::CKKS> acc(context_);
+            bool started = false;
+            for (int u = 0; u < d; u++)
+            {
+                // tau(X)[i][j] = X[(i + j) mod d][j], so column j takes its
+                // entries from the row rotation by j and from no other.
+                std::vector<double> mask(slot_count_, 0.0);
+                for (int r = 0; r < d; r++)
+                {
+                    for (int m = 0; m < batch; m++)
+                    {
+                        mask[(r * d + u) * batch + m] = 1.0;
+                    }
+                }
+
+                Ciphertext<Scheme::CKKS> source(context_);
+                if (u == 0)
+                {
+                    source = ct;
+                }
+                else
+                {
+                    rotate_rows(ct, source, galois_key, u * row);
+                }
+
+                accumulate_masked(acc, started, source, mask, plain_scale,
+                                  "tau");
+            }
+
+            rescale_inplace(acc);
+            return acc;
+        }
+
+        Ciphertext<Scheme::CKKS>
+        Llama3Operator::transpose(Ciphertext<Scheme::CKKS>& ct,
+                                  const MatrixLayout& layout,
+                                  Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            require_layout(layout);
+            if (layout.slots != slot_count_)
+            {
+                throw std::invalid_argument(
+                    "The matrix layout must fill the slot vector exactly");
+            }
+
+            const int d = layout.d;
+            const int batch = layout.batch;
+            const int step = (d - 1) * batch;
+            const double plain_scale = rescale_prime(ct);
+
+            Ciphertext<Scheme::CKKS> acc(context_);
+            bool started = false;
+            for (int s = -(d - 1); s <= d - 1; s++)
+            {
+                // The diagonal j - i = s, which the rotation by s(d - 1)
+                // brings into place and the mask is what keeps.
+                std::vector<double> mask;
+                for (int i = 0; i < d; i++)
+                {
+                    const int j = i + s;
+                    if (j < 0 || j >= d)
+                    {
+                        continue;
+                    }
+                    if (mask.empty())
+                    {
+                        mask.assign(slot_count_, 0.0);
+                    }
+                    for (int m = 0; m < batch; m++)
+                    {
+                        mask[(i * d + j) * batch + m] = 1.0;
+                    }
+                }
+                if (mask.empty())
+                {
+                    continue;
+                }
+
+                Ciphertext<Scheme::CKKS> source(context_);
+                if (s == 0)
+                {
+                    source = ct;
+                }
+                else
+                {
+                    rotate_rows(ct, source, galois_key, s * step);
+                }
+
+                accumulate_masked(acc, started, source, mask, plain_scale,
+                                  "transpose");
+            }
+
+            rescale_inplace(acc);
+            return acc;
+        }
+
+        Ciphertext<Scheme::CKKS>
+        Llama3Operator::ccmm(Ciphertext<Scheme::CKKS>& a,
+                             Ciphertext<Scheme::CKKS>& b,
+                             const MatrixLayout& layout, double scale,
+                             Galoiskey<Scheme::CKKS>& galois_key,
+                             Relinkey<Scheme::CKKS>& relin_key)
+        {
+            require_layout(layout);
+            if (layout.slots != slot_count_)
+            {
+                throw std::invalid_argument(
+                    "The matrix layout must fill the slot vector exactly");
+            }
+
+            const int d = layout.d;
+            const int batch = layout.batch;
+            const int row = d * batch;
+
+            Ciphertext<Scheme::CKKS> lhs = a;
+            Ciphertext<Scheme::CKKS> rhs = b;
+            align_levels(lhs, rhs);
+
+            // Right operand: tau costs one level, and the d - 1 row rotations
+            // that follow it cost none.
+            Ciphertext<Scheme::CKKS> tb = tau(rhs, layout, galois_key);
+            std::vector<Ciphertext<Scheme::CKKS>> right;
+            right.reserve(d);
+            for (int k = 0; k < d; k++)
+            {
+                if (k == 0)
+                {
+                    right.push_back(tb);
+                }
+                else
+                {
+                    Ciphertext<Scheme::CKKS> shifted(context_);
+                    rotate_rows(tb, shifted, galois_key, k * row);
+                    right.push_back(shifted);
+                }
+            }
+
+            // Left operand: rot_C^k(sigma(A))[i][j] is A[i][(i + j + k) mod d],
+            // which is still a single diagonal of A per shift, so all d of
+            // them are built from one set of 2d - 2 rotations and differ only
+            // in their masks. That is what keeps the whole product at depth
+            // two instead of the three sigma and the column rotation would
+            // cost separately.
+            std::vector<Ciphertext<Scheme::CKKS>> diagonal;
+            diagonal.reserve(2 * d - 1);
+            for (int s = -(d - 1); s <= d - 1; s++)
+            {
+                if (s == 0)
+                {
+                    diagonal.push_back(lhs);
+                }
+                else
+                {
+                    Ciphertext<Scheme::CKKS> shifted(context_);
+                    rotate_rows(lhs, shifted, galois_key, s * batch);
+                    diagonal.push_back(shifted);
+                }
+            }
+
+            const double plain_scale = rescale_prime(lhs);
+            Ciphertext<Scheme::CKKS> product(context_);
+            bool product_started = false;
+
+            for (int k = 0; k < d; k++)
+            {
+                std::vector<std::vector<double>> masks(2 * d - 1);
+                for (int i = 0; i < d; i++)
+                {
+                    for (int j = 0; j < d; j++)
+                    {
+                        const int s = wrap(i + j + k, d) - j;
+                        std::vector<double>& mask = masks[s + d - 1];
+                        if (mask.empty())
+                        {
+                            mask.assign(slot_count_, 0.0);
+                        }
+                        // The requested scaling rides on masks that have to be
+                        // encoded anyway, so it is free.
+                        for (int m = 0; m < batch; m++)
+                        {
+                            mask[(i * d + j) * batch + m] = scale;
+                        }
+                    }
+                }
+
+                Ciphertext<Scheme::CKKS> left(context_);
+                bool left_started = false;
+                for (int t = 0; t < 2 * d - 1; t++)
+                {
+                    if (masks[t].empty())
+                    {
+                        continue;
+                    }
+                    accumulate_masked(left, left_started, diagonal[t], masks[t],
+                                      plain_scale, "ccmm left operand");
+                }
+                rescale_inplace(left);
+
+                Ciphertext<Scheme::CKKS> term(context_);
+                multiply(left, right[k], term);
+
+                // The d terms are summed before relinearising, so the whole
+                // product pays for one key switch rather than d.
+                if (!product_started)
+                {
+                    product = term;
+                    product_started = true;
+                }
+                else
+                {
+                    add_same_scale(product, term, "ccmm product");
+                }
+            }
+
+            relinearize_inplace(product, relin_key);
+            rescale_inplace(product);
+            return product;
+        }
+
+        // -------------------------------------------------------------------
+        // Sublayers
+        // -------------------------------------------------------------------
+
+        void Llama3Operator::bsgs_split(int d, int& giant, int& baby)
+        {
+            if (giant > 0 && baby > 0)
+            {
+                if (giant * baby != d)
+                {
+                    throw std::invalid_argument(
+                        "The BSGS factors given must multiply to the matrix "
+                        "dimension");
+                }
+                return;
+            }
+
+            int b = 1;
+            while (b * b < d)
+            {
+                b <<= 1;
+            }
+            if (b * b > d)
+            {
+                b >>= 1;
+            }
+            baby = b;
+            giant = d / b;
+        }
+
+        std::vector<double>
+        Llama3Operator::sigma_blocks(const std::vector<double>& w,
+                                     const MatrixLayout& layout,
+                                     const char* name)
+        {
+            const std::size_t entries =
+                static_cast<std::size_t>(layout.d) * layout.d;
+
+            if (w.size() == entries)
+            {
+                return permute_sigma(w, layout.d);
+            }
+
+            if (w.size() == entries * static_cast<std::size_t>(layout.batch))
+            {
+                std::vector<double> out;
+                out.reserve(w.size());
+                for (int m = 0; m < layout.batch; m++)
+                {
+                    const std::ptrdiff_t base =
+                        static_cast<std::ptrdiff_t>(m) *
+                        static_cast<std::ptrdiff_t>(entries);
+                    const std::vector<double> block(
+                        w.begin() + base,
+                        w.begin() + base +
+                            static_cast<std::ptrdiff_t>(entries));
+                    const std::vector<double> permuted =
+                        permute_sigma(block, layout.d);
+                    out.insert(out.end(), permuted.begin(), permuted.end());
+                }
+                return out;
+            }
+
+            throw std::invalid_argument(
+                std::string("The ") + name +
+                " weight must hold one d by d block, shared by the batch, or "
+                "one per batch entry");
+        }
+
+        Ciphertext<Scheme::CKKS>
+        Llama3Operator::project(Ciphertext<Scheme::CKKS>& tau_x,
+                                const std::vector<double>& weight,
+                                const MatrixLayout& layout, int giant, int baby,
+                                const char* name,
+                                Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            // Equation (5) at l = 0 turns tau of the operand into the plain
+            // product, so the stored weight is just sigma of it.
+            const std::vector<double> stored =
+                sigma_blocks(weight, layout, name);
+            return pcmm(tau_x, stored, layout, giant, baby, 0, galois_key);
+        }
+
+        int Llama3Operator::rope_swap_shift(const MatrixLayout& layout)
+        {
+            require_layout(layout);
+            if (layout.d < 2)
+            {
+                throw std::invalid_argument(
+                    "RoPE needs at least two channels to pair up");
+            }
+            // Channels are the slow axis, so pairing channel r with
+            // r + d / 2 is one row rotation by half the matrix.
+            return (layout.d / 2) * layout.d * layout.batch;
+        }
+
+        std::vector<double>
+        Llama3Operator::causal_mask(const MatrixLayout& layout)
+        {
+            require_layout(layout);
+
+            const int d = layout.d;
+            const int batch = layout.batch;
+            std::vector<double> mask(static_cast<std::size_t>(layout.slots),
+                                     0.0);
+
+            for (int query = 0; query < d; query++)
+            {
+                // A query attends to itself and everything before it, so the
+                // number of surviving keys grows down the sequence. Weighting
+                // by sqrt(d / kept) leaves the sum of squares in the range a
+                // full row would give, which is the range the first round's
+                // reciprocal is fitted over; the rounds normalise, so a weight
+                // constant along the key axis cancels and the result is
+                // unchanged.
+                const double weight =
+                    std::sqrt(static_cast<double>(d) /
+                              static_cast<double>(query + 1));
+                for (int key = 0; key <= query; key++)
+                {
+                    for (int m = 0; m < batch; m++)
+                    {
+                        mask[(key * d + query) * batch + m] = weight;
+                    }
+                }
+            }
+
+            return mask;
+        }
+
+        std::vector<int> Llama3Operator::attention_rotation_indices(
+            const AttentionConfig& config)
+        {
+            const MatrixLayout& layout = config.layout;
+            require_layout(layout);
+
+            int giant = config.giant;
+            int baby = config.baby;
+            bsgs_split(layout.d, giant, baby);
+
+            std::set<int> indices;
+            for (int r : tau_rotation_indices(layout))
+            {
+                indices.insert(r);
+            }
+            for (int r : pcmm_rotation_indices(layout, giant, baby))
+            {
+                indices.insert(r);
+            }
+            for (int r : transpose_rotation_indices(layout))
+            {
+                indices.insert(r);
+            }
+            for (int r : ccmm_rotation_indices(layout))
+            {
+                indices.insert(r);
+            }
+            for (int r : strided_rotation_indices(layout.d * layout.batch,
+                                                  layout.d))
+            {
+                indices.insert(r);
+            }
+            if (config.rope)
+            {
+                indices.insert(rope_swap_shift(layout));
+            }
+
+            return std::vector<int>(indices.begin(), indices.end());
+        }
+
+        std::vector<int> Llama3Operator::feed_forward_rotation_indices(
+            const FeedForwardConfig& config)
+        {
+            const MatrixLayout& layout = config.layout;
+            require_layout(layout);
+
+            int giant = config.giant;
+            int baby = config.baby;
+            bsgs_split(layout.d, giant, baby);
+
+            std::set<int> indices;
+            for (int r : tau_rotation_indices(layout))
+            {
+                indices.insert(r);
+            }
+            for (int r : pcmm_rotation_indices(layout, giant, baby))
+            {
+                indices.insert(r);
+            }
+            return std::vector<int>(indices.begin(), indices.end());
+        }
+
+        Ciphertext<Scheme::CKKS> Llama3Operator::attention(
+            Ciphertext<Scheme::CKKS>& x, const AttentionWeights& weights,
+            std::vector<Plaintext<Scheme::CKKS>>& rope_plain,
+            const AttentionConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            const MatrixLayout& layout = config.layout;
+            require_layout(layout);
+            if (layout.slots != slot_count_)
+            {
+                throw std::invalid_argument(
+                    "The matrix layout must fill the slot vector exactly");
+            }
+            if (config.rope && rope_plain.size() != 2)
+            {
+                throw std::invalid_argument(
+                    "RoPE needs exactly the cosine and sine plaintexts");
+            }
+
+            const int d = layout.d;
+            int giant = config.giant;
+            int baby = config.baby;
+            bsgs_split(d, giant, baby);
+
+            const bool any_projection = !weights.query.empty() ||
+                                        !weights.key.empty() ||
+                                        !weights.value.empty();
+            const bool all_projections = !weights.query.empty() &&
+                                         !weights.key.empty() &&
+                                         !weights.value.empty();
+            if (any_projection && !all_projections)
+            {
+                throw std::invalid_argument(
+                    "Attention needs all three of the query, key and value "
+                    "weights, or none of them");
+            }
+
+            Ciphertext<Scheme::CKKS> query(context_);
+            Ciphertext<Scheme::CKKS> key(context_);
+            Ciphertext<Scheme::CKKS> value(context_);
+
+            if (all_projections)
+            {
+                // One tau serves all three projections, which is the only
+                // reason an isolated pcmm's tau is affordable here.
+                Ciphertext<Scheme::CKKS> tau_x = tau(x, layout, galois_key);
+                query = project(tau_x, weights.query, layout, giant, baby,
+                                "query", galois_key);
+                key = project(tau_x, weights.key, layout, giant, baby, "key",
+                              galois_key);
+                value = project(tau_x, weights.value, layout, giant, baby,
+                                "value", galois_key);
+            }
+            else
+            {
+                query = x;
+                key = x;
+                value = x;
+            }
+
+            if (config.rope)
+            {
+                const int swap = rope_swap_shift(layout);
+                query = rope(query, rope_plain[0], rope_plain[1], swap,
+                             galois_key);
+                key = rope(key, rope_plain[0], rope_plain[1], swap, galois_key);
+            }
+
+            // The scores are formed as K^T Q rather than Q^T K. That puts the
+            // key position on the slow axis, so the SoftMax denominator is the
+            // exact strided reduction and costs no level and no mask, and what
+            // comes out is already P^T, which is the operand the value product
+            // wants.
+            Ciphertext<Scheme::CKKS> key_t = transpose(key, layout, galois_key);
+            const double head = config.head_scale > 0.0
+                                    ? config.head_scale
+                                    : 1.0 / std::sqrt(static_cast<double>(d));
+            Ciphertext<Scheme::CKKS> scores =
+                ccmm(key_t, query, layout, head, galois_key, relin_key);
+
+            if (config.score_shift != 0.0)
+            {
+                // Translating the scores into [-bound, 0] is calibration in
+                // the paper, not a homomorphic maximum, so it is a constant.
+                add_constant(scores, -config.score_shift);
+            }
+
+            SoftmaxConfig softmax_config = config.softmax;
+            softmax_config.strided = true;
+            softmax_config.stride = d * layout.batch;
+            softmax_config.count = d;
+
+            const std::vector<double> mask =
+                config.causal ? causal_mask(layout) : std::vector<double>();
+            Ciphertext<Scheme::CKKS> probabilities =
+                softmax(scores, softmax_config, mask, galois_key, relin_key);
+
+            Ciphertext<Scheme::CKKS> out =
+                ccmm(value, probabilities, layout, 1.0, galois_key, relin_key);
+
+            if (!weights.output.empty())
+            {
+                Ciphertext<Scheme::CKKS> tau_out = tau(out, layout, galois_key);
+                out = project(tau_out, weights.output, layout, giant, baby,
+                              "output", galois_key);
+            }
+
+            return out;
+        }
+
+        Ciphertext<Scheme::CKKS> Llama3Operator::feed_forward(
+            Ciphertext<Scheme::CKKS>& x, const FeedForwardWeights& weights,
+            const FeedForwardConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            const MatrixLayout& layout = config.layout;
+            require_layout(layout);
+            if (layout.slots != slot_count_)
+            {
+                throw std::invalid_argument(
+                    "The matrix layout must fill the slot vector exactly");
+            }
+            if (weights.gate.empty() || weights.up.empty() ||
+                weights.down.empty())
+            {
+                throw std::invalid_argument(
+                    "SwiGLU needs the gate, up and down weights");
+            }
+
+            int giant = config.giant;
+            int baby = config.baby;
+            bsgs_split(layout.d, giant, baby);
+
+            // The gate and the up projection read the same input, so the tau
+            // Equation (5) consumes is taken once for both.
+            Ciphertext<Scheme::CKKS> tau_x = tau(x, layout, galois_key);
+            Ciphertext<Scheme::CKKS> gate = project(
+                tau_x, weights.gate, layout, giant, baby, "gate", galois_key);
+            Ciphertext<Scheme::CKKS> up = project(tau_x, weights.up, layout,
+                                                  giant, baby, "up",
+                                                  galois_key);
+
+            Ciphertext<Scheme::CKKS> activated =
+                silu(gate, config.silu_bound, config.silu_degree, relin_key);
+            Ciphertext<Scheme::CKKS> hidden =
+                multiply_and_rescale(activated, up, relin_key);
+
+            Ciphertext<Scheme::CKKS> tau_hidden =
+                tau(hidden, layout, galois_key);
+            return project(tau_hidden, weights.down, layout, giant, baby,
+                           "down", galois_key);
         }
 
     } // namespace llama
