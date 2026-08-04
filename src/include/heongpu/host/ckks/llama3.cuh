@@ -403,6 +403,8 @@ namespace heongpu
                                            double scale);
 
             HEEncoder<Scheme::CKKS> encoder_;
+            /// Cached: the context hands out its modulus chain by value.
+            std::vector<Modulus64> primes_;
             int slot_count_;
             double default_scale_;
         };

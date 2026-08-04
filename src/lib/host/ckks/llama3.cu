@@ -175,8 +175,8 @@ namespace heongpu
                                        HEEncoder<Scheme::CKKS>& encoder,
                                        double scale)
             : HEArithmeticOperator<Scheme::CKKS>(context, encoder),
-              encoder_(encoder), slot_count_(encoder.slot_count()),
-              default_scale_(scale)
+              encoder_(encoder), primes_(context->get_key_modulus()),
+              slot_count_(encoder.slot_count()), default_scale_(scale)
         {
             if (!(scale > 0.0))
             {
@@ -194,13 +194,12 @@ namespace heongpu
         Llama3Operator::rescale_prime(const Ciphertext<Scheme::CKKS>& ct) const
         {
             const int level = ct.level();
-            if (level < 0 || level >= static_cast<int>(
-                                          context_->prime_vector_.size()))
+            if (level < 0 || level >= static_cast<int>(primes_.size()))
             {
                 throw std::invalid_argument(
                     "Ciphertext has no level left to rescale");
             }
-            return static_cast<double>(context_->prime_vector_[level].value);
+            return static_cast<double>(primes_[level].value);
         }
 
         Plaintext<Scheme::CKKS>
