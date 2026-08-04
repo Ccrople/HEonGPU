@@ -10,6 +10,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace heongpu
 {
@@ -106,6 +107,45 @@ namespace heongpu
                     "MatrixLayout needs a power-of-two d and a positive batch");
             }
             slots = d * d * batch;
+        }
+
+        BlockMatrix::BlockMatrix(int out_blocks_, int in_blocks_)
+            : out_blocks(out_blocks_), in_blocks(in_blocks_)
+        {
+            if (out_blocks <= 0 || in_blocks <= 0)
+            {
+                throw std::invalid_argument(
+                    "A block matrix needs a positive number of blocks in each "
+                    "direction");
+            }
+            blocks.resize(static_cast<std::size_t>(out_blocks) * in_blocks);
+        }
+
+        BlockMatrix::BlockMatrix(std::vector<double> single)
+        {
+            if (single.empty())
+            {
+                return;
+            }
+            out_blocks = 1;
+            in_blocks = 1;
+            blocks.push_back(std::move(single));
+        }
+
+        std::vector<double>& BlockMatrix::at(int i, int j)
+        {
+            return const_cast<std::vector<double>&>(
+                const_cast<const BlockMatrix*>(this)->at(i, j));
+        }
+
+        const std::vector<double>& BlockMatrix::at(int i, int j) const
+        {
+            if (i < 0 || i >= out_blocks || j < 0 || j >= in_blocks)
+            {
+                throw std::out_of_range(
+                    "Block index outside the block matrix");
+            }
+            return blocks[static_cast<std::size_t>(i) * in_blocks + j];
         }
 
         std::vector<double> permute_sigma(const std::vector<double>& a, int d)
@@ -1495,6 +1535,203 @@ namespace heongpu
             return pcmm(tau_x, stored, layout, giant, baby, 0, galois_key);
         }
 
+        void Llama3Operator::require_uniform(
+            const std::vector<Ciphertext<Scheme::CKKS>>& in,
+            const char* name) const
+        {
+            if (in.empty())
+            {
+                throw std::invalid_argument(
+                    std::string("The ") + name +
+                    " needs at least one channel block");
+            }
+
+            const int depth = in.front().depth();
+            const double scale = in.front().scale();
+            for (std::size_t j = 1; j < in.size(); j++)
+            {
+                if (in[j].depth() != depth)
+                {
+                    throw std::invalid_argument(
+                        std::string("The ") + name +
+                        " channel blocks sit at different levels, so the block "
+                        "sums below them cannot be taken");
+                }
+                // The same relative test add_same_scale uses: rescaling drifts
+                // scales, and what must not happen is two blocks drifting
+                // apart before they are added together.
+                if (std::abs(in[j].scale() - scale) >
+                    1e-9 * std::max(std::abs(scale), std::abs(in[j].scale())))
+                {
+                    throw std::invalid_argument(
+                        std::string("The ") + name +
+                        " channel blocks sit at different scales, so the block "
+                        "sums below them would be silently wrong");
+                }
+            }
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>>
+        Llama3Operator::tau_blocks(std::vector<Ciphertext<Scheme::CKKS>>& in,
+                                   const MatrixLayout& layout,
+                                   Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            std::vector<Ciphertext<Scheme::CKKS>> out;
+            out.reserve(in.size());
+            for (auto& block : in)
+            {
+                out.push_back(tau(block, layout, galois_key));
+            }
+            return out;
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>> Llama3Operator::project_blocks(
+            std::vector<Ciphertext<Scheme::CKKS>>& tau_x,
+            const BlockMatrix& weight, const MatrixLayout& layout, int giant,
+            int baby, const char* name, Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            require_layout(layout);
+            if (layout.slots != slot_count_)
+            {
+                throw std::invalid_argument(
+                    "The matrix layout must fill the slot vector exactly");
+            }
+            require_uniform(tau_x, name);
+            bsgs_split(layout.d, giant, baby);
+
+            if (weight.empty())
+            {
+                throw std::invalid_argument(std::string("The ") + name +
+                                            " weight has no blocks");
+            }
+            if (weight.in_blocks != static_cast<int>(tau_x.size()))
+            {
+                throw std::invalid_argument(
+                    std::string("The ") + name +
+                    " weight expects a different number of input channel "
+                    "blocks than it was given");
+            }
+
+            std::vector<Ciphertext<Scheme::CKKS>> out;
+            out.reserve(weight.out_blocks);
+
+            for (int i = 0; i < weight.out_blocks; i++)
+            {
+                Ciphertext<Scheme::CKKS> row(context_);
+                bool started = false;
+
+                for (int j = 0; j < weight.in_blocks; j++)
+                {
+                    const std::vector<double>& block = weight.at(i, j);
+                    if (block.empty())
+                    {
+                        continue; // A zero block is skipped, not encoded.
+                    }
+
+                    Ciphertext<Scheme::CKKS> term = project(
+                        tau_x[j], block, layout, giant, baby, name, galois_key);
+
+                    if (!started)
+                    {
+                        row = term;
+                        started = true;
+                    }
+                    else
+                    {
+                        // Every term left Equation (5) one level below a
+                        // common input and at the input's own scale, so the
+                        // sum over the input blocks is exact and free.
+                        add_same_scale(row, term, name);
+                    }
+                }
+
+                if (!started)
+                {
+                    throw std::invalid_argument(
+                        std::string("Row ") + std::to_string(i) + " of the " +
+                        name +
+                        " weight is entirely empty, so that output block would "
+                        "be a zero this cannot produce");
+                }
+                out.push_back(row);
+            }
+
+            return out;
+        }
+
+        void Llama3Operator::rope_blocks(
+            std::vector<Ciphertext<Scheme::CKKS>>& in, int per_head,
+            std::vector<Plaintext<Scheme::CKKS>>& rope_plain,
+            const MatrixLayout& layout, Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            if (static_cast<int>(rope_plain.size()) != 2 * per_head)
+            {
+                throw std::invalid_argument(
+                    "RoPE needs a cosine and a sine plaintext for each channel "
+                    "block of a head");
+            }
+
+            if (per_head == 1)
+            {
+                // The head is one block wide, so pairing channel c with
+                // c + d / 2 stays inside it and is the row rotation rope()
+                // takes.
+                const int swap = rope_swap_shift(layout);
+                for (auto& block : in)
+                {
+                    block = rope(block, rope_plain[0], rope_plain[1], swap,
+                                 galois_key);
+                }
+                return;
+            }
+
+            if (per_head % 2 != 0)
+            {
+                throw std::invalid_argument(
+                    "RoPE splits a head in half, so a head spanning several "
+                    "channel blocks must span an even number of them");
+            }
+
+            // Wider than one block, the partner of channel c lands in another
+            // block entirely, so the rotation disappears: the pairing is
+            // already there in the choice of which two blocks to combine.
+            const int half = per_head / 2;
+            const int heads = static_cast<int>(in.size()) / per_head;
+            std::vector<Ciphertext<Scheme::CKKS>> out;
+            out.reserve(in.size());
+
+            for (int h = 0; h < heads; h++)
+            {
+                for (int t = 0; t < per_head; t++)
+                {
+                    const int index = h * per_head + t;
+                    const int partner =
+                        h * per_head + (t < half ? t + half : t - half);
+
+                    if (rope_plain[2 * t].scale() !=
+                        rope_plain[2 * t + 1].scale())
+                    {
+                        throw std::invalid_argument(
+                            "RoPE needs the cosine and sine plaintexts at one "
+                            "scale");
+                    }
+
+                    Ciphertext<Scheme::CKKS> direct = in[index];
+                    multiply_plaintext(direct, rope_plain[2 * t]);
+                    rescale_inplace(direct);
+
+                    Ciphertext<Scheme::CKKS> crossed = in[partner];
+                    multiply_plaintext(crossed, rope_plain[2 * t + 1]);
+                    rescale_inplace(crossed);
+
+                    add_same_scale(direct, crossed, "rope across blocks");
+                    out.push_back(direct);
+                }
+            }
+
+            in = out;
+        }
+
         int Llama3Operator::rope_swap_shift(const MatrixLayout& layout)
         {
             require_layout(layout);
@@ -1611,6 +1848,36 @@ namespace heongpu
             Galoiskey<Scheme::CKKS>& galois_key,
             Relinkey<Scheme::CKKS>& relin_key)
         {
+            if (config.heads > 1)
+            {
+                throw std::invalid_argument(
+                    "One channel block holds one head; a multi-head layer has "
+                    "to be handed its blocks as a vector");
+            }
+
+            BlockAttentionWeights blocked;
+            blocked.query = BlockMatrix(weights.query);
+            blocked.key = BlockMatrix(weights.key);
+            blocked.value = BlockMatrix(weights.value);
+            blocked.output = BlockMatrix(weights.output);
+
+            AttentionConfig one = config;
+            one.heads = 1;
+
+            std::vector<Ciphertext<Scheme::CKKS>> in{x};
+            std::vector<Ciphertext<Scheme::CKKS>> out =
+                attention(in, blocked, rope_plain, one, galois_key, relin_key);
+            return out.front();
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>> Llama3Operator::attention(
+            std::vector<Ciphertext<Scheme::CKKS>>& x,
+            const BlockAttentionWeights& weights,
+            std::vector<Plaintext<Scheme::CKKS>>& rope_plain,
+            const AttentionConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
             const MatrixLayout& layout = config.layout;
             require_layout(layout);
             if (layout.slots != slot_count_)
@@ -1618,11 +1885,7 @@ namespace heongpu
                 throw std::invalid_argument(
                     "The matrix layout must fill the slot vector exactly");
             }
-            if (config.rope && rope_plain.size() != 2)
-            {
-                throw std::invalid_argument(
-                    "RoPE needs exactly the cosine and sine plaintexts");
-            }
+            require_uniform(x, "attention input");
 
             const int d = layout.d;
             int giant = config.giant;
@@ -1642,21 +1905,32 @@ namespace heongpu
                     "weights, or none of them");
             }
 
-            Ciphertext<Scheme::CKKS> query(context_);
-            Ciphertext<Scheme::CKKS> key(context_);
-            Ciphertext<Scheme::CKKS> value(context_);
+            std::vector<Ciphertext<Scheme::CKKS>> query;
+            std::vector<Ciphertext<Scheme::CKKS>> key;
+            std::vector<Ciphertext<Scheme::CKKS>> value;
 
             if (all_projections)
             {
-                // One tau serves all three projections, which is the only
-                // reason an isolated pcmm's tau is affordable here.
-                Ciphertext<Scheme::CKKS> tau_x = tau(x, layout, galois_key);
-                query = project(tau_x, weights.query, layout, giant, baby,
-                                "query", galois_key);
-                key = project(tau_x, weights.key, layout, giant, baby, "key",
-                              galois_key);
-                value = project(tau_x, weights.value, layout, giant, baby,
-                                "value", galois_key);
+                if (weights.query.out_blocks != weights.key.out_blocks ||
+                    weights.query.out_blocks != weights.value.out_blocks)
+                {
+                    throw std::invalid_argument(
+                        "The query, key and value weights must produce the "
+                        "same number of channel blocks, since that is what the "
+                        "heads are shared out between");
+                }
+
+                // One tau of each input block serves all three projections,
+                // which is the only reason an isolated pcmm's tau is
+                // affordable here.
+                std::vector<Ciphertext<Scheme::CKKS>> tau_x =
+                    tau_blocks(x, layout, galois_key);
+                query = project_blocks(tau_x, weights.query, layout, giant,
+                                       baby, "query", galois_key);
+                key = project_blocks(tau_x, weights.key, layout, giant, baby,
+                                     "key", galois_key);
+                value = project_blocks(tau_x, weights.value, layout, giant,
+                                       baby, "value", galois_key);
             }
             else
             {
@@ -1665,31 +1939,20 @@ namespace heongpu
                 value = x;
             }
 
+            const int qkv = static_cast<int>(query.size());
+            const int heads = config.heads > 0 ? config.heads : 1;
+            if (qkv % heads != 0)
+            {
+                throw std::invalid_argument(
+                    "The heads must share the query, key and value channel "
+                    "blocks out evenly between them");
+            }
+            const int per_head = qkv / heads;
+
             if (config.rope)
             {
-                const int swap = rope_swap_shift(layout);
-                query = rope(query, rope_plain[0], rope_plain[1], swap,
-                             galois_key);
-                key = rope(key, rope_plain[0], rope_plain[1], swap, galois_key);
-            }
-
-            // The scores are formed as K^T Q rather than Q^T K. That puts the
-            // key position on the slow axis, so the SoftMax denominator is the
-            // exact strided reduction and costs no level and no mask, and what
-            // comes out is already P^T, which is the operand the value product
-            // wants.
-            Ciphertext<Scheme::CKKS> key_t = transpose(key, layout, galois_key);
-            const double head = config.head_scale > 0.0
-                                    ? config.head_scale
-                                    : 1.0 / std::sqrt(static_cast<double>(d));
-            Ciphertext<Scheme::CKKS> scores =
-                ccmm(key_t, query, layout, head, galois_key, relin_key);
-
-            if (config.score_shift != 0.0)
-            {
-                // Translating the scores into [-bound, 0] is calibration in
-                // the paper, not a homomorphic maximum, so it is a constant.
-                add_constant(scores, -config.score_shift);
+                rope_blocks(query, per_head, rope_plain, layout, galois_key);
+                rope_blocks(key, per_head, rope_plain, layout, galois_key);
             }
 
             SoftmaxConfig softmax_config = config.softmax;
@@ -1699,17 +1962,80 @@ namespace heongpu
 
             const std::vector<double> mask =
                 config.causal ? causal_mask(layout) : std::vector<double>();
-            Ciphertext<Scheme::CKKS> probabilities =
-                softmax(scores, softmax_config, mask, galois_key, relin_key);
 
-            Ciphertext<Scheme::CKKS> out =
-                ccmm(value, probabilities, layout, 1.0, galois_key, relin_key);
+            // head_dim is the channel blocks a head owns, times d.
+            const double head =
+                config.head_scale > 0.0
+                    ? config.head_scale
+                    : 1.0 / std::sqrt(static_cast<double>(per_head) * d);
+
+            std::vector<Ciphertext<Scheme::CKKS>> probabilities;
+            probabilities.reserve(heads);
+
+            for (int h = 0; h < heads; h++)
+            {
+                // The scores are formed as K^T Q rather than Q^T K. That puts
+                // the key position on the slow axis, so the SoftMax
+                // denominator is the exact strided reduction and costs no
+                // level and no mask, and what comes out is already P^T, which
+                // is the operand the value product wants.
+                //
+                // A head wider than one block sums its blocks' scores. Each
+                // term is a ccmm at the same level and scale, so the sum over
+                // the head is free and the SoftMax below runs once.
+                Ciphertext<Scheme::CKKS> scores(context_);
+                bool started = false;
+
+                for (int t = 0; t < per_head; t++)
+                {
+                    const int index = h * per_head + t;
+                    Ciphertext<Scheme::CKKS> key_t =
+                        transpose(key[index], layout, galois_key);
+                    Ciphertext<Scheme::CKKS> term = ccmm(
+                        key_t, query[index], layout, head, galois_key,
+                        relin_key);
+
+                    if (!started)
+                    {
+                        scores = term;
+                        started = true;
+                    }
+                    else
+                    {
+                        add_same_scale(scores, term, "attention scores");
+                    }
+                }
+
+                if (config.score_shift != 0.0)
+                {
+                    // Translating the scores into [-bound, 0] is calibration
+                    // in the paper, not a homomorphic maximum, so it is a
+                    // constant.
+                    add_constant(scores, -config.score_shift);
+                }
+
+                probabilities.push_back(softmax(scores, softmax_config, mask,
+                                                galois_key, relin_key));
+            }
+
+            std::vector<Ciphertext<Scheme::CKKS>> out;
+            out.reserve(qkv);
+            for (int h = 0; h < heads; h++)
+            {
+                for (int t = 0; t < per_head; t++)
+                {
+                    const int index = h * per_head + t;
+                    out.push_back(ccmm(value[index], probabilities[h], layout,
+                                       1.0, galois_key, relin_key));
+                }
+            }
 
             if (!weights.output.empty())
             {
-                Ciphertext<Scheme::CKKS> tau_out = tau(out, layout, galois_key);
-                out = project(tau_out, weights.output, layout, giant, baby,
-                              "output", galois_key);
+                std::vector<Ciphertext<Scheme::CKKS>> tau_out =
+                    tau_blocks(out, layout, galois_key);
+                out = project_blocks(tau_out, weights.output, layout, giant,
+                                     baby, "output", galois_key);
             }
 
             return out;
@@ -1717,6 +2043,24 @@ namespace heongpu
 
         Ciphertext<Scheme::CKKS> Llama3Operator::feed_forward(
             Ciphertext<Scheme::CKKS>& x, const FeedForwardWeights& weights,
+            const FeedForwardConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            BlockFeedForwardWeights blocked;
+            blocked.gate = BlockMatrix(weights.gate);
+            blocked.up = BlockMatrix(weights.up);
+            blocked.down = BlockMatrix(weights.down);
+
+            std::vector<Ciphertext<Scheme::CKKS>> in{x};
+            std::vector<Ciphertext<Scheme::CKKS>> out =
+                feed_forward(in, blocked, config, galois_key, relin_key);
+            return out.front();
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>> Llama3Operator::feed_forward(
+            std::vector<Ciphertext<Scheme::CKKS>>& x,
+            const BlockFeedForwardWeights& weights,
             const FeedForwardConfig& config,
             Galoiskey<Scheme::CKKS>& galois_key,
             Relinkey<Scheme::CKKS>& relin_key)
@@ -1734,6 +2078,13 @@ namespace heongpu
                 throw std::invalid_argument(
                     "SwiGLU needs the gate, up and down weights");
             }
+            if (weights.gate.out_blocks != weights.up.out_blocks)
+            {
+                throw std::invalid_argument(
+                    "The gate and the up projection must agree on the hidden "
+                    "width, since the two are multiplied together");
+            }
+            require_uniform(x, "feed-forward input");
 
             int giant = config.giant;
             int baby = config.baby;
@@ -1741,22 +2092,28 @@ namespace heongpu
 
             // The gate and the up projection read the same input, so the tau
             // Equation (5) consumes is taken once for both.
-            Ciphertext<Scheme::CKKS> tau_x = tau(x, layout, galois_key);
-            Ciphertext<Scheme::CKKS> gate = project(
+            std::vector<Ciphertext<Scheme::CKKS>> tau_x =
+                tau_blocks(x, layout, galois_key);
+            std::vector<Ciphertext<Scheme::CKKS>> gate = project_blocks(
                 tau_x, weights.gate, layout, giant, baby, "gate", galois_key);
-            Ciphertext<Scheme::CKKS> up = project(tau_x, weights.up, layout,
-                                                  giant, baby, "up",
-                                                  galois_key);
+            std::vector<Ciphertext<Scheme::CKKS>> up = project_blocks(
+                tau_x, weights.up, layout, giant, baby, "up", galois_key);
 
-            Ciphertext<Scheme::CKKS> activated =
-                silu(gate, config.silu_bound, config.silu_degree, relin_key);
-            Ciphertext<Scheme::CKKS> hidden =
-                multiply_and_rescale(activated, up, relin_key);
+            std::vector<Ciphertext<Scheme::CKKS>> hidden;
+            hidden.reserve(gate.size());
+            for (std::size_t i = 0; i < gate.size(); i++)
+            {
+                Ciphertext<Scheme::CKKS> activated =
+                    silu(gate[i], config.silu_bound, config.silu_degree,
+                         relin_key);
+                hidden.push_back(
+                    multiply_and_rescale(activated, up[i], relin_key));
+            }
 
-            Ciphertext<Scheme::CKKS> tau_hidden =
-                tau(hidden, layout, galois_key);
-            return project(tau_hidden, weights.down, layout, giant, baby,
-                           "down", galois_key);
+            std::vector<Ciphertext<Scheme::CKKS>> tau_hidden =
+                tau_blocks(hidden, layout, galois_key);
+            return project_blocks(tau_hidden, weights.down, layout, giant, baby,
+                                  "down", galois_key);
         }
 
     } // namespace llama

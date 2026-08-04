@@ -30,6 +30,7 @@
 #include <memory>
 #include <random>
 #include <set>
+#include <string>
 #include <vector>
 
 namespace
@@ -137,6 +138,99 @@ namespace
     }
 
     double silu_host(double x) { return x / (1.0 + std::exp(-x)); }
+
+    // -----------------------------------------------------------------------
+    // Channel blocks, for the models wider than one ciphertext
+    // -----------------------------------------------------------------------
+
+    /// One channel block on the host: a d x d matrix per batch entry, which is
+    /// exactly what random_blocks and pack_blocks already speak.
+    using ChannelBlock = std::vector<std::vector<double>>;
+
+    ChannelBlock zero_block(const llama::MatrixLayout& layout)
+    {
+        return ChannelBlock(
+            layout.batch,
+            std::vector<double>(static_cast<std::size_t>(layout.d) * layout.d,
+                                0.0));
+    }
+
+    void add_into(ChannelBlock& acc, const ChannelBlock& term)
+    {
+        for (std::size_t m = 0; m < acc.size(); m++)
+        {
+            for (std::size_t e = 0; e < acc[m].size(); e++)
+            {
+                acc[m][e] += term[m][e];
+            }
+        }
+    }
+
+    ChannelBlock matmul_block(const ChannelBlock& a, const ChannelBlock& b,
+                              int d)
+    {
+        ChannelBlock out(a.size());
+        for (std::size_t m = 0; m < a.size(); m++)
+        {
+            out[m] = llama::matmul_host(a[m], b[m], d);
+        }
+        return out;
+    }
+
+    /// The one-per-batch-entry form a BlockMatrix block takes.
+    std::vector<double> flatten_block(const ChannelBlock& block)
+    {
+        std::vector<double> out;
+        for (const auto& matrix : block)
+        {
+            out.insert(out.end(), matrix.begin(), matrix.end());
+        }
+        return out;
+    }
+
+    /// want[i] = sum_j w[i][j] x[j], the block product the layers perform.
+    std::vector<ChannelBlock> block_project_host(
+        const std::vector<std::vector<ChannelBlock>>& w,
+        const std::vector<ChannelBlock>& x, const llama::MatrixLayout& layout)
+    {
+        std::vector<ChannelBlock> want(w.size());
+        for (std::size_t i = 0; i < w.size(); i++)
+        {
+            want[i] = zero_block(layout);
+            for (std::size_t j = 0; j < x.size(); j++)
+            {
+                add_into(want[i], matmul_block(w[i][j], x[j], layout.d));
+            }
+        }
+        return want;
+    }
+
+    /// The causal SoftMax of a score block, keys on the slow axis.
+    ChannelBlock causal_softmax_host(const ChannelBlock& scores, double scale,
+                                     double shift, int d)
+    {
+        ChannelBlock out(scores.size());
+        for (std::size_t m = 0; m < scores.size(); m++)
+        {
+            out[m].assign(static_cast<std::size_t>(d) * d, 0.0);
+            for (int query = 0; query < d; query++)
+            {
+                double total = 0.0;
+                for (int key = 0; key <= query; key++)
+                {
+                    total +=
+                        std::exp(scores[m][key * d + query] * scale - shift);
+                }
+                for (int key = 0; key <= query; key++)
+                {
+                    out[m][key * d + query] =
+                        std::exp(scores[m][key * d + query] * scale - shift) /
+                        total;
+                }
+            }
+        }
+        return out;
+    }
 
     // -----------------------------------------------------------------------
     // Host-only checks
@@ -2354,6 +2448,442 @@ namespace
         EXPECT_LT(reported("pre-norm attention block", decrypt(result),
                            pack_blocks(want, layout)),
                   1e-4);
+    }
+
+    /// A projection of a model wider than one ciphertext. The sum over the
+    /// input channel blocks is the whole of what makes width possible, and it
+    /// has to be exact: every term leaves Equation (5) at one level and one
+    /// scale, so nothing here may cost depth.
+    TEST_F(Llama3LayerEnv, ProjectBlocksSumsTheChannelBlocks)
+    {
+        const int in_blocks = 3;
+        const int out_blocks = 2;
+        const double weight_scale = 1.0 / std::sqrt(static_cast<double>(
+                                              layout.d * in_blocks));
+
+        llama::Llama3Operator::FeedForwardConfig index_config;
+        index_config.layout = layout;
+        auto key = narrow_key(
+            llama::Llama3Operator::feed_forward_rotation_indices(index_config));
+
+        std::mt19937_64 rng(901);
+        std::vector<ChannelBlock> x;
+        for (int j = 0; j < in_blocks; j++)
+        {
+            x.push_back(random_blocks(layout, 1.0, rng));
+        }
+
+        llama::BlockMatrix weight(out_blocks, in_blocks);
+        std::vector<std::vector<ChannelBlock>> w(out_blocks);
+        for (int i = 0; i < out_blocks; i++)
+        {
+            w[i].resize(in_blocks);
+            for (int j = 0; j < in_blocks; j++)
+            {
+                // One block is left out entirely. A zero block is skipped
+                // rather than encoded, so the answer has to account for a
+                // weight that was never handed over.
+                if (i == 1 && j == 0)
+                {
+                    w[i][j] = zero_block(layout);
+                    continue;
+                }
+                w[i][j] = random_blocks(layout, weight_scale, rng);
+                weight.at(i, j) = flatten_block(w[i][j]);
+            }
+        }
+
+        const std::vector<ChannelBlock> want =
+            block_project_host(w, x, layout);
+
+        std::vector<heongpu::Ciphertext<S>> tau_x;
+        for (int j = 0; j < in_blocks; j++)
+        {
+            heongpu::Ciphertext<S> cipher = encrypt(pack_blocks(x[j], layout));
+            tau_x.push_back(ops->tau(cipher, layout, *key));
+        }
+
+        std::vector<heongpu::Ciphertext<S>> got = ops->project_blocks(
+            tau_x, weight, layout, 0, 0, "block projection", *key);
+        ASSERT_EQ(got.size(), static_cast<std::size_t>(out_blocks));
+
+        for (int i = 0; i < out_blocks; i++)
+        {
+            const std::string label =
+                "project_blocks[" + std::to_string(i) + "]";
+            EXPECT_LT(reported(label.c_str(), decrypt(got[i]),
+                               pack_blocks(want[i], layout)),
+                      1e-6);
+        }
+    }
+
+    /// Attention with a head two channel blocks wide: the projections sum over
+    /// the input blocks, the scores sum over the head's blocks, and RoPE pairs
+    /// a channel with one in the other block, which needs no rotation at all.
+    TEST_F(Llama3LayerEnv, AttentionSpansSeveralChannelBlocks)
+    {
+        const int d = layout.d;
+        const int blocks = 2;
+        const int entries = d * d;
+        const int half = blocks / 2;
+        const double weight_scale =
+            1.0 / std::sqrt(static_cast<double>(d * blocks));
+
+        std::mt19937_64 rng(902);
+        std::vector<ChannelBlock> x;
+        for (int j = 0; j < blocks; j++)
+        {
+            x.push_back(random_blocks(layout, 1.0, rng));
+        }
+
+        llama::Llama3Operator::BlockAttentionWeights weights;
+        weights.query = llama::BlockMatrix(blocks, blocks);
+        weights.key = llama::BlockMatrix(blocks, blocks);
+        weights.value = llama::BlockMatrix(blocks, blocks);
+        weights.output = llama::BlockMatrix(blocks, blocks);
+
+        std::vector<std::vector<ChannelBlock>> wq(blocks), wk(blocks),
+            wv(blocks), wo(blocks);
+        for (int i = 0; i < blocks; i++)
+        {
+            wq[i].resize(blocks);
+            wk[i].resize(blocks);
+            wv[i].resize(blocks);
+            wo[i].resize(blocks);
+            for (int j = 0; j < blocks; j++)
+            {
+                wq[i][j] = random_blocks(layout, weight_scale, rng);
+                wk[i][j] = random_blocks(layout, weight_scale, rng);
+                wv[i][j] = random_blocks(layout, weight_scale, rng);
+                wo[i][j] = random_blocks(layout, weight_scale, rng);
+                weights.query.at(i, j) = flatten_block(wq[i][j]);
+                weights.key.at(i, j) = flatten_block(wk[i][j]);
+                weights.value.at(i, j) = flatten_block(wv[i][j]);
+                weights.output.at(i, j) = flatten_block(wo[i][j]);
+            }
+        }
+
+        // RoPE pairs channel c with c + head_dim / 2. The head is two blocks
+        // wide, so that partner is in the other block: block 0 carries the
+        // first half of the head and takes the negative sine, block 1 the
+        // second half and the positive one. The angles depend on the channel
+        // inside the head and on the token, so both heads would read these.
+        std::vector<std::vector<double>> cos_values(blocks,
+                                                    std::vector<double>(entries));
+        std::vector<std::vector<double>> sin_values(blocks,
+                                                    std::vector<double>(entries));
+        for (int t = 0; t < blocks; t++)
+        {
+            for (int r = 0; r < d; r++)
+            {
+                for (int j = 0; j < d; j++)
+                {
+                    const double theta =
+                        0.05 * (j + 1) * std::pow(2.0, -r);
+                    cos_values[t][r * d + j] = std::cos(theta);
+                    sin_values[t][r * d + j] =
+                        (t < half) ? -std::sin(theta) : std::sin(theta);
+                }
+            }
+        }
+
+        std::vector<std::vector<double>> rope_slots;
+        for (int t = 0; t < blocks; t++)
+        {
+            std::vector<double> cos_slots(slots);
+            std::vector<double> sin_slots(slots);
+            for (int e = 0; e < entries; e++)
+            {
+                for (int m = 0; m < layout.batch; m++)
+                {
+                    cos_slots[e * layout.batch + m] = cos_values[t][e];
+                    sin_slots[e * layout.batch + m] = sin_values[t][e];
+                }
+            }
+            rope_slots.push_back(cos_slots);
+            rope_slots.push_back(sin_slots);
+        }
+
+        std::vector<heongpu::Plaintext<S>> rope_plain;
+        for (std::size_t i = 0; i < rope_slots.size(); i++)
+        {
+            rope_plain.emplace_back(context);
+        }
+        for (std::size_t i = 0; i < rope_slots.size(); i++)
+        {
+            encoder->encode(rope_plain[i], rope_slots[i], scale);
+        }
+
+        // The reference, block by block.
+        const std::vector<ChannelBlock> q = block_project_host(wq, x, layout);
+        const std::vector<ChannelBlock> k = block_project_host(wk, x, layout);
+        const std::vector<ChannelBlock> v = block_project_host(wv, x, layout);
+
+        std::vector<ChannelBlock> q_roped(blocks), k_roped(blocks);
+        for (int t = 0; t < blocks; t++)
+        {
+            const int partner = (t < half) ? t + half : t - half;
+            q_roped[t] = zero_block(layout);
+            k_roped[t] = zero_block(layout);
+            for (int m = 0; m < layout.batch; m++)
+            {
+                for (int e = 0; e < entries; e++)
+                {
+                    q_roped[t][m][e] = q[t][m][e] * cos_values[t][e] +
+                                       q[partner][m][e] * sin_values[t][e];
+                    k_roped[t][m][e] = k[t][m][e] * cos_values[t][e] +
+                                       k[partner][m][e] * sin_values[t][e];
+                }
+            }
+        }
+
+        // A head spanning several blocks sums their scores, which is exactly
+        // the channel sum K^T Q performs when K and Q are stacked.
+        ChannelBlock raw = zero_block(layout);
+        for (int t = 0; t < blocks; t++)
+        {
+            ChannelBlock term(layout.batch);
+            for (int m = 0; m < layout.batch; m++)
+            {
+                term[m] = llama::matmul_host(
+                    llama::transpose_host(k_roped[t][m], d), q_roped[t][m], d);
+            }
+            add_into(raw, term);
+        }
+
+        double lowest = std::numeric_limits<double>::max();
+        double highest = std::numeric_limits<double>::lowest();
+        for (const auto& block : raw)
+        {
+            for (double s : block)
+            {
+                lowest = std::min(lowest, s);
+                highest = std::max(highest, s);
+            }
+        }
+
+        llama::Llama3Operator::AttentionConfig config;
+        config.layout = layout;
+        config.heads = 1;
+        config.causal = true;
+        config.rope = true;
+        config.head_scale = 2.0 / (highest - lowest);
+        config.score_shift = highest * config.head_scale;
+        config.softmax.bound = 2.0;
+        config.softmax.iterations = 1;
+        config.softmax.exp_degree = 15;
+        config.softmax.inverse_degree = 15;
+        config.softmax.inverse_newton = 2;
+
+        const ChannelBlock probabilities = causal_softmax_host(
+            raw, config.head_scale, config.score_shift, d);
+
+        std::vector<ChannelBlock> weighted(blocks);
+        for (int t = 0; t < blocks; t++)
+        {
+            weighted[t] = matmul_block(v[t], probabilities, d);
+        }
+        const std::vector<ChannelBlock> want =
+            block_project_host(wo, weighted, layout);
+
+        std::vector<heongpu::Ciphertext<S>> in;
+        for (int j = 0; j < blocks; j++)
+        {
+            in.push_back(encrypt(pack_blocks(x[j], layout)));
+        }
+
+        std::vector<heongpu::Ciphertext<S>> got = ops->attention(
+            in, weights, rope_plain, config, *galois, *relin);
+        ASSERT_EQ(got.size(), static_cast<std::size_t>(blocks));
+
+        for (int t = 0; t < blocks; t++)
+        {
+            const std::string label =
+                "wide attention[" + std::to_string(t) + "]";
+            EXPECT_LT(reported(label.c_str(), decrypt(got[t]),
+                               pack_blocks(want[t], layout)),
+                      1e-6);
+        }
+    }
+
+    /// Two heads, one channel block each. Nothing may cross between them: the
+    /// blocks carry different data, so a head reading the wrong one is a large
+    /// error rather than a subtle one.
+    TEST_F(Llama3LayerEnv, AttentionKeepsItsHeadsApart)
+    {
+        const int d = layout.d;
+        const int heads = 2;
+
+        std::mt19937_64 rng(903);
+        std::vector<ChannelBlock> x;
+        for (int h = 0; h < heads; h++)
+        {
+            x.push_back(random_blocks(layout, 1.0, rng));
+        }
+
+        std::vector<ChannelBlock> raw(heads);
+        double lowest = std::numeric_limits<double>::max();
+        double highest = std::numeric_limits<double>::lowest();
+        for (int h = 0; h < heads; h++)
+        {
+            raw[h].resize(layout.batch);
+            for (int m = 0; m < layout.batch; m++)
+            {
+                raw[h][m] = llama::matmul_host(
+                    llama::transpose_host(x[h][m], d), x[h][m], d);
+                for (double s : raw[h][m])
+                {
+                    lowest = std::min(lowest, s);
+                    highest = std::max(highest, s);
+                }
+            }
+        }
+
+        // No projections at all, so the input blocks are the query, the key
+        // and the value, and head h sees only block h.
+        llama::Llama3Operator::BlockAttentionWeights weights;
+
+        llama::Llama3Operator::AttentionConfig config;
+        config.layout = layout;
+        config.heads = heads;
+        config.causal = true;
+        config.rope = false;
+        config.head_scale = 2.0 / (highest - lowest);
+        config.score_shift = highest * config.head_scale;
+        config.softmax.bound = 2.0;
+        config.softmax.iterations = 1;
+        config.softmax.exp_degree = 15;
+        config.softmax.inverse_degree = 15;
+        config.softmax.inverse_newton = 2;
+
+        std::vector<ChannelBlock> want(heads);
+        for (int h = 0; h < heads; h++)
+        {
+            const ChannelBlock probabilities = causal_softmax_host(
+                raw[h], config.head_scale, config.score_shift, d);
+            want[h] = matmul_block(x[h], probabilities, d);
+        }
+
+        std::vector<heongpu::Ciphertext<S>> in;
+        for (int h = 0; h < heads; h++)
+        {
+            in.push_back(encrypt(pack_blocks(x[h], layout)));
+        }
+
+        std::vector<heongpu::Plaintext<S>> no_rope;
+        std::vector<heongpu::Ciphertext<S>> got =
+            ops->attention(in, weights, no_rope, config, *galois, *relin);
+        ASSERT_EQ(got.size(), static_cast<std::size_t>(heads));
+
+        for (int h = 0; h < heads; h++)
+        {
+            const std::string label = "head " + std::to_string(h);
+            EXPECT_LT(reported(label.c_str(), decrypt(got[h]),
+                               pack_blocks(want[h], layout)),
+                      1e-6);
+        }
+    }
+
+    /// SwiGLU widening past the input width and contracting back, which is
+    /// what Llama-3's feed-forward does by a factor of three and a half.
+    TEST_F(Llama3LayerEnv, FeedForwardWidensAndContractsChannelBlocks)
+    {
+        const int d = layout.d;
+        const int in_blocks = 2;
+        const int hidden_blocks = 3;
+        const double weight_scale =
+            1.0 / std::sqrt(static_cast<double>(d * in_blocks));
+
+        llama::Llama3Operator::FeedForwardConfig config;
+        config.layout = layout;
+        config.silu_bound = 4.0;
+        config.silu_degree = 31;
+
+        auto key = narrow_key(
+            llama::Llama3Operator::feed_forward_rotation_indices(config));
+
+        std::mt19937_64 rng(904);
+        std::vector<ChannelBlock> x;
+        for (int j = 0; j < in_blocks; j++)
+        {
+            x.push_back(random_blocks(layout, 1.0, rng));
+        }
+
+        llama::Llama3Operator::BlockFeedForwardWeights weights;
+        weights.gate = llama::BlockMatrix(hidden_blocks, in_blocks);
+        weights.up = llama::BlockMatrix(hidden_blocks, in_blocks);
+        weights.down = llama::BlockMatrix(in_blocks, hidden_blocks);
+
+        std::vector<std::vector<ChannelBlock>> wg(hidden_blocks),
+            wu(hidden_blocks), wd(in_blocks);
+        for (int i = 0; i < hidden_blocks; i++)
+        {
+            wg[i].resize(in_blocks);
+            wu[i].resize(in_blocks);
+            for (int j = 0; j < in_blocks; j++)
+            {
+                wg[i][j] = random_blocks(layout, weight_scale, rng);
+                wu[i][j] = random_blocks(layout, weight_scale, rng);
+                weights.gate.at(i, j) = flatten_block(wg[i][j]);
+                weights.up.at(i, j) = flatten_block(wu[i][j]);
+            }
+        }
+        const double down_scale =
+            1.0 / std::sqrt(static_cast<double>(d * hidden_blocks));
+        for (int k = 0; k < in_blocks; k++)
+        {
+            wd[k].resize(hidden_blocks);
+            for (int i = 0; i < hidden_blocks; i++)
+            {
+                wd[k][i] = random_blocks(layout, down_scale, rng);
+                weights.down.at(k, i) = flatten_block(wd[k][i]);
+            }
+        }
+
+        const std::vector<ChannelBlock> gate =
+            block_project_host(wg, x, layout);
+        const std::vector<ChannelBlock> up = block_project_host(wu, x, layout);
+
+        std::vector<ChannelBlock> hidden(hidden_blocks);
+        double widest = 0.0;
+        for (int i = 0; i < hidden_blocks; i++)
+        {
+            hidden[i] = zero_block(layout);
+            for (int m = 0; m < layout.batch; m++)
+            {
+                for (std::size_t e = 0; e < gate[i][m].size(); e++)
+                {
+                    widest = std::max(widest, std::abs(gate[i][m][e]));
+                    hidden[i][m][e] =
+                        silu_host(gate[i][m][e]) * up[i][m][e];
+                }
+            }
+        }
+        // The activation is a Chebyshev fit on a fixed interval, so a gate
+        // outside it would be extrapolation rather than approximation.
+        ASSERT_LT(widest, config.silu_bound);
+
+        const std::vector<ChannelBlock> want =
+            block_project_host(wd, hidden, layout);
+
+        std::vector<heongpu::Ciphertext<S>> in;
+        for (int j = 0; j < in_blocks; j++)
+        {
+            in.push_back(encrypt(pack_blocks(x[j], layout)));
+        }
+
+        std::vector<heongpu::Ciphertext<S>> got =
+            ops->feed_forward(in, weights, config, *key, *relin);
+        ASSERT_EQ(got.size(), static_cast<std::size_t>(in_blocks));
+
+        for (int k = 0; k < in_blocks; k++)
+        {
+            const std::string label = "wide feed_forward[" +
+                                      std::to_string(k) + "]";
+            EXPECT_LT(reported(label.c_str(), decrypt(got[k]),
+                               pack_blocks(want[k], layout)),
+                      1e-5);
+        }
     }
 
 } // namespace

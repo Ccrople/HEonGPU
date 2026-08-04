@@ -100,6 +100,39 @@ namespace heongpu
             MatrixLayout(int d, int batch);
         };
 
+        /**
+         * @brief A weight matrix cut into the d x d blocks a layout can hold.
+         *
+         * Block (i, j) carries input channel block j into output channel block
+         * i, so a C_out by C_in weight is out_blocks by in_blocks of them, each
+         * either d * d entries shared by the batch, d * d per batch entry, or
+         * empty. An empty block is a zero block and is skipped rather than
+         * encoded, which is what lets a block-diagonal weight -- a per-head
+         * projection, say -- cost only its diagonal.
+         */
+        struct BlockMatrix
+        {
+            int out_blocks = 0;
+            int in_blocks = 0;
+            /// Row-major, out_blocks * in_blocks entries.
+            std::vector<std::vector<double>> blocks;
+
+            BlockMatrix() = default;
+
+            /** @brief An all-empty, and therefore all-zero, block matrix. */
+            BlockMatrix(int out_blocks, int in_blocks);
+
+            /// One block wide and one block tall: the unblocked weight. An
+            /// empty vector stays empty, which is how the sublayers spell
+            /// "there is no such weight".
+            BlockMatrix(std::vector<double> single);
+
+            std::vector<double>& at(int i, int j);
+            const std::vector<double>& at(int i, int j) const;
+
+            bool empty() const { return blocks.empty(); }
+        };
+
         /// The permutations of Equation (4), on a d x d host matrix in
         /// row-major order. Indices are taken modulo d throughout.
         std::vector<double> permute_sigma(const std::vector<double>& a, int d);
@@ -564,11 +597,38 @@ namespace heongpu
             //   - a sum over channels is a sum over the slow axis, which is
             //     the exact, level-free strided reduction of Section 3.2.
             //
-            // The weights are per block: one ciphertext holds d channels of d
-            // tokens, so a model whose width exceeds d needs the caller to sum
-            // the products of the channel blocks, the way rms_norm already
-            // accumulates over its inputs. That orchestration is Table 4 and is
-            // not attempted here.
+            // One ciphertext holds d channels of d tokens, so a model wider
+            // than d is carried by several of them, block j holding channels
+            // [j d, (j + 1) d). Every routine below therefore comes in two
+            // forms: one ciphertext, which is the width-d case, and a vector of
+            // them, which is the general one. The single-ciphertext form is the
+            // vector form at one block and is implemented as such.
+            //
+            // What makes the general form affordable is that a projection is
+            // then the block product Y[i] = sum_j W(i, j) X[j], and every term
+            // of that sum leaves Equation (5) at the same level and the same
+            // scale, so the sum itself is free. Widening a model buys products,
+            // not depth. The sequence length is a separate question and is
+            // still d: this is the width half of Table 4, not the whole of it.
+
+            /**
+             * @brief Y[i] = sum_j W(i, j) X[j], over channel blocks.
+             *
+             * The inputs are already tau'd, because a projection consumes
+             * tau of its operand and the sublayers take that map once and
+             * share it across the weights that read the same activation.
+             *
+             * @param tau_x One tau'd block per input channel block, all at one
+             *              level and one scale.
+             * @param giant,baby BSGS factors with giant * baby == d, or both
+             *                   zero to take the balanced split.
+             */
+            std::vector<Ciphertext<Scheme::CKKS>>
+            project_blocks(std::vector<Ciphertext<Scheme::CKKS>>& tau_x,
+                           const BlockMatrix& weight,
+                           const MatrixLayout& layout, int giant, int baby,
+                           const char* name,
+                           Galoiskey<Scheme::CKKS>& galois_key);
 
             /** @brief Plaintext weights of one attention sublayer. */
             struct AttentionWeights
@@ -587,9 +647,14 @@ namespace heongpu
                 MatrixLayout layout;
                 int giant = 0; ///< BSGS split of the projections; 0 balances.
                 int baby = 0;
+                /// Heads sharing the query, key and value channel blocks
+                /// between them; each takes a contiguous run of
+                /// qkv_blocks / heads of them, so head_dim is that run times d.
+                int heads = 1;
                 bool causal = true;   ///< Mask keys ahead of the query.
                 bool rope = false;    ///< Apply RoPE to Q and K.
-                double head_scale = 0.0;  ///< 1/sqrt(head_dim); 0 uses 1/sqrt(d).
+                /// 1/sqrt(head_dim); 0 derives it from the blocks per head.
+                double head_scale = 0.0;
                 /// Subtracted from the scores so they land in [-bound, 0].
                 /// Calibrated, as in the paper, not computed homomorphically.
                 double score_shift = 0.0;
@@ -630,6 +695,44 @@ namespace heongpu
                       Galoiskey<Scheme::CKKS>& galois_key,
                       Relinkey<Scheme::CKKS>& relin_key);
 
+            /** @brief Blocked weights of one attention sublayer. */
+            struct BlockAttentionWeights
+            {
+                /// out_blocks must agree across the three, since they are the
+                /// blocks the heads are shared out between.
+                BlockMatrix query;
+                BlockMatrix key;
+                BlockMatrix value;
+                BlockMatrix output; ///< Empty skips W_o.
+            };
+
+            /**
+             * @brief Attention over a model wider than one channel block.
+             *
+             * A head owns a contiguous run of the query, key and value blocks,
+             * and its scores are the sum of that run's K[j]^T Q[j]. Every term
+             * lands at one level and one scale, so a head spanning several
+             * blocks costs products rather than depth, and the SoftMax that
+             * follows is one per head however wide the head is.
+             *
+             * @param rope_plain Empty, or 2 * (blocks per head) plaintexts as
+             *                   {cos_0, sin_0, cos_1, sin_1, ...} indexed by
+             *                   the block's position inside its head. RoPE
+             *                   pairs channel c with c + head_dim / 2: within
+             *                   one block when a head is one block, and between
+             *                   blocks otherwise, where it needs no rotation at
+             *                   all. The angles depend on the channel inside
+             *                   the head and on the token, so every head reads
+             *                   the same plaintexts.
+             */
+            std::vector<Ciphertext<Scheme::CKKS>>
+            attention(std::vector<Ciphertext<Scheme::CKKS>>& x,
+                      const BlockAttentionWeights& weights,
+                      std::vector<Plaintext<Scheme::CKKS>>& rope_plain,
+                      const AttentionConfig& config,
+                      Galoiskey<Scheme::CKKS>& galois_key,
+                      Relinkey<Scheme::CKKS>& relin_key);
+
             /** @brief Plaintext weights of one SwiGLU sublayer. */
             struct FeedForwardWeights
             {
@@ -661,6 +764,31 @@ namespace heongpu
             Ciphertext<Scheme::CKKS>
             feed_forward(Ciphertext<Scheme::CKKS>& x,
                          const FeedForwardWeights& weights,
+                         const FeedForwardConfig& config,
+                         Galoiskey<Scheme::CKKS>& galois_key,
+                         Relinkey<Scheme::CKKS>& relin_key);
+
+            /** @brief Blocked weights of one SwiGLU sublayer. */
+            struct BlockFeedForwardWeights
+            {
+                /// The gate and the up projection must agree on out_blocks,
+                /// which is the hidden width; down carries that back.
+                BlockMatrix gate;
+                BlockMatrix up;
+                BlockMatrix down;
+            };
+
+            /**
+             * @brief SwiGLU over a model wider than one channel block.
+             *
+             * The hidden width is free to differ from the input width, which
+             * is the point: Llama-3 widens by a factor of three and a half
+             * before contracting, and here that is simply a gate and an up
+             * weight with more output blocks than input ones.
+             */
+            std::vector<Ciphertext<Scheme::CKKS>>
+            feed_forward(std::vector<Ciphertext<Scheme::CKKS>>& x,
+                         const BlockFeedForwardWeights& weights,
                          const FeedForwardConfig& config,
                          Galoiskey<Scheme::CKKS>& galois_key,
                          Relinkey<Scheme::CKKS>& relin_key);
@@ -707,6 +835,25 @@ namespace heongpu
                     const std::vector<double>& weight,
                     const MatrixLayout& layout, int giant, int baby,
                     const char* name, Galoiskey<Scheme::CKKS>& galois_key);
+
+            /// Refuse channel blocks that have drifted apart, since the block
+            /// sums below add them and CKKS addition needs one level and one
+            /// scale. An empty vector is refused too: there is no such model.
+            void require_uniform(const std::vector<Ciphertext<Scheme::CKKS>>& in,
+                                 const char* name) const;
+
+            /// tau of every channel block, which the projections then share.
+            std::vector<Ciphertext<Scheme::CKKS>>
+            tau_blocks(std::vector<Ciphertext<Scheme::CKKS>>& in,
+                       const MatrixLayout& layout,
+                       Galoiskey<Scheme::CKKS>& galois_key);
+
+            /// RoPE across a head's channel blocks, in place.
+            void rope_blocks(std::vector<Ciphertext<Scheme::CKKS>>& in,
+                             int per_head,
+                             std::vector<Plaintext<Scheme::CKKS>>& rope_plain,
+                             const MatrixLayout& layout,
+                             Galoiskey<Scheme::CKKS>& galois_key);
 
             HEEncoder<Scheme::CKKS> encoder_;
             /// Cached: the context hands out its modulus chain by value.
