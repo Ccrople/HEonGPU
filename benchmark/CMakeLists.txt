@@ -9,6 +9,7 @@ set(EXECUTABLES
     bfv_benchmark benchmark_bfv.cpp
     ckks_benchmark benchmark_ckks.cpp
     tfhe_benchmark benchmark_tfhe.cpp
+    ckks_profile profile_ckks.cpp
 )
 
 function(add_benchmark exe source)
