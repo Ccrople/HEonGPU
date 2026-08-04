@@ -2006,9 +2006,12 @@ namespace
         heongpu::Ciphertext<S> result =
             ops->feed_forward(cipher, weights, config, *key, *relin);
 
+        // The only bound here that is not on the noise floor: the degree 31
+        // SiLU fit dominates and its error is then summed over d terms by the
+        // down projection.
         EXPECT_LT(reported("feed_forward", decrypt(result),
                            pack_blocks(want, layout)),
-                  1e-4);
+                  1e-5);
     }
 
     /// The whole attention sublayer: projections, RoPE, scores, a causal
@@ -2155,9 +2158,12 @@ namespace
         heongpu::Ciphertext<S> result = ops->attention(
             cipher, weights, rope_plain, config, *galois, *relin);
 
+        // Thirty levels deep and still on the noise floor: nothing in the
+        // attention path is approximated over a wide interval, so the bound
+        // belongs with the exact primitives rather than with SiLU.
         EXPECT_LT(reported("attention", decrypt(result),
                            pack_blocks(want, layout)),
-                  1e-4);
+                  1e-6);
     }
 
     /// A pre-norm feed-forward block: RMSNorm, the sublayer, the residual.
@@ -2232,7 +2238,7 @@ namespace
 
         EXPECT_LT(reported("pre-norm ffn block", decrypt(result),
                            pack_blocks(want, layout)),
-                  1e-3);
+                  2e-4);
     }
 
     /// A pre-norm attention block, which is the deepest circuit here.
@@ -2347,7 +2353,7 @@ namespace
 
         EXPECT_LT(reported("pre-norm attention block", decrypt(result),
                            pack_blocks(want, layout)),
-                  1e-3);
+                  1e-4);
     }
 
 } // namespace
