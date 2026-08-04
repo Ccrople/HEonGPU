@@ -165,6 +165,10 @@ namespace heongpu
         DeviceVector<Data64> psi_fwd_n; ///< [limbs][k][d] psi_N^(+h0(s)*i).
         DeviceVector<Data64> psi_inv_n; ///< [limbs][k][d] psi_N^(-h0(s)*i)/d.
         DeviceVector<Data64> psi_n;     ///< [limbs] primitive 2N-th root.
+        /// [limbs][2N] every power of psi_N. The monomial twiddle is a lookup
+        /// rather than a per-element modular exponentiation, which otherwise
+        /// dominates the whole CMT.
+        DeviceVector<Data64> psi_n_pow;
         DeviceVector<Data64> dinv;      ///< [limbs] d^-1 mod p.
         DeviceVector<Modulus64> modulus;
     };
@@ -343,10 +347,25 @@ namespace heongpu
 
       private:
         const BatchSubringTables& tables_for(int depth);
-        void butterfly(Ciphertext<Scheme::CKKS>& e,
-                       Ciphertext<Scheme::CKKS>& o);
-        void tweak_recursive(std::vector<Ciphertext<Scheme::CKKS>*>& ct, int k,
-                             int sgn);
+
+        /**
+         * @brief Multiply each of @p ct by its own monomial, in one launch.
+         *
+         * @param powers One exponent per ciphertext; zero entries are skipped
+         *               on the device, so callers need not filter them out.
+         */
+        void mult_monomial_batch(const std::vector<Data64*>& ct,
+                                 const std::vector<int>& powers, int depth);
+
+        /**
+         * @brief Metadata clone of @p src with uninitialised device memory.
+         *
+         * A copy-construct would deep-copy coefficients that the caller is
+         * about to overwrite in full.
+         */
+        Ciphertext<Scheme::CKKS> allocate_like(const Ciphertext<Scheme::CKKS>&
+                                                   src,
+                                               size_t elems) const;
 
         /// [limb][j] -> start of limb @p l inside one component of ciphertext
         /// @p j, the addressing every batch matrix kernel expects.

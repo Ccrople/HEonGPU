@@ -203,86 +203,116 @@ namespace heongpu
 
     namespace
     {
-        __device__ inline uint32_t bm_bitrev(uint32_t v, int bits)
+        /**
+         * @brief psi_N^(power * (2*brv(idx)+1)) for the length-N NTT domain.
+         *
+         * 2N is a power of two, so reducing the exponent is a mask. The
+         * product needs 64 bits: both factors reach 2N = 2^17 here.
+         */
+        __device__ inline Data64 bm_monomial_twiddle(const Data64* psi_pow,
+                                                     int limb, int n_power,
+                                                     int power, int idx)
         {
-            uint32_t r = 0;
-            for (int i = 0; i < bits; ++i)
-                r |= ((v >> i) & 1u) << (bits - 1 - i);
-            return r;
-        }
-
-        __device__ inline Data64 bm_powmod(Data64 b, Data64 e, Data64 m)
-        {
-            Data64 r = 1;
-            b %= m;
-            while (e)
-            {
-                if (e & 1)
-                    r = static_cast<__uint128_t>(r) * b % m;
-                b = static_cast<__uint128_t>(b) * b % m;
-                e >>= 1;
-            }
-            return r;
+            const unsigned mask = (1u << (n_power + 1)) - 1u;
+            const unsigned h =
+                2u * (__brev(static_cast<unsigned>(idx)) >> (32 - n_power)) +
+                1u;
+            const unsigned e = static_cast<unsigned>(
+                (static_cast<unsigned long long>(static_cast<unsigned>(power)) *
+                 h) &
+                mask);
+            return psi_pow[(static_cast<size_t>(limb) << (n_power + 1)) + e];
         }
     } // namespace
 
-    __global__ void bm_mult_monomial_kernel(Data64* data, const Data64* psi_n,
-                                            const Modulus64* modulus,
-                                            int n_power, int power,
-                                            int num_limbs)
+    __global__ void bm_mult_monomial_batch_kernel(Data64* const* data,
+                                                  const int* powers,
+                                                  const Data64* psi_pow,
+                                                  const Modulus64* modulus,
+                                                  int n_power, int num_limbs)
     {
         const int n = 1 << n_power;
         const int idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= n)
             return;
+
+        const int power = powers[blockIdx.z];
+        if (power == 0)
+            return;
+
         const int limb = blockIdx.y;
-        const int comp = blockIdx.z;
         const Modulus64 p = modulus[limb];
+        const Data64 w =
+            bm_monomial_twiddle(psi_pow, limb, n_power, power, idx);
 
-        const Data64 two_n = 2ull * static_cast<Data64>(n);
-        const Data64 h = 2ull * bm_bitrev(static_cast<uint32_t>(idx), n_power) + 1ull;
-        const Data64 e = (static_cast<Data64>(power) % two_n) * h % two_n;
-        const Data64 w = bm_powmod(psi_n[limb], e, p.value);
-
-        const size_t off =
-            (static_cast<size_t>(comp) * num_limbs + limb) * n + idx;
-        data[off] = OPERATOR_GPU_64::mult(data[off], w, p);
+        Data64* g = data[blockIdx.z] + static_cast<size_t>(limb) * n + idx;
+        const size_t comp = static_cast<size_t>(num_limbs) * n;
+        g[0] = OPERATOR_GPU_64::mult(g[0], w, p);
+        g[comp] = OPERATOR_GPU_64::mult(g[comp], w, p);
     }
 
-    __global__ void bm_butterfly_kernel(Data64* e, Data64* o,
-                                        const Modulus64* modulus, int n,
-                                        int num_limbs)
+    __global__ void bm_tweak_stage_kernel(Data64* const* even,
+                                          Data64* const* odd,
+                                          const int* powers,
+                                          const Data64* psi_pow,
+                                          const Modulus64* modulus,
+                                          int n_power, int num_limbs)
     {
-        const size_t total = static_cast<size_t>(2) * num_limbs * n;
-        const size_t idx =
-            static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (idx >= total)
+        const int n = 1 << n_power;
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= n)
             return;
-        const int limb = static_cast<int>((idx / n) % num_limbs);
-        const Data64 p = modulus[limb].value;
 
-        const Data64 x = e[idx];
-        const Data64 y = o[idx];
-        Data64 s = x + y;
-        s = (s >= p) ? s - p : s;
-        Data64 t = x + p - y;
-        t = (t >= p) ? t - p : t;
-        e[idx] = s;
-        o[idx] = t;
+        const int limb = blockIdx.y;
+        const Modulus64 mp = modulus[limb];
+        const Data64 p = mp.value;
+
+        // Uniform across the block: the pair is carried by grid.z.
+        const int power = powers[blockIdx.z];
+        const Data64 w =
+            (power == 0)
+                ? 0
+                : bm_monomial_twiddle(psi_pow, limb, n_power, power, idx);
+
+        const size_t off = static_cast<size_t>(limb) * n + idx;
+        const size_t comp = static_cast<size_t>(num_limbs) * n;
+        Data64* ep = even[blockIdx.z] + off;
+        Data64* op = odd[blockIdx.z] + off;
+
+#pragma unroll
+        for (int c = 0; c < 2; ++c)
+        {
+            const size_t o = static_cast<size_t>(c) * comp;
+            const Data64 u = ep[o];
+            const Data64 v =
+                (power == 0) ? op[o] : OPERATOR_GPU_64::mult(op[o], w, mp);
+            Data64 s = u + v;
+            s = (s >= p) ? s - p : s;
+            Data64 t = u + p - v;
+            t = (t >= p) ? t - p : t;
+            ep[o] = s;
+            op[o] = t;
+        }
     }
 
-    __global__ void bm_mult_scalar_kernel(Data64* data, const Data64* scalar,
-                                          const Modulus64* modulus, int n,
-                                          int num_limbs)
+    __global__ void bm_mult_scalar_batch_kernel(Data64* const* data,
+                                                const Data64* scalar,
+                                                const Modulus64* modulus,
+                                                int n_power, int num_limbs)
     {
-        const size_t total = static_cast<size_t>(2) * num_limbs * n;
-        const size_t idx =
-            static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (idx >= total)
+        const int n = 1 << n_power;
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= n)
             return;
-        const int limb = static_cast<int>((idx / n) % num_limbs);
-        data[idx] =
-            OPERATOR_GPU_64::mult(data[idx], scalar[limb], modulus[limb]);
+
+        const int limb = blockIdx.y;
+        const Modulus64 p = modulus[limb];
+        const Data64 s = scalar[limb];
+
+        Data64* g = data[blockIdx.z] + static_cast<size_t>(limb) * n + idx;
+        const size_t comp = static_cast<size_t>(num_limbs) * n;
+        g[0] = OPERATOR_GPU_64::mult(g[0], s, p);
+        g[comp] = OPERATOR_GPU_64::mult(g[comp], s, p);
     }
 
     __global__ void bm_gemm_kernel(Data64* C, const Data64* A, const Data64* B,

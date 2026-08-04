@@ -76,38 +76,58 @@ namespace heongpu
                                    int b_col_stride, int s_blocks);
 
     /**
-     * @brief Multiply a ciphertext by the monomial X^power, in place.
+     * @brief Multiply ciphertexts by monomials X^power_j, in place.
      *
-     * Step 1 and step 5 of Algorithm 3, and the odd-branch twiddle of the
-     * Algorithm 2 butterfly. In the length-N NTT domain the coefficient at
-     * index j is the evaluation at psi^(2*brv_N(j)+1), so multiplying the
-     * polynomial by X^power is a pointwise multiply by psi^(power*(2*brv(j)+1)).
-     * That keeps the operation exact and avoids any transform round trip.
+     * Step 1 and step 5 of Algorithm 3. In the length-N NTT domain the
+     * coefficient at index j is the evaluation at psi^(2*brv_N(j)+1), so
+     * multiplying the polynomial by X^power is a pointwise multiply by
+     * psi^(power*(2*brv(j)+1)). That keeps the operation exact and avoids any
+     * transform round trip.
      *
-     * @param data      Ciphertext memory, [component][limb][coefficient].
-     * @param psi_n     [limbs] primitive 2N-th root per limb.
-     * @param power     Exponent, taken modulo 2N.
+     * The twiddle comes from @p psi_pow rather than from a per-thread modular
+     * exponentiation. Since 2N is a power of two the exponent reduces with a
+     * mask, so each element costs one table load and one modular multiply.
+     *
+     * One launch covers every ciphertext of a step: grid.z selects the
+     * ciphertext and both components share the twiddle, so it is loaded once
+     * per element rather than once per component.
+     *
+     * @param data      [count] pointers to ciphertext memory,
+     *                  laid out [component][limb][coefficient].
+     * @param powers    [count] exponents, already reduced into [0, 2N).
+     *                  A zero entry leaves that ciphertext untouched.
+     * @param psi_pow   [limbs][2N] powers of the primitive 2N-th root.
      */
-    __global__ void bm_mult_monomial_kernel(Data64* data, const Data64* psi_n,
-                                            const Modulus64* modulus,
-                                            int n_power, int power,
-                                            int num_limbs);
+    __global__ void bm_mult_monomial_batch_kernel(Data64* const* data,
+                                                  const int* powers,
+                                                  const Data64* psi_pow,
+                                                  const Modulus64* modulus,
+                                                  int n_power, int num_limbs);
 
     /**
-     * @brief In-place butterfly: (e, o) <- (e + o, e - o) over every limb.
+     * @brief One TWEAK stage: (e, o) <- (e + X^power * o, e - X^power * o).
      *
-     * The combine step of the Algorithm 2 TWEAK recursion. Operating directly
-     * on both ciphertext components at once avoids the copy-then-accumulate
-     * that a three-operand add would cost.
+     * The monomial twiddle and the butterfly of Algorithm 2 fused into a
+     * single pass, for every pair of a stage at once. Fusing matters because
+     * both halves are elementwise over the same ciphertexts: done separately
+     * the odd operand is read and written twice.
+     *
+     * @param even,odd [pairs] pointers to the two ciphertexts of each pair.
+     * @param powers   [pairs] twiddle exponents in [0, 2N); zero skips the
+     *                 multiply. Uniform across a block, so it does not diverge.
      */
-    __global__ void bm_butterfly_kernel(Data64* e, Data64* o,
-                                        const Modulus64* modulus, int n,
-                                        int num_limbs);
+    __global__ void bm_tweak_stage_kernel(Data64* const* even,
+                                          Data64* const* odd,
+                                          const int* powers,
+                                          const Data64* psi_pow,
+                                          const Modulus64* modulus,
+                                          int n_power, int num_limbs);
 
-    /** @brief Scale a ciphertext by a per-limb constant, in place. */
-    __global__ void bm_mult_scalar_kernel(Data64* data, const Data64* scalar,
-                                          const Modulus64* modulus, int n,
-                                          int num_limbs);
+    /** @brief Scale ciphertexts by a per-limb constant, in place. */
+    __global__ void bm_mult_scalar_batch_kernel(Data64* const* data,
+                                                const Data64* scalar,
+                                                const Modulus64* modulus,
+                                                int n_power, int num_limbs);
 
 } // namespace heongpu
 #endif // HEONGPU_KERNEL_BATCHMATRIX_H

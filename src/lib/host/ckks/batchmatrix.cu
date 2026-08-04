@@ -10,6 +10,8 @@
 
 #include <gpuntt/ntt_merge/ntt.cuh>
 
+#include <nvtx3/nvToolsExt.h>
+
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -19,6 +21,18 @@ namespace heongpu
 {
     namespace
     {
+        /// Scoped NVTX range, so a capture can attribute GPU time to the step
+        /// of Algorithm 3/4 that issued it. Every step boundary below already
+        /// ends in cudaDeviceSynchronize, so these host-side ranges bracket the
+        /// device work tightly enough to bucket kernels by timestamp.
+        struct BmRange
+        {
+            explicit BmRange(const char* name) { nvtxRangePushA(name); }
+            ~BmRange() { nvtxRangePop(); }
+            BmRange(const BmRange&) = delete;
+            BmRange& operator=(const BmRange&) = delete;
+        };
+
         inline bool is_power_of_two(int v) noexcept
         {
             return v > 0 && (v & (v - 1)) == 0;
@@ -477,6 +491,27 @@ namespace heongpu
         t.psi_inv_n = DeviceVector<Data64>(pin);
         t.psi_n = DeviceVector<Data64>(psi_n);
         {
+            // Every power of psi_N, so the monomial multiply reduces to one
+            // table load. Built by repeated multiplication: 2N muls per limb
+            // once per level, against one modular exponentiation per element
+            // per call if the kernel derived it itself.
+            const size_t two_n = 2ull * static_cast<size_t>(n_);
+            std::vector<Data64> ppow(static_cast<size_t>(num_limbs) * two_n);
+            for (int l = 0; l < num_limbs; ++l)
+            {
+                const Data64 p = primes[l].value;
+                Data64 acc = 1;
+                Data64* row = ppow.data() + static_cast<size_t>(l) * two_n;
+                for (size_t e = 0; e < two_n; ++e)
+                {
+                    row[e] = acc;
+                    acc = static_cast<Data64>(
+                        (static_cast<__uint128_t>(acc) * psi_n[l]) % p);
+                }
+            }
+            t.psi_n_pow = DeviceVector<Data64>(ppow);
+        }
+        {
             std::vector<Data64> dv(num_limbs);
             for (int l = 0; l < num_limbs; ++l)
                 dv[l] = invmod(static_cast<Data64>(d) % primes[l].value,
@@ -587,6 +622,33 @@ namespace heongpu
         plain.plain_size_ = static_cast<int>(host.size());
     }
 
+    void HEBatchMatrixOperator<Scheme::CKKS>::mult_monomial_batch(
+        const std::vector<Data64*>& ct, const std::vector<int>& powers,
+        int depth)
+    {
+        if (ct.empty())
+            return;
+        if (ct.size() != powers.size())
+            throw std::invalid_argument(
+                "mult_monomial_batch needs one power per ciphertext");
+
+        const BatchSubringTables& t = tables_for(depth);
+        DeviceVector<Data64*> dp(ct);
+        DeviceVector<int> dpow(powers);
+
+        const int threads = 256;
+        const dim3 grid(static_cast<unsigned>((n_ + threads - 1) / threads),
+                        static_cast<unsigned>(t.num_limbs),
+                        static_cast<unsigned>(ct.size()));
+        bm_mult_monomial_batch_kernel<<<grid, threads>>>(
+            dp.data(), dpow.data(), t.psi_n_pow.data(), t.modulus.data(),
+            context_->n_power, t.num_limbs);
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+        // The pointer and power buffers are freed when this returns, so the
+        // launch has to have consumed them first.
+        HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
     void HEBatchMatrixOperator<Scheme::CKKS>::mult_monomial(
         Ciphertext<Scheme::CKKS>& ct, int power)
     {
@@ -597,84 +659,76 @@ namespace heongpu
         if (e == 0)
             return;
 
-        const BatchSubringTables& t = tables_for(ct.depth_);
-        const int num_limbs = t.num_limbs;
-
-        const int threads = 256;
-        const dim3 grid(static_cast<unsigned>((n_ + threads - 1) / threads),
-                        static_cast<unsigned>(num_limbs), 2u);
-        bm_mult_monomial_kernel<<<grid, threads>>>(
-            ct.data(), t.psi_n.data(), t.modulus.data(), context_->n_power, e,
-            num_limbs);
-        HEONGPU_CUDA_CHECK(cudaGetLastError());
-        HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
-    }
-
-    void HEBatchMatrixOperator<Scheme::CKKS>::butterfly(
-        Ciphertext<Scheme::CKKS>& e, Ciphertext<Scheme::CKKS>& o)
-    {
-        const BatchSubringTables& t = tables_for(e.depth_);
-        const size_t total = static_cast<size_t>(2) * t.num_limbs * n_;
-        const int threads = 256;
-        const unsigned blocks =
-            static_cast<unsigned>((total + threads - 1) / threads);
-        bm_butterfly_kernel<<<blocks, threads>>>(
-            e.data(), o.data(), t.modulus.data(), n_, t.num_limbs);
-        HEONGPU_CUDA_CHECK(cudaGetLastError());
-    }
-
-    void HEBatchMatrixOperator<Scheme::CKKS>::tweak_recursive(
-        std::vector<Ciphertext<Scheme::CKKS>*>& ct, int k, int sgn)
-    {
-        const int d = static_cast<int>(ct.size());
-        if (d <= 1)
-            return;
-
-        std::vector<Ciphertext<Scheme::CKKS>*> even(d / 2), odd(d / 2);
-        for (int j = 0; j < d / 2; ++j)
-        {
-            even[j] = ct[2 * j];
-            odd[j] = ct[2 * j + 1];
-        }
-
-        tweak_recursive(even, 2 * k, sgn);
-        tweak_recursive(odd, 2 * k, sgn);
-
-        const long long two_n = 2ll * n_;
-        for (int j = 0; j < d / 2; ++j)
-        {
-            const long long e = 2ll * k * j * sgn;
-            const int power = static_cast<int>(((e % two_n) + two_n) % two_n);
-            if (power != 0)
-                mult_monomial(*odd[j], power);
-
-            // The butterfly writes e+o and e-o in place, so the result is
-            // placed by permuting pointers rather than by copying ciphertexts.
-            butterfly(*even[j], *odd[j]);
-            ct[j] = even[j];
-            ct[j + d / 2] = odd[j];
-        }
+        mult_monomial_batch({ct.data()}, {e}, ct.depth_);
     }
 
     void HEBatchMatrixOperator<Scheme::CKKS>::tweak(
         std::vector<Ciphertext<Scheme::CKKS>>& ct, int sgn)
     {
-        if (static_cast<int>(ct.size()) != layout_.d)
+        const int d = layout_.d;
+        if (static_cast<int>(ct.size()) != d)
             throw std::invalid_argument("tweak expects exactly d ciphertexts");
 
-        std::vector<Ciphertext<Scheme::CKKS>*> ptrs(layout_.d);
-        for (int i = 0; i < layout_.d; ++i)
-            ptrs[i] = &ct[i];
+        // Iterative Cooley-Tukey rather than the recursion of Algorithm 2.
+        // Same butterflies in the same order, but a whole stage is one launch:
+        // the recursion issued one monomial multiply and one butterfly per
+        // pair, 129 + 192 launches at d = 64, each far too small to fill the
+        // device.
+        //
+        // Decimation in time, so the working order is bit-reversed: logical
+        // position i is held by ct[brv(i)] throughout, and only the final
+        // reorder touches the caller's vector.
+        const int logd = log2i(d);
+        std::vector<int> slot(d);
+        for (int i = 0; i < d; ++i)
+            slot[i] = static_cast<int>(bitrev(static_cast<uint32_t>(i), logd));
 
-        tweak_recursive(ptrs, layout_.k, sgn);
-        HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
+        const BatchSubringTables& t = tables_for(ct[0].depth_);
+        const long long two_n = 2ll * n_;
+        const int threads = 256;
 
-        // tweak_recursive permutes which ciphertext object holds which result,
-        // so materialise the permutation back into the caller's order.
+        for (int len = 2; len <= d; len <<= 1)
+        {
+            const int half = len >> 1;
+            // The subproblem of size len sits at the recursion level whose
+            // modulus parameter is k * (d / len).
+            const long long k_level =
+                static_cast<long long>(layout_.k) * (d / len);
+
+            std::vector<Data64*> even, odd;
+            std::vector<int> powers;
+            even.reserve(d / 2);
+            odd.reserve(d / 2);
+            powers.reserve(d / 2);
+            for (int start = 0; start < d; start += len)
+                for (int j = 0; j < half; ++j)
+                {
+                    even.push_back(ct[slot[start + j]].data());
+                    odd.push_back(ct[slot[start + j + half]].data());
+                    const long long e = 2ll * k_level * j * sgn;
+                    powers.push_back(
+                        static_cast<int>(((e % two_n) + two_n) % two_n));
+                }
+
+            DeviceVector<Data64*> de(even), dod(odd);
+            DeviceVector<int> dpow(powers);
+            const dim3 grid(static_cast<unsigned>((n_ + threads - 1) / threads),
+                            static_cast<unsigned>(t.num_limbs),
+                            static_cast<unsigned>(even.size()));
+            bm_tweak_stage_kernel<<<grid, threads>>>(
+                de.data(), dod.data(), dpow.data(), t.psi_n_pow.data(),
+                t.modulus.data(), context_->n_power, t.num_limbs);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+            HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
+        }
+
+        // Logical result i lives in ct[brv(i)]. Bit reversal is an involution,
+        // so this is a permutation and every element is moved exactly once --
+        // pointer moves, not the d device-to-device copies this used to cost.
         std::vector<Ciphertext<Scheme::CKKS>> result;
-        result.reserve(layout_.d);
-        for (int i = 0; i < layout_.d; ++i)
-            result.push_back(*ptrs[i]);
+        result.reserve(d);
+        for (int i = 0; i < d; ++i)
+            result.push_back(std::move(ct[slot[i]]));
         ct = std::move(result);
     }
 
@@ -688,26 +742,46 @@ namespace heongpu
         if (static_cast<int>(ct.size()) != d)
             throw std::invalid_argument("cmt expects exactly d ciphertexts");
 
-        // Step 1: ct_i <- X^i * ct_i
-        for (int i = 1; i < d; ++i)
-            mult_monomial(ct[i], i);
+        BmRange _r_cmt("CMT");
+
+        // Step 1: ct_i <- X^i * ct_i. One launch: index 0 carries power 0 and
+        // is skipped on the device.
+        {
+            BmRange _r("CMT.step1_monomial");
+            std::vector<Data64*> base(d);
+            std::vector<int> powers(d);
+            for (int i = 0; i < d; ++i)
+            {
+                base[i] = ct[i].data();
+                powers[i] = i;
+            }
+            mult_monomial_batch(base, powers, ct[0].depth_);
+        }
 
         // Step 2
-        tweak(ct, +1);
+        {
+            BmRange _r("CMT.step2_tweak_fwd");
+            tweak(ct, +1);
+        }
 
         // Step 3: scale by d^-1. The map t -> t* is a bijection, so scaling
         // every ciphertext once is equivalent to the per-t scaling written in
         // the algorithm.
         {
+            BmRange _r("CMT.step3_scale");
             const BatchSubringTables& t = tables_for(ct[0].depth_);
-            const size_t total = static_cast<size_t>(2) * t.num_limbs * n_;
-            const int threads = 256;
-            const unsigned blocks =
-                static_cast<unsigned>((total + threads - 1) / threads);
+            std::vector<Data64*> base(d);
             for (int i = 0; i < d; ++i)
-                bm_mult_scalar_kernel<<<blocks, threads>>>(
-                    ct[i].data(), t.dinv.data(), t.modulus.data(), n_,
-                    t.num_limbs);
+                base[i] = ct[i].data();
+            DeviceVector<Data64*> dp(base);
+
+            const int threads = 256;
+            const dim3 grid(static_cast<unsigned>((n_ + threads - 1) / threads),
+                            static_cast<unsigned>(t.num_limbs),
+                            static_cast<unsigned>(d));
+            bm_mult_scalar_batch_kernel<<<grid, threads>>>(
+                dp.data(), t.dinv.data(), t.modulus.data(), context_->n_power,
+                t.num_limbs);
             HEONGPU_CUDA_CHECK(cudaGetLastError());
             HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
         }
@@ -725,9 +799,9 @@ namespace heongpu
 
         // t -> t* is a bijection, so the permutation is a pure reordering and
         // each automorphism then runs in place.
-        std::vector<Ciphertext<Scheme::CKKS>> permuted;
-        permuted.reserve(d);
         std::vector<int> rot_index(d, 0);
+        std::vector<int> source(d, 0);
+        std::vector<bool> taken(d, false);
         for (int t = 0; t < d; ++t)
         {
             const uint64_t h = (2ull * k * t + 1) % mod;
@@ -741,20 +815,50 @@ namespace heongpu
                 throw std::runtime_error("automorphism X -> X^(2kt+1) is not a "
                                          "slot rotation for this layout");
             rot_index[t] = it->second;
-            permuted.push_back(ct[tstar]);
+            // Reordering by moving is only sound because t -> t* is injective;
+            // a repeat would leave a moved-from ciphertext behind rather than
+            // fail, so check it rather than trust it.
+            if (taken[tstar])
+                throw std::runtime_error(
+                    "t -> t* is not injective; the CMT reordering would drop a "
+                    "ciphertext");
+            taken[tstar] = true;
+            source[t] = tstar;
         }
-        ct = std::move(permuted);
 
-        for (int t = 0; t < d; ++t)
-            if (rot_index[t] != 0)
-                ops.rotate_rows_inplace(ct[t], galois_key, rot_index[t]);
+        {
+            std::vector<Ciphertext<Scheme::CKKS>> permuted;
+            permuted.reserve(d);
+            for (int t = 0; t < d; ++t)
+                permuted.push_back(std::move(ct[source[t]]));
+            ct = std::move(permuted);
+        }
+
+        {
+            BmRange _r("CMT.automorphisms");
+            for (int t = 0; t < d; ++t)
+                if (rot_index[t] != 0)
+                    ops.rotate_rows_inplace(ct[t], galois_key, rot_index[t]);
+        }
 
         // Step 4
-        tweak(ct, -1);
+        {
+            BmRange _r("CMT.step4_tweak_inv");
+            tweak(ct, -1);
+        }
 
         // Step 5: ct'_i <- X^-i * ct'_i
-        for (int i = 1; i < d; ++i)
-            mult_monomial(ct[i], 2 * n_ - i);
+        {
+            BmRange _r("CMT.step5_monomial");
+            std::vector<Data64*> base(d);
+            std::vector<int> powers(d);
+            for (int i = 0; i < d; ++i)
+            {
+                base[i] = ct[i].data();
+                powers[i] = (2 * n_ - i) % (2 * n_);
+            }
+            mult_monomial_batch(base, powers, ct[0].depth_);
+        }
     }
 
     std::vector<int64_t> HEBatchMatrixOperator<Scheme::CKKS>::ntt_intt_probe(
@@ -1137,6 +1241,26 @@ namespace heongpu
         return h;
     }
 
+    Ciphertext<Scheme::CKKS> HEBatchMatrixOperator<Scheme::CKKS>::allocate_like(
+        const Ciphertext<Scheme::CKKS>& src, size_t elems) const
+    {
+        Ciphertext<Scheme::CKKS> c;
+        c.scheme_ = src.scheme_;
+        c.ring_size_ = src.ring_size_;
+        c.coeff_modulus_count_ = src.coeff_modulus_count_;
+        c.cipher_size_ = src.cipher_size_;
+        c.depth_ = src.depth_;
+        c.in_ntt_domain_ = src.in_ntt_domain_;
+        c.scale_ = src.scale_;
+        c.encoding_ = src.encoding_;
+        c.rescale_required_ = src.rescale_required_;
+        c.relinearization_required_ = src.relinearization_required_;
+        c.ciphertext_generated_ = true;
+        c.storage_type_ = storage_type::DEVICE;
+        c.memory_set(DeviceVector<Data64>(elems));
+        return c;
+    }
+
     void HEBatchMatrixOperator<Scheme::CKKS>::ccmm(
         std::vector<Ciphertext<Scheme::CKKS>>& out,
         const std::vector<Ciphertext<Scheme::CKKS>*>& a,
@@ -1168,11 +1292,16 @@ namespace heongpu
         // Step 1: the right operand becomes a row-wise matrix encryption. The
         // transpose that implies is applied by the GEMM strides below rather
         // than by moving data.
+        BmRange _r_ccmm("CCMM");
+
         std::vector<Ciphertext<Scheme::CKKS>> bcmt;
-        bcmt.reserve(d);
-        for (int j = 0; j < d; ++j)
-            bcmt.push_back(*b[j]);
-        cmt(bcmt, galois_key, ops);
+        {
+            BmRange _r("CCMM.step1_cmt_right");
+            bcmt.reserve(d);
+            for (int j = 0; j < d; ++j)
+                bcmt.push_back(*b[j]);
+            cmt(bcmt, galois_key, ops);
+        }
 
         std::vector<Data64*> a_base(d), b_base(d);
         for (int j = 0; j < d; ++j)
@@ -1184,6 +1313,7 @@ namespace heongpu
         DeviceVector<Data64> A0(elems), A1(elems), B0(elems), B1(elems);
         const int dthreads = (d < 256) ? d : 256;
         {
+            BmRange _r("CCMM.step2_ntt_to_subring");
             DeviceVector<Data64*> pa0(
                 component_pointers(a_base, d, false, num_limbs));
             DeviceVector<Data64*> pa1(
@@ -1227,6 +1357,7 @@ namespace heongpu
         // product in steps 3 and 4.
         DeviceVector<Data64> C00(elems), C01(elems), C10(elems), C11(elems);
         {
+            BmRange _r("CCMM.step2_gemm");
             const int threads = (k < 256) ? k : 256;
             const int s_blocks = (k + threads - 1) / threads;
             const dim3 grid(static_cast<unsigned>(s_blocks * d * d), 1u,
@@ -1260,10 +1391,17 @@ namespace heongpu
         auto fold = [&](DeviceVector<Data64>& c0src, DeviceVector<Data64>& c1src,
                         std::vector<Ciphertext<Scheme::CKKS>>& dst)
         {
+            BmRange _r_fold("CCMM.step34_fold");
+            {
+            BmRange _r("CCMM.step34_subring_to_ntt");
             dst.clear();
             dst.reserve(d);
+            // Inherits level, scale and shape, but not coefficients: the two
+            // subring_to_ntt launches below overwrite every element, so
+            // copy-constructing from a[0] would move 2*comp_stride words per
+            // column for nothing.
             for (int j = 0; j < d; ++j)
-                dst.push_back(*a[0]); // inherits level, scale and shape
+                dst.push_back(allocate_like(*a[0], 2 * comp_stride));
 
             std::vector<Data64*> base(d);
             for (int j = 0; j < d; ++j)
@@ -1285,6 +1423,7 @@ namespace heongpu
                 t.modulus.data(), d, d, k);
             HEONGPU_CUDA_CHECK(cudaGetLastError());
             HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
+            }
 
             cmt(dst, galois_key, ops);
         };
@@ -1292,6 +1431,8 @@ namespace heongpu
         std::vector<Ciphertext<Scheme::CKKS>> D01, D23;
         fold(C00, C01, D01);
         fold(C10, C11, D23);
+
+        BmRange _r_comb("CCMM.step56_combine_relin");
 
         // Steps 5 and 6: the product is now
         //   D0 + Toep(sk) * (D1 + D2) + Toep(sk^2) * D3,
@@ -1301,25 +1442,25 @@ namespace heongpu
         out.reserve(d);
         for (int j = 0; j < d; ++j)
         {
-            Ciphertext<Scheme::CKKS> c(*a[0]);
-            DeviceVector<Data64> mem(3 * comp_stride);
+            // All three components are written below, so the ciphertext is
+            // allocated rather than copy-constructed from a[0].
+            Ciphertext<Scheme::CKKS> c = allocate_like(*a[0], 3 * comp_stride);
+            Data64* mem = c.data();
 
-            cudaMemcpyAsync(mem.data(), D01[j].data(),
-                            comp_stride * sizeof(Data64),
+            cudaMemcpyAsync(mem, D01[j].data(), comp_stride * sizeof(Data64),
                             cudaMemcpyDeviceToDevice);
-            cudaMemcpyAsync(mem.data() + 2 * comp_stride,
+            cudaMemcpyAsync(mem + 2 * comp_stride,
                             D23[j].data() + comp_stride,
                             comp_stride * sizeof(Data64),
                             cudaMemcpyDeviceToDevice);
             addition<<<dim3(static_cast<unsigned>(n_ >> 8),
                             static_cast<unsigned>(num_limbs), 1u),
                        256>>>(D01[j].data() + comp_stride, D23[j].data(),
-                              mem.data() + comp_stride,
-                              context_->modulus_->data(), context_->n_power);
+                              mem + comp_stride, context_->modulus_->data(),
+                              context_->n_power);
             HEONGPU_CUDA_CHECK(cudaGetLastError());
             HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
 
-            c.memory_set(std::move(mem));
             c.cipher_size_ = 3;
             c.rescale_required_ = false;
             c.relinearization_required_ = true;
