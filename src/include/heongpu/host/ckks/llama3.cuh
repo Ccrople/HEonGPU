@@ -165,6 +165,11 @@ namespace heongpu
              * plaintext prepared once and reused down a circuit has to be
              * dropped first. The drop is taken on a copy, leaving the caller's
              * plaintext reusable at its original level.
+             *
+             * Unlike multiply_constant and multiply_vector, this leaves the
+             * rescale pending, because the caller chose the plaintext's scale
+             * and may want to fold another product in first. Until it is
+             * rescaled the result cannot be multiplied, rotated or dropped.
              */
             void multiply_plaintext(Ciphertext<Scheme::CKKS>& ct,
                                     Plaintext<Scheme::CKKS>& plain);
@@ -289,7 +294,10 @@ namespace heongpu
             {
                 int stride = 0;  ///< Strided layout: instances per ciphertext.
                 int count = 0;   ///< Channels held in one ciphertext.
-                int channels = 0; ///< Total channels summed over, all inputs.
+                /// Total channels summed over. Must lie in
+                /// (count * (inputs - 1), count * inputs]: every input
+                /// contributes count channels and only the last may be padded.
+                int channels = 0;
                 double eps = 1e-5;
                 double sum_lo = 0.0; ///< Range of the summed square.
                 double sum_hi = 0.0;

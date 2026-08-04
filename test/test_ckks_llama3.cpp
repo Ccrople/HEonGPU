@@ -892,6 +892,69 @@ namespace
         EXPECT_LT(max_error(decrypt(shallow), want_shallow), 1e-4);
     }
 
+    /// The mistakes that would otherwise pass silently.
+    ///
+    /// Each of these produces a plausible-looking ciphertext rather than an
+    /// error: a wrong channel count rescales every output by a constant, a
+    /// mismatched RoPE pair weights the two terms differently, and too short a
+    /// chain reaches a kernel launch with a nonpositive extent.
+    TEST_F(Llama3Env, WrongConfigurationIsRefusedRatherThanApproximated)
+    {
+        const int count = 32;
+        const int stride = slots / count;
+        const std::vector<double> values = uniform(-1.0, 1.0, 141);
+
+        llama::Llama3Operator::RMSNormConfig config;
+        config.stride = stride;
+        config.count = count;
+        config.eps = 1e-5;
+        config.sum_lo = 8.0;
+        config.sum_hi = 72.0;
+        config.degree = 15;
+        config.newton_iterations = 1;
+
+        std::vector<heongpu::Ciphertext<S>> two{encrypt(values),
+                                                encrypt(values)};
+        std::vector<heongpu::Plaintext<S>> no_weights;
+
+        // Forgetting that a second ciphertext doubles the channel count.
+        config.channels = count;
+        EXPECT_THROW(ops->rms_norm(two, no_weights, config, *galois, *relin),
+                     std::invalid_argument);
+
+        // Counting channels that no input actually carries.
+        config.channels = 3 * count;
+        EXPECT_THROW(ops->rms_norm(two, no_weights, config, *galois, *relin),
+                     std::invalid_argument);
+
+        config.channels = 2 * count;
+        EXPECT_NO_THROW(ops->rms_norm(two, no_weights, config, *galois,
+                                      *relin));
+
+        // Inputs that have drifted apart in level.
+        std::vector<heongpu::Ciphertext<S>> uneven{encrypt(values),
+                                                   encrypt(values)};
+        ops->multiply_constant(uneven[1], 1.0);
+        EXPECT_THROW(ops->rms_norm(uneven, no_weights, config, *galois, *relin),
+                     std::invalid_argument);
+
+        // A RoPE pair encoded at two different scales.
+        heongpu::Plaintext<S> cos_plain(context);
+        heongpu::Plaintext<S> sin_plain(context);
+        encoder->encode(cos_plain, std::vector<double>(slots, 1.0), scale);
+        encoder->encode(sin_plain, std::vector<double>(slots, 1.0), scale / 2);
+        heongpu::Ciphertext<S> cipher = encrypt(values);
+        EXPECT_THROW(ops->rope(cipher, cos_plain, sin_plain, kRopeSwap,
+                               *galois),
+                     std::invalid_argument);
+
+        // A polynomial that does not fit in what is left of the chain.
+        heongpu::Ciphertext<S> shallow = encrypt(values);
+        ops->drop_to_depth(shallow, kLimbs - 3);
+        EXPECT_THROW(ops->silu(shallow, 11.0, 31, *relin),
+                     std::invalid_argument);
+    }
+
     /// Primitives back to back on one ciphertext.
     ///
     /// Each test above starts from a fresh encryption, which is exactly the

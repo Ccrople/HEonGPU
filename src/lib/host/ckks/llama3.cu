@@ -461,6 +461,24 @@ namespace heongpu
                 add_constant(t, -(a + b) / (b - a));
             }
 
+            // evaluate_poly starts the recursion at level - ceil(log2(degree))
+            // + 1 and uses that as a kernel grid dimension, so too short a
+            // chain launches a kernel with a nonpositive extent instead of
+            // reporting anything. Say what actually went wrong.
+            const int degree = static_cast<int>(coeffs.size()) - 1;
+            const int needed =
+                degree < 1
+                    ? 0
+                    : static_cast<int>(std::ceil(std::log2(degree))) - 1;
+            if (t.level() < needed)
+            {
+                throw std::invalid_argument(
+                    "Not enough levels left for a degree " +
+                    std::to_string(degree) + " Chebyshev evaluation: it needs " +
+                    std::to_string(needed) + " beyond the affine map and the "
+                    "ciphertext has " + std::to_string(t.level()));
+            }
+
             std::vector<Complex64> complex_coeffs(coeffs.size());
             for (std::size_t i = 0; i < coeffs.size(); i++)
             {
@@ -610,9 +628,31 @@ namespace heongpu
                 throw std::invalid_argument(
                     "RMSNorm needs one weight plaintext per input, or none");
             }
-            if (config.channels <= 0)
+            // The reduction covers count channels in each of the inputs, and
+            // only the last one may be partly padding, so the true channel
+            // count is pinned between those two bounds. Getting this wrong
+            // scales every output by a constant and nothing else complains.
+            const int reduced =
+                config.count * static_cast<int>(in.size());
+            if (config.channels <= reduced - config.count ||
+                config.channels > reduced)
             {
-                throw std::invalid_argument("RMSNorm needs a channel count");
+                throw std::invalid_argument(
+                    "RMSNorm's channel count must lie in (count * (inputs - "
+                    "1), count * inputs]: the reduction covers count channels "
+                    "per input and only the last input may be padded");
+            }
+
+            for (std::size_t i = 1; i < in.size(); i++)
+            {
+                // The squares are added together, so a mismatch here is a
+                // silently wrong sum rather than an error from the library.
+                if (in[i].depth() != in[0].depth() ||
+                    in[i].scale() != in[0].scale())
+                {
+                    throw std::invalid_argument(
+                        "RMSNorm needs every input at one level and one scale");
+                }
             }
             if (!(config.sum_hi > config.sum_lo) || !(config.sum_lo > 0.0))
             {
@@ -747,6 +787,15 @@ namespace heongpu
                              Plaintext<Scheme::CKKS>& sin_plain, int swap_shift,
                              Galoiskey<Scheme::CKKS>& galois_key)
         {
+            // The two products are added, so unequal plaintext scales weight
+            // the cosine and sine terms differently and the rotation quietly
+            // comes out wrong.
+            if (cos_plain.scale() != sin_plain.scale())
+            {
+                throw std::invalid_argument(
+                    "RoPE needs the cosine and sine plaintexts at one scale");
+            }
+
             Ciphertext<Scheme::CKKS> swapped(context_);
             rotate_rows(ct, swapped, galois_key, swap_shift);
 
