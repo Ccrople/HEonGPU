@@ -244,6 +244,11 @@ namespace heongpu
             residual_add(Ciphertext<Scheme::CKKS>& x,
                          Ciphertext<Scheme::CKKS>& sublayer);
 
+            /** @brief The same, block by block, over a blocked activation. */
+            std::vector<Ciphertext<Scheme::CKKS>>
+            residual_add(std::vector<Ciphertext<Scheme::CKKS>>& x,
+                         std::vector<Ciphertext<Scheme::CKKS>>& sublayer);
+
             /** @brief Square, relinearise and rescale. */
             void square(Ciphertext<Scheme::CKKS>& ct,
                         Relinkey<Scheme::CKKS>& relin_key);
@@ -922,6 +927,112 @@ namespace heongpu
                          const FeedForwardConfig& config,
                          Galoiskey<Scheme::CKKS>& galois_key,
                          Relinkey<Scheme::CKKS>& relin_key);
+
+            // ---------------------------------------------------------------
+            // Bootstrapping, and the whole block it makes possible
+            // ---------------------------------------------------------------
+
+            /**
+             * @brief Refresh the modulus chain of @p x.
+             *
+             * A bootstrap is not a longer chain. It spends a fixed slice of
+             * the chain it is given on itself, and hands back the rest: with
+             * the regular procedure and a BootstrappingConfig of (CtoS, StoC,
+             * taylor) that slice is CtoS + taylor + StoC + 8 levels, so what a
+             * caller gets is the chain less that and not the chain.
+             *
+             * @p x is dropped to the bottom of the chain first, which is where
+             * the procedure insists on being handed it, and is left there.
+             * Dropping is free and anything still unspent was about to be
+             * discarded anyway, so a caller with levels in hand simply loses
+             * them; that is why the bootstrap belongs at the point in a
+             * circuit where the chain has actually run out.
+             *
+             * This is by a wide margin the least accurate operation in the
+             * module. Everything else lands on the CKKS noise floor near 1e-8,
+             * while the sine standing in for the modular reduction holds
+             * around 1e-3 relative, so a circuit that bootstraps carries that
+             * error to its end.
+             *
+             * generate_bootstrapping_params must have run first, and @p
+             * boot_key must hold exactly the indices bootstrapping_key_indexs
+             * advertises. That is a different list from the one the sublayers
+             * ask for, so it is a second key and not a wider one.
+             */
+            Ciphertext<Scheme::CKKS>
+            bootstrap(Ciphertext<Scheme::CKKS>& x,
+                      Galoiskey<Scheme::CKKS>& boot_key,
+                      Relinkey<Scheme::CKKS>& relin_key);
+
+            /** @brief The same, block by block, over a blocked activation. */
+            std::vector<Ciphertext<Scheme::CKKS>>
+            bootstrap(std::vector<Ciphertext<Scheme::CKKS>>& x,
+                      Galoiskey<Scheme::CKKS>& boot_key,
+                      Relinkey<Scheme::CKKS>& relin_key);
+
+            /** @brief Plaintext weights of one whole transformer block. */
+            struct TransformerBlockWeights
+            {
+                /// Learned scale of each norm, one plaintext per block of the
+                /// activation, or empty to leave the scaling out.
+                std::vector<Plaintext<Scheme::CKKS>> attention_norm;
+                std::vector<Plaintext<Scheme::CKKS>> feed_forward_norm;
+                BlockAttentionWeights attention;
+                BlockFeedForwardWeights feed_forward;
+                /// RoPE plaintexts, as the attention sublayer wants them.
+                std::vector<Plaintext<Scheme::CKKS>> rope;
+            };
+
+            /** @brief Shape and approximation settings for a whole block. */
+            struct TransformerBlockConfig
+            {
+                RMSNormConfig attention_norm;
+                AttentionConfig attention;
+                RMSNormConfig feed_forward_norm;
+                FeedForwardConfig feed_forward;
+                /// Refresh the residual stream between the two sublayers.
+                ///
+                /// One refresh is enough and this is where it goes. Attention
+                /// under its pre-norm is the deeper half by a long way, so the
+                /// stream arrives here with the chain spent, and the SwiGLU
+                /// half then fits in what a bootstrap gives back. False runs
+                /// the whole block on one chain, which wants about fifty
+                /// levels.
+                bool bootstrap = true;
+            };
+
+            /** @brief Rotations a whole block needs a Galois key for. */
+            static std::vector<int> transformer_block_rotation_indices(
+                const TransformerBlockConfig& config);
+
+            /**
+             * @brief One pre-norm transformer block, the unit Llama-3 repeats.
+             *
+             * Norm, attention, residual; then norm, SwiGLU, residual. The
+             * pre-norm arrangement is what makes the residual cheap: the
+             * sublayer reads a normalised copy while the stream itself is
+             * carried around untouched, so the addition that closes each half
+             * pays only the level match_scale needs.
+             *
+             * The bootstrap sits between the two halves rather than at the top
+             * or the bottom of the block. That is not an arbitrary choice: a
+             * refresh is worth the most where the chain is emptiest, and the
+             * attention half spends roughly three levels for every one the
+             * SwiGLU half does.
+             *
+             * @param galois_key The sublayers' rotations,
+             *                   transformer_block_rotation_indices.
+             * @param boot_key   Bootstrapping's own rotations, which are a
+             *                   different list; unused when the config turns
+             *                   the refresh off.
+             */
+            std::vector<Ciphertext<Scheme::CKKS>>
+            transformer_block(std::vector<Ciphertext<Scheme::CKKS>>& x,
+                              TransformerBlockWeights& weights,
+                              const TransformerBlockConfig& config,
+                              Galoiskey<Scheme::CKKS>& galois_key,
+                              Galoiskey<Scheme::CKKS>& boot_key,
+                              Relinkey<Scheme::CKKS>& relin_key);
 
           private:
             /// The prime the next rescale of @p ct will divide by.

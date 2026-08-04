@@ -196,6 +196,54 @@ namespace
         return out;
     }
 
+    /// RMSNorm over the strided axis, which is the channel axis of the packed
+    /// layout. Shared rather than a fixture member: two fixtures need it and
+    /// it reads nothing but its arguments.
+    std::vector<double> rms_norm_host(
+        const std::vector<double>& x,
+        const llama::Llama3Operator::RMSNormConfig& config)
+    {
+        std::vector<double> out(x.size());
+        for (int i = 0; i < config.stride; i++)
+        {
+            double total = 0.0;
+            for (int j = 0; j < config.count; j++)
+            {
+                const double v = x[j * config.stride + i];
+                total += v * v;
+            }
+            const double factor =
+                1.0 / std::sqrt(total / config.channels + config.eps);
+            for (int j = 0; j < config.count; j++)
+            {
+                out[j * config.stride + i] = x[j * config.stride + i] * factor;
+            }
+        }
+        return out;
+    }
+
+    /// Bracket the summed squares an RMSNorm will meet, which is the interval
+    /// its 1/sqrt has to be fitted over.
+    void square_sum_range(const std::vector<double>& x,
+                          llama::Llama3Operator::RMSNormConfig& config)
+    {
+        double lowest = std::numeric_limits<double>::max();
+        double highest = 0.0;
+        for (int i = 0; i < config.stride; i++)
+        {
+            double total = 0.0;
+            for (int j = 0; j < config.count; j++)
+            {
+                const double v = x[j * config.stride + i];
+                total += v * v;
+            }
+            lowest = std::min(lowest, total);
+            highest = std::max(highest, total);
+        }
+        config.sum_lo = 0.8 * lowest;
+        config.sum_hi = 1.2 * highest;
+    }
+
     /// The one-per-batch-entry form a BlockMatrix block takes.
     std::vector<double> flatten_block(const ChannelBlock& block)
     {
@@ -1953,48 +2001,10 @@ namespace
             config.eps = 1e-5;
             config.degree = 31;
             config.newton_iterations = newton_iterations;
-
-            double lowest = std::numeric_limits<double>::max();
-            double highest = 0.0;
-            for (int i = 0; i < config.stride; i++)
-            {
-                double total = 0.0;
-                for (int j = 0; j < config.count; j++)
-                {
-                    const double v = x[j * config.stride + i];
-                    total += v * v;
-                }
-                lowest = std::min(lowest, total);
-                highest = std::max(highest, total);
-            }
-            config.sum_lo = 0.8 * lowest;
-            config.sum_hi = 1.2 * highest;
+            square_sum_range(x, config);
             return config;
         }
 
-        std::vector<double> rms_norm_host(
-            const std::vector<double>& x,
-            const llama::Llama3Operator::RMSNormConfig& config) const
-        {
-            std::vector<double> out(x.size());
-            for (int i = 0; i < config.stride; i++)
-            {
-                double total = 0.0;
-                for (int j = 0; j < config.count; j++)
-                {
-                    const double v = x[j * config.stride + i];
-                    total += v * v;
-                }
-                const double factor =
-                    1.0 / std::sqrt(total / config.channels + config.eps);
-                for (int j = 0; j < config.count; j++)
-                {
-                    out[j * config.stride + i] =
-                        x[j * config.stride + i] * factor;
-                }
-            }
-            return out;
-        }
     };
 
     TEST_F(Llama3LayerEnv, TauPermutesEveryBlock)
@@ -3658,15 +3668,23 @@ namespace
     {
       protected:
         static constexpr int kDegree = 4096;
-        /// Long enough that a sublayer still fits in what comes back.
-        /// BootstrappingBuysBackTheChain measures what that actually is.
-        static constexpr int kLimbs = 45;
+        /// A bootstrap keeps the chain less twenty five here, so this is the
+        /// SwiGLU half's twenty levels with a little in hand.
+        /// BootstrappingBuysBackTheChain measures the twenty three.
+        static constexpr int kLimbs = 48;
         static constexpr int kD = 8;
         /// The shipped bootstrapping example's configuration.
         static constexpr int kCtoSPiece = 3;
         static constexpr int kStoCPiece = 3;
         static constexpr int kTaylor = 11;
         static constexpr int kHammingWeight = 16;
+        /// Fifty rather than the forty the layer fixtures use, and not a free
+        /// choice: the sine that stands in for the modular reduction is set up
+        /// around the ratio of the bottom prime to the scale, and at 2^60 over
+        /// 2^40 it comes back as noise. Sixty over fifty is the ratio the
+        /// procedure is built for.
+        static constexpr int kPrimeBits = 50;
+        static constexpr int kLogScale = 50;
 
         heongpu::HEContext<S> context =
             heongpu::GenHEContext<S>(heongpu::sec_level_type::none);
@@ -3680,14 +3698,14 @@ namespace
         std::unique_ptr<heongpu::Relinkey<S>> relin;
         std::unique_ptr<llama::Llama3Operator> ops;
 
-        double scale = std::pow(2.0, 40);
+        double scale = std::pow(2.0, kLogScale);
         int slots = 0;
         llama::MatrixLayout layout;
 
         void SetUp() override
         {
             std::vector<int> logq{60};
-            logq.insert(logq.end(), kLimbs - 1, 40);
+            logq.insert(logq.end(), kLimbs - 1, kPrimeBits);
             context->set_poly_modulus_degree(kDegree);
             context->set_coeff_modulus_bit_sizes(logq, {60, 60, 60});
             context->generate();
@@ -3786,14 +3804,188 @@ namespace
         const int usable = levels_left(refreshed);
         std::cout << "[ MEASURED ] bootstrap returns " << usable << " of "
                   << kLimbs << " levels" << std::endl;
-        EXPECT_GT(usable, 1);
+
+        // The slice a bootstrap keeps is CtoS + taylor + StoC + 8, and that
+        // is the arithmetic the whole-block test's budget rests on, so it is
+        // pinned here rather than left as a comment.
+        EXPECT_EQ(usable, kLimbs - (kCtoSPiece + kTaylor + kStoCPiece + 8));
 
         // Bootstrapping is the least accurate thing in this file by a wide
         // margin: the sine standing in for the modular reduction is a
-        // Taylor-and-double-angle approximation, not a Chebyshev fit over the
-        // data, so the bound here is set from what it delivers rather than
-        // from the noise floor everything else lands on.
-        EXPECT_LT(reported("bootstrap", decrypt(refreshed), packed), 1e-3);
+        // Taylor-and-double-angle approximation rather than a fit over the
+        // data, so the bound here is set from what it delivers and not from
+        // the noise floor everything else lands on.
+        EXPECT_LT(reported("bootstrap", decrypt(refreshed), packed), 5e-3);
+    }
+
+    /// One whole transformer block: norm, attention, residual, refresh, norm,
+    /// SwiGLU, residual.
+    ///
+    /// This is the first circuit here that does not fit on a chain, which is
+    /// why there was no whole-block test before. The attention half spends
+    /// about thirty levels and the SwiGLU half about twenty, and no chain
+    /// these tests can afford holds fifty. The refresh in the middle is what
+    /// turns one demand for fifty into two for thirty, and putting it between
+    /// the halves rather than anywhere else is the whole of the arrangement:
+    /// it lands where the chain is emptiest.
+    ///
+    /// The reference treats the refresh as the identity it is meant to be, so
+    /// what the bound measures is how far from the identity it actually is.
+    TEST_F(Llama3BootstrapEnv, TransformerBlockRunsAcrossARefresh)
+    {
+        const int d = layout.d;
+        const double weight_scale = 1.0 / std::sqrt(static_cast<double>(d));
+
+        std::mt19937_64 rng(1002);
+        const std::vector<std::vector<double>> x =
+            random_blocks(layout, 1.0, rng);
+        const std::vector<std::vector<double>> wq =
+            random_blocks(layout, weight_scale, rng);
+        const std::vector<std::vector<double>> wk =
+            random_blocks(layout, weight_scale, rng);
+        const std::vector<std::vector<double>> wv =
+            random_blocks(layout, weight_scale, rng);
+        const std::vector<std::vector<double>> gate =
+            random_blocks(layout, weight_scale, rng);
+        const std::vector<std::vector<double>> up =
+            random_blocks(layout, weight_scale, rng);
+        const std::vector<std::vector<double>> down =
+            random_blocks(layout, weight_scale, rng);
+
+        llama::Llama3Operator::TransformerBlockConfig config;
+        config.bootstrap = true;
+
+        // The pre-attention norm, over the channels of the one block.
+        const std::vector<double> x_slots = pack_blocks(x, layout);
+        config.attention_norm.stride = d * layout.batch;
+        config.attention_norm.count = d;
+        config.attention_norm.channels = d;
+        config.attention_norm.eps = 1e-5;
+        config.attention_norm.degree = 31;
+        // Both norms skip the Newton step. A sublayer follows each of them and
+        // wants the level more than the norm wants its last digit, and against
+        // a bootstrap's own error the difference is invisible anyway.
+        config.attention_norm.newton_iterations = 0;
+        square_sum_range(x_slots, config.attention_norm);
+
+        const std::vector<std::vector<double>> normed =
+            unpack_blocks(rms_norm_host(x_slots, config.attention_norm),
+                          layout);
+
+        std::vector<std::vector<double>> q(layout.batch);
+        std::vector<std::vector<double>> k(layout.batch);
+        std::vector<std::vector<double>> v(layout.batch);
+        std::vector<std::vector<double>> raw(layout.batch);
+        double lowest = std::numeric_limits<double>::max();
+        double highest = std::numeric_limits<double>::lowest();
+        for (int m = 0; m < layout.batch; m++)
+        {
+            q[m] = llama::matmul_host(wq[m], normed[m], d);
+            k[m] = llama::matmul_host(wk[m], normed[m], d);
+            v[m] = llama::matmul_host(wv[m], normed[m], d);
+            raw[m] =
+                llama::matmul_host(llama::transpose_host(k[m], d), q[m], d);
+            for (double s : raw[m])
+            {
+                lowest = std::min(lowest, s);
+                highest = std::max(highest, s);
+            }
+        }
+
+        config.attention.layout = layout;
+        config.attention.causal = true;
+        config.attention.rope = false;
+        config.attention.head_scale = 2.0 / (highest - lowest);
+        config.attention.score_shift = highest * config.attention.head_scale;
+        config.attention.softmax.bound = 2.0;
+        config.attention.softmax.iterations = 1;
+        config.attention.softmax.exp_degree = 15;
+        config.attention.softmax.inverse_degree = 15;
+        config.attention.softmax.inverse_newton = 1;
+
+        // The residual stream after the attention half, which is what the
+        // refresh is handed and what the second norm reduces over.
+        const ChannelBlock probabilities =
+            causal_softmax_host(raw, config.attention.head_scale,
+                                config.attention.score_shift, d);
+        ChannelBlock stream = matmul_block(v, probabilities, d);
+        for (int m = 0; m < layout.batch; m++)
+        {
+            for (std::size_t e = 0; e < stream[m].size(); e++)
+            {
+                stream[m][e] += x[m][e];
+            }
+        }
+        const std::vector<double> stream_slots = pack_blocks(stream, layout);
+
+        config.feed_forward_norm = config.attention_norm;
+        square_sum_range(stream_slots, config.feed_forward_norm);
+
+        const std::vector<std::vector<double>> stream_normed = unpack_blocks(
+            rms_norm_host(stream_slots, config.feed_forward_norm), layout);
+
+        config.feed_forward.layout = layout;
+        config.feed_forward.silu_bound = 4.0;
+        config.feed_forward.silu_degree = 31;
+
+        std::vector<std::vector<double>> want(layout.batch);
+        double widest = 0.0;
+        for (int m = 0; m < layout.batch; m++)
+        {
+            const std::vector<double> g =
+                llama::matmul_host(gate[m], stream_normed[m], d);
+            const std::vector<double> u =
+                llama::matmul_host(up[m], stream_normed[m], d);
+            std::vector<double> hidden(g.size());
+            for (std::size_t e = 0; e < g.size(); e++)
+            {
+                widest = std::max(widest, std::abs(g[e]));
+                hidden[e] = silu_host(g[e]) * u[e];
+            }
+            const std::vector<double> out =
+                llama::matmul_host(down[m], hidden, d);
+            want[m].resize(out.size());
+            for (std::size_t e = 0; e < out.size(); e++)
+            {
+                want[m][e] = stream[m][e] + out[e];
+            }
+        }
+        ASSERT_LT(widest, config.feed_forward.silu_bound);
+
+        llama::Llama3Operator::TransformerBlockWeights weights;
+        weights.attention.query = llama::BlockMatrix(flatten_block(wq));
+        weights.attention.key = llama::BlockMatrix(flatten_block(wk));
+        weights.attention.value = llama::BlockMatrix(flatten_block(wv));
+        weights.feed_forward.gate = llama::BlockMatrix(flatten_block(gate));
+        weights.feed_forward.up = llama::BlockMatrix(flatten_block(up));
+        weights.feed_forward.down = llama::BlockMatrix(flatten_block(down));
+
+        // Exactly the list the block advertises, and nothing more. The
+        // bootstrapping indices are a separate key on purpose.
+        auto key = narrow_key(
+            llama::Llama3Operator::transformer_block_rotation_indices(config));
+
+        std::vector<heongpu::Ciphertext<S>> in{encrypt(x_slots)};
+        std::vector<heongpu::Ciphertext<S>> got = ops->transformer_block(
+            in, weights, config, *key, *boot_galois, *relin);
+        ASSERT_EQ(got.size(), std::size_t{1});
+
+        // Two orders looser than the deepest single-chain circuit here, and
+        // essentially all of it is the refresh: this lands within a few parts
+        // in ten of what the bootstrap alone delivers, so the SwiGLU half that
+        // follows it adds almost nothing to the error it inherits.
+        EXPECT_LT(reported("transformer block", decrypt(got[0]),
+                           pack_blocks(want, layout)),
+                  5e-3);
+
+        // And the refresh is not decorative. The same block, the same chain,
+        // nothing else changed: fifty one levels of work do not fit in
+        // forty eight, and it runs out part way through the SwiGLU half.
+        llama::Llama3Operator::TransformerBlockConfig without = config;
+        without.bootstrap = false;
+        std::vector<heongpu::Ciphertext<S>> again{encrypt(x_slots)};
+        EXPECT_ANY_THROW(ops->transformer_block(again, weights, without, *key,
+                                                *boot_galois, *relin));
     }
 
 } // namespace

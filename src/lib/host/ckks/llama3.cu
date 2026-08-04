@@ -250,9 +250,14 @@ namespace heongpu
             }
 
             // evaluate_poly consults scale_boot_ when deciding whether an
-            // intermediate has grown enough to need rescaling. Nothing here
-            // bootstraps, so seed it with the working scale to give that test
-            // the meaning it has inside bootstrapping.
+            // intermediate has grown enough to need rescaling, and outside
+            // bootstrapping nothing sets it. Seeding it with the working scale
+            // gives that test the meaning it has inside bootstrapping.
+            //
+            // generate_bootstrapping_params writes the same field, so a caller
+            // that bootstraps at a scale other than the one it works at would
+            // quietly change how every polynomial in this file rescales. Pass
+            // it this same scale.
             scale_boot_ = scale;
         }
 
@@ -451,6 +456,26 @@ namespace heongpu
             drop_to_depth(out, skip.depth());
 
             add_same_scale(out, skip, "residual");
+            return out;
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>> Llama3Operator::residual_add(
+            std::vector<Ciphertext<Scheme::CKKS>>& x,
+            std::vector<Ciphertext<Scheme::CKKS>>& sublayer)
+        {
+            if (x.size() != sublayer.size())
+            {
+                throw std::invalid_argument(
+                    "A residual needs the sublayer to come back on as many "
+                    "blocks as went into it");
+            }
+
+            std::vector<Ciphertext<Scheme::CKKS>> out;
+            out.reserve(x.size());
+            for (std::size_t i = 0; i < x.size(); i++)
+            {
+                out.push_back(residual_add(x[i], sublayer[i]));
+            }
             return out;
         }
 
@@ -2410,6 +2435,99 @@ namespace heongpu
                 tau_blocks(hidden, layout, galois_key);
             return project_blocks(tau_hidden, weights.down, layout, giant, baby,
                                   "down", galois_key, token_blocks);
+        }
+
+        Ciphertext<Scheme::CKKS>
+        Llama3Operator::bootstrap(Ciphertext<Scheme::CKKS>& x,
+                                  Galoiskey<Scheme::CKKS>& boot_key,
+                                  Relinkey<Scheme::CKKS>& relin_key)
+        {
+            // The procedure raises the modulus of a ciphertext that has one
+            // prime left, so anything still unspent has to go first. It is
+            // free to drop and it was about to be discarded regardless.
+            drop_to_depth(x, context_->get_ciphertext_modulus_count() - 1);
+            return regular_bootstrapping(x, boot_key, relin_key);
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>>
+        Llama3Operator::bootstrap(std::vector<Ciphertext<Scheme::CKKS>>& x,
+                                  Galoiskey<Scheme::CKKS>& boot_key,
+                                  Relinkey<Scheme::CKKS>& relin_key)
+        {
+            // Blocks are refreshed one at a time and not together. A bootstrap
+            // is slot-wise and every block fills the slots, so there is nothing
+            // to share between them.
+            std::vector<Ciphertext<Scheme::CKKS>> out;
+            out.reserve(x.size());
+            for (Ciphertext<Scheme::CKKS>& block : x)
+            {
+                out.push_back(bootstrap(block, boot_key, relin_key));
+            }
+            return out;
+        }
+
+        std::vector<int> Llama3Operator::transformer_block_rotation_indices(
+            const TransformerBlockConfig& config)
+        {
+            std::set<int> indices;
+            for (int r : attention_rotation_indices(config.attention))
+            {
+                indices.insert(r);
+            }
+            for (int r : feed_forward_rotation_indices(config.feed_forward))
+            {
+                indices.insert(r);
+            }
+            // The two norms reduce over the channel axis, which the sublayers
+            // need no shift of their own for when a head is one block wide.
+            for (const RMSNormConfig* norm :
+                 {&config.attention_norm, &config.feed_forward_norm})
+            {
+                for (int r :
+                     strided_rotation_indices(norm->stride, norm->count))
+                {
+                    indices.insert(r);
+                }
+            }
+            // Bootstrapping's rotations are deliberately absent. They are a
+            // different list, generated against a different key, and folding
+            // them in here would hide that.
+            return std::vector<int>(indices.begin(), indices.end());
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>> Llama3Operator::transformer_block(
+            std::vector<Ciphertext<Scheme::CKKS>>& x,
+            TransformerBlockWeights& weights,
+            const TransformerBlockConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Galoiskey<Scheme::CKKS>& boot_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            if (x.empty())
+            {
+                throw std::invalid_argument("A transformer block needs an "
+                                            "input");
+            }
+
+            std::vector<Ciphertext<Scheme::CKKS>> normed =
+                rms_norm(x, weights.attention_norm, config.attention_norm,
+                         galois_key, relin_key);
+            std::vector<Ciphertext<Scheme::CKKS>> sublayer =
+                attention(normed, weights.attention, weights.rope,
+                          config.attention, galois_key, relin_key);
+            std::vector<Ciphertext<Scheme::CKKS>> stream =
+                residual_add(x, sublayer);
+
+            if (config.bootstrap)
+            {
+                stream = bootstrap(stream, boot_key, relin_key);
+            }
+
+            normed = rms_norm(stream, weights.feed_forward_norm,
+                              config.feed_forward_norm, galois_key, relin_key);
+            sublayer = feed_forward(normed, weights.feed_forward,
+                                    config.feed_forward, galois_key, relin_key);
+            return residual_add(stream, sublayer);
         }
 
     } // namespace llama
