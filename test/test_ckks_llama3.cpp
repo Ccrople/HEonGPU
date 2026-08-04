@@ -19,6 +19,25 @@
 // 1e-3 would have let a five hundred fold regression through. The exceptions
 // are the Chebyshev approximations themselves, where the fit error dominates
 // and the bound is set from the degree instead.
+//
+// Those two regimes behave differently from run to run, and how much headroom a
+// bound needs follows from which one it is in. The plaintext operands are drawn
+// from fixed seeds, so a fit-dominated bound sees the same error every run: the
+// spread over six consecutive runs of the whole suite was under a part in ten
+// thousand, and a factor of two of headroom is plenty there. A noise-dominated
+// bound is a maximum over slots of the encryption noise, which is redrawn every
+// run; the same six runs moved those by up to a factor of four, so anything
+// resting on the noise floor is given at least an order and a half. Where the
+// two are mixed the noisy one governs.
+//
+// Every precision check therefore goes through reported(), which prints the
+// measured error next to the bound it is checked against. A primitive that
+// still passes but has lost a digit is then visible in the log rather than
+// waiting to be found by the first test whose bound is tight enough to catch
+// it. The exceptions are the two rotation-index sweeps, which are contract
+// tests and not precision tests: what they assert is that the advertised key
+// list suffices, and they cover enough shapes that reporting every one of them
+// would bury the rest of the log.
 
 #include <heongpu/heongpu.hpp>
 #include <gtest/gtest.h>
@@ -698,7 +717,7 @@ namespace
             }
         }
 
-        EXPECT_LT(max_error(got, want), 1e-6);
+        EXPECT_LT(reported("sum_strided", got, want), 1e-6);
     }
 
     TEST_F(Llama3Env, SumBlockedReducesContiguousBlocks)
@@ -724,7 +743,7 @@ namespace
             }
         }
 
-        EXPECT_LT(max_error(got, want), 1e-5);
+        EXPECT_LT(reported("sum_blocked", got, want), 1e-5);
     }
 
     /// Plaintext operands below the top of the chain.
@@ -768,7 +787,7 @@ namespace
             }
         }
 
-        EXPECT_LT(max_error(got, want), 1e-5);
+        EXPECT_LT(reported("plaintext below the top", got, want), 1e-5);
     }
 
     // -----------------------------------------------------------------------
@@ -870,7 +889,7 @@ namespace
                       values[(i + half) % slots] * sin_values[i];
         }
 
-        EXPECT_LT(max_error(got, want), 1e-6);
+        EXPECT_LT(reported("rope", got, want), 1e-6);
     }
 
     TEST_F(Llama3Env, RMSNormMatchesThePlaintextLayer)
@@ -1124,7 +1143,9 @@ namespace
                     want[p] = values[part][p] * factor;
                 }
             }
-            EXPECT_LT(max_error(got, want), 1e-6) << "part " << part;
+            const std::string label =
+                "rms_norm split[" + std::to_string(part) + "]";
+            EXPECT_LT(reported(label.c_str(), got, want), 1e-6);
         }
     }
 
@@ -1195,7 +1216,7 @@ namespace
         heongpu::Ciphertext<S> cipher = encrypt(operand_slots);
         heongpu::Ciphertext<S> result =
             ops->pcmm(cipher, stored, layout, 4, 4, 0, *galois);
-        EXPECT_LT(max_error(decrypt(result), want), 1e-6);
+        EXPECT_LT(reported("pcmm one block", decrypt(result), want), 1e-6);
     }
 
     /// Lopsided BSGS splits. The rotation sets differ from the square split,
@@ -1229,8 +1250,9 @@ namespace
             heongpu::Ciphertext<S> cipher = encrypt(operand_slots);
             heongpu::Ciphertext<S> result =
                 ops->pcmm(cipher, stored, layout, d / baby, baby, 0, *galois);
-            EXPECT_LT(max_error(decrypt(result), want), 1e-6)
-                << "baby=" << baby;
+            const std::string label =
+                "pcmm baby=" + std::to_string(baby);
+            EXPECT_LT(reported(label.c_str(), decrypt(result), want), 1e-6);
         }
     }
 
@@ -1271,8 +1293,11 @@ namespace
             want_shallow[i] = values[i] * weight[i];
         }
 
-        EXPECT_LT(max_error(decrypt(deep), want_deep), 1e-6);
-        EXPECT_LT(max_error(decrypt(shallow), want_shallow), 1e-6);
+        EXPECT_LT(reported("plaintext reuse deep", decrypt(deep), want_deep),
+                  1e-6);
+        EXPECT_LT(
+            reported("plaintext reuse shallow", decrypt(shallow), want_shallow),
+            1e-6);
     }
 
     // -----------------------------------------------------------------------
@@ -1910,8 +1935,16 @@ namespace
 
         /// RMSNorm over the channel axis of the packed layout, which is the
         /// slow axis and therefore the free one.
+        ///
+        /// @p newton_iterations has no default on purpose. Dropping the Newton
+        /// step caps the normalisation at the bare Chebyshev fit, around 1e-5,
+        /// which is invisible inside a block test whose bound is looser than
+        /// that and fatal in a standalone one whose bound is not. The pre-norm
+        /// blocks pass 0 because they cannot spare the level; a caller with
+        /// levels to spend must say 1 rather than inherit the compromise.
         llama::Llama3Operator::RMSNormConfig
-        norm_config(const std::vector<double>& x) const
+        norm_config(const std::vector<double>& x,
+                    int newton_iterations) const
         {
             llama::Llama3Operator::RMSNormConfig config;
             config.stride = layout.d * layout.batch;
@@ -1919,7 +1952,7 @@ namespace
             config.channels = layout.d;
             config.eps = 1e-5;
             config.degree = 31;
-            config.newton_iterations = 0;
+            config.newton_iterations = newton_iterations;
 
             double lowest = std::numeric_limits<double>::max();
             double highest = 0.0;
@@ -2379,7 +2412,10 @@ namespace
         }
 
         const std::vector<double> x_slots = pack_blocks(x, layout);
-        const llama::Llama3Operator::RMSNormConfig norm = norm_config(x_slots);
+        // 0 Newton steps: the sublayer that follows needs the level more
+        // than this norm needs the last digit.
+        const llama::Llama3Operator::RMSNormConfig norm =
+            norm_config(x_slots, 0);
         const std::vector<std::vector<double>> normed =
             unpack_blocks(rms_norm_host(x_slots, norm), layout);
 
@@ -2454,7 +2490,10 @@ namespace
         }
 
         const std::vector<double> x_slots = pack_blocks(x, layout);
-        const llama::Llama3Operator::RMSNormConfig norm = norm_config(x_slots);
+        // 0 Newton steps: the sublayer that follows needs the level more
+        // than this norm needs the last digit.
+        const llama::Llama3Operator::RMSNormConfig norm =
+            norm_config(x_slots, 0);
         const std::vector<std::vector<double>> normed =
             unpack_blocks(rms_norm_host(x_slots, norm), layout);
 
