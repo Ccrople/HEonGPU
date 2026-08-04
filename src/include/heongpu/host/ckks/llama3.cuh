@@ -368,6 +368,10 @@ namespace heongpu
                 /// (count * (inputs - 1), count * inputs]: every input
                 /// contributes count channels and only the last may be padded.
                 int channels = 0;
+                /// Token blocks the sequence is cut into. The inputs are then
+                /// channel-major, block (j, s) at j * token_blocks + s, and
+                /// each token block is normalised over its own channels.
+                int token_blocks = 1;
                 double eps = 1e-5;
                 double sum_lo = 0.0; ///< Range of the summed square.
                 double sum_hi = 0.0;
@@ -383,6 +387,11 @@ namespace heongpu
              * strided reduction, so the mean is over all @c channels. The
              * division by the channel count is folded into the approximated
              * function and costs nothing.
+             *
+             * A sequence longer than d is several token blocks, and they are
+             * independent: each is normalised over its own channels only. The
+             * inputs are then channel-major and the weights follow them, since
+             * a learned scale belongs to a channel and not to a token.
              *
              * @param in      Channel-split ciphertexts, all at one level.
              * @param weights One plaintext per input, or empty to skip the
@@ -400,7 +409,10 @@ namespace heongpu
             {
                 bool strided = true; ///< Layout of the reduced axis.
                 int stride = 0;      ///< Strided layout only.
-                int count = 0;       ///< SoftMax length d, either layout.
+                /// Reduced coordinates held in ONE ciphertext, either layout.
+                /// When the axis is split over several, the SoftMax length is
+                /// this times their number.
+                int count = 0;
                 double bound = 0.0;  ///< Inputs lie in [-bound, 0].
                 int iterations = 2;  ///< Section 4.3 fixes this at two.
                 int exp_degree = 31;
@@ -456,6 +468,39 @@ namespace heongpu
             Ciphertext<Scheme::CKKS>
             softmax(Ciphertext<Scheme::CKKS>& ct, const SoftmaxConfig& config,
                     const std::vector<double>& mask,
+                    Galoiskey<Scheme::CKKS>& galois_key,
+                    Relinkey<Scheme::CKKS>& relin_key);
+
+            /**
+             * @brief One SoftMax whose reduced axis spans several ciphertexts.
+             *
+             * A sequence longer than d puts the keys of one query in more than
+             * one ciphertext, and the denominator has to cover all of them.
+             * The parts share a slot layout and differ only in which stretch
+             * of the axis they hold, so the sum of their reductions is the
+             * reduction of their sum: the squares are added slot-wise first
+             * and reduced once, and the whole SoftMax pays for one reduction
+             * and one reciprocal however many ciphertexts the axis is cut
+             * into. Only the squaring and the final product are per part.
+             *
+             * Depth is therefore exactly that of the single-ciphertext form.
+             * Splitting the axis costs products, not levels.
+             *
+             * The SoftMax length is @c config.count times the number of parts,
+             * and it is that total the mask weights and the fitted ranges are
+             * taken against.
+             *
+             * @param masks Empty for none, or one per part; an individual mask
+             *              may be empty to leave its part unmasked. A part
+             *              that is masked off entirely should be left out
+             *              rather than passed as zeros, since a dropped
+             *              coordinate still has to have been in [-bound, 0]
+             *              before the exponential.
+             */
+            std::vector<Ciphertext<Scheme::CKKS>>
+            softmax(std::vector<Ciphertext<Scheme::CKKS>>& parts,
+                    const SoftmaxConfig& config,
+                    const std::vector<std::vector<double>>& masks,
                     Galoiskey<Scheme::CKKS>& galois_key,
                     Relinkey<Scheme::CKKS>& relin_key);
 
@@ -608,8 +653,32 @@ namespace heongpu
             // then the block product Y[i] = sum_j W(i, j) X[j], and every term
             // of that sum leaves Equation (5) at the same level and the same
             // scale, so the sum itself is free. Widening a model buys products,
-            // not depth. The sequence length is a separate question and is
-            // still d: this is the width half of Table 4, not the whole of it.
+            // not depth.
+            //
+            // The sequence is cut the same way. A prompt longer than d is
+            // several TOKEN blocks, and an activation is then a grid: channel
+            // block j of token block s at index j * token_blocks + s, which
+            // makes the width-only case token_blocks = 1 and leaves it exactly
+            // as it was. Every configuration below carries that count.
+            //
+            // Token blocking is not symmetric with channel blocking, because
+            // the two axes meet differently:
+            //
+            //   - a weight touches channels only, so a projection is the same
+            //     block product run once per token block and the two blockings
+            //     simply multiply;
+            //   - attention is the axis talking to itself. Scores become a
+            //     grid S(u, s) over key block u and query block s, the SoftMax
+            //     denominator of a query has to sum over every u, and the
+            //     value product sums over u again. Causality then deletes the
+            //     half with u > s outright, which is why those blocks are
+            //     never formed rather than formed and masked.
+            //
+            // Neither costs depth. The score blocks of one query share a level
+            // and a scale, the SoftMax over them reduces once, and the value
+            // products land together, so a long sequence buys products and
+            // ciphertexts. That is the whole of Table 4's blocking; what is
+            // still absent is its multi-ring, multi-encoding half.
 
             /**
              * @brief Y[i] = sum_j W(i, j) X[j], over channel blocks.
@@ -618,17 +687,24 @@ namespace heongpu
              * tau of its operand and the sublayers take that map once and
              * share it across the weights that read the same activation.
              *
-             * @param tau_x One tau'd block per input channel block, all at one
+             * A weight reads channels and says nothing about tokens, so a
+             * blocked sequence runs the same block product once per token
+             * block against the same plaintexts.
+             *
+             * @param tau_x One tau'd block per input channel block and token
+             *              block, at index j * token_blocks + s, all at one
              *              level and one scale.
              * @param giant,baby BSGS factors with giant * baby == d, or both
              *                   zero to take the balanced split.
+             * @param token_blocks Token blocks the sequence is cut into.
              */
             std::vector<Ciphertext<Scheme::CKKS>>
             project_blocks(std::vector<Ciphertext<Scheme::CKKS>>& tau_x,
                            const BlockMatrix& weight,
                            const MatrixLayout& layout, int giant, int baby,
                            const char* name,
-                           Galoiskey<Scheme::CKKS>& galois_key);
+                           Galoiskey<Scheme::CKKS>& galois_key,
+                           int token_blocks = 1);
 
             /** @brief Plaintext weights of one attention sublayer. */
             struct AttentionWeights
@@ -647,10 +723,22 @@ namespace heongpu
                 MatrixLayout layout;
                 int giant = 0; ///< BSGS split of the projections; 0 balances.
                 int baby = 0;
-                /// Heads sharing the query, key and value channel blocks
-                /// between them; each takes a contiguous run of
-                /// qkv_blocks / heads of them, so head_dim is that run times d.
+                /// Heads sharing the query channel blocks between them; each
+                /// takes a contiguous run of query_blocks / heads of them, so
+                /// head_dim is that run times d.
                 int heads = 1;
+                /// Distinct key and value heads, for grouped-query attention;
+                /// 0 means one apiece, which is multi-head attention. Must
+                /// divide @c heads, and heads / kv_heads consecutive query
+                /// heads then read the same key and value blocks. The key and
+                /// value weights produce kv_heads runs rather than heads, so
+                /// they are narrower than the query weight by that factor,
+                /// which is the point of the arrangement.
+                int kv_heads = 0;
+                /// Token blocks the sequence is cut into, so the sequence
+                /// length is token_blocks * d. The activations are then
+                /// channel-major, block (j, s) at j * token_blocks + s.
+                int token_blocks = 1;
                 bool causal = true;   ///< Mask keys ahead of the query.
                 bool rope = false;    ///< Apply RoPE to Q and K.
                 /// 1/sqrt(head_dim); 0 derives it from the blocks per head.
@@ -666,6 +754,29 @@ namespace heongpu
 
             /** @brief The mask a causal attention wants, ready for softmax. */
             static std::vector<double> causal_mask(const MatrixLayout& layout);
+
+            /**
+             * @brief The causal mask of one score block of a cut sequence.
+             *
+             * Block (@p key_block, @p query_block) of the score grid, keys on
+             * the slow axis. Three cases and only the third has any shape to
+             * it: a key block entirely behind the query block is kept whole, a
+             * key block entirely ahead of it is dropped whole and comes back
+             * as an empty vector the caller should skip, and the diagonal
+             * block is the triangle.
+             *
+             * The surviving weight is sqrt(visible / kept), where kept is the
+             * global count of keys the query admits and visible is the size of
+             * the key blocks that were formed, (query_block + 1) * d. Neither
+             * is per block, and both matter: the weight cancels only because
+             * it is constant along the key axis, and that axis now runs across
+             * the blocks, while the SoftMax fits its first reciprocal over the
+             * coordinates it is actually handed, which is the blocks a causal
+             * query block is given rather than the whole sequence.
+             */
+            static std::vector<double>
+            causal_block_mask(const MatrixLayout& layout, int query_block,
+                              int key_block, int token_blocks);
 
             /** @brief Rotations attention needs a Galois key for. */
             static std::vector<int>
@@ -698,8 +809,9 @@ namespace heongpu
             /** @brief Blocked weights of one attention sublayer. */
             struct BlockAttentionWeights
             {
-                /// out_blocks must agree across the three, since they are the
-                /// blocks the heads are shared out between.
+                /// The key and the value must agree on out_blocks. The query
+                /// agrees with them too under multi-head attention, and is
+                /// heads / kv_heads times wider under grouped-query attention.
                 BlockMatrix query;
                 BlockMatrix key;
                 BlockMatrix value;
@@ -707,23 +819,35 @@ namespace heongpu
             };
 
             /**
-             * @brief Attention over a model wider than one channel block.
+             * @brief Attention over a model wider or longer than one block.
              *
-             * A head owns a contiguous run of the query, key and value blocks,
-             * and its scores are the sum of that run's K[j]^T Q[j]. Every term
-             * lands at one level and one scale, so a head spanning several
-             * blocks costs products rather than depth, and the SoftMax that
-             * follows is one per head however wide the head is.
+             * A head owns a contiguous run of the query blocks, and its scores
+             * are the sum of that run's K[j]^T Q[j]. Every term lands at one
+             * level and one scale, so a head spanning several blocks costs
+             * products rather than depth, and the SoftMax that follows is one
+             * per head however wide the head is. Under grouped-query attention
+             * several query heads read one run of key and value blocks; they
+             * still get their own scores and their own SoftMax, because it is
+             * the query that differs.
              *
-             * @param rope_plain Empty, or 2 * (blocks per head) plaintexts as
-             *                   {cos_0, sin_0, cos_1, sin_1, ...} indexed by
-             *                   the block's position inside its head. RoPE
-             *                   pairs channel c with c + head_dim / 2: within
-             *                   one block when a head is one block, and between
-             *                   blocks otherwise, where it needs no rotation at
-             *                   all. The angles depend on the channel inside
-             *                   the head and on the token, so every head reads
-             *                   the same plaintexts.
+             * A sequence cut into token blocks makes the scores a grid. Query
+             * block s takes one SoftMax per head over the key blocks it is
+             * allowed to see, which under a causal mask is u <= s; the blocks
+             * ahead are never formed. The value product then sums over the
+             * same u. Both sums are free, so the sequence length costs
+             * ciphertexts and products and no depth at all.
+             *
+             * @param rope_plain Empty, or 2 * (blocks per head) plaintexts per
+             *                   token block, token-block-major: the pair for
+             *                   block t of a head in token block s sits at
+             *                   2 * (s * per_head + t). RoPE pairs channel c
+             *                   with c + head_dim / 2: within one block when a
+             *                   head is one block, and between blocks
+             *                   otherwise, where it needs no rotation at all.
+             *                   The angles depend on the channel inside the
+             *                   head and on the absolute token position, so
+             *                   every head reads the same plaintexts but every
+             *                   token block needs its own.
              */
             std::vector<Ciphertext<Scheme::CKKS>>
             attention(std::vector<Ciphertext<Scheme::CKKS>>& x,
@@ -747,6 +871,9 @@ namespace heongpu
                 MatrixLayout layout;
                 int giant = 0; ///< BSGS split; 0 balances.
                 int baby = 0;
+                /// Token blocks the sequence is cut into. Every token is its
+                /// own SwiGLU, so this only says how the inputs are indexed.
+                int token_blocks = 1;
                 double silu_bound = 10.8; ///< Table 2 after calibration.
                 int silu_degree = 31;     ///< Section 3.1.3.
             };
@@ -785,6 +912,9 @@ namespace heongpu
              * is the point: Llama-3 widens by a factor of three and a half
              * before contracting, and here that is simply a gate and an up
              * weight with more output blocks than input ones.
+             *
+             * A cut sequence adds nothing but indices. SwiGLU is a map on one
+             * token's channels, so the token blocks never meet.
              */
             std::vector<Ciphertext<Scheme::CKKS>>
             feed_forward(std::vector<Ciphertext<Scheme::CKKS>>& x,
@@ -836,9 +966,9 @@ namespace heongpu
                     const MatrixLayout& layout, int giant, int baby,
                     const char* name, Galoiskey<Scheme::CKKS>& galois_key);
 
-            /// Refuse channel blocks that have drifted apart, since the block
-            /// sums below add them and CKKS addition needs one level and one
-            /// scale. An empty vector is refused too: there is no such model.
+            /// Refuse blocks that have drifted apart, since the sums below add
+            /// them and CKKS addition needs one level and one scale. An empty
+            /// vector is refused too: there is no such model.
             void require_uniform(const std::vector<Ciphertext<Scheme::CKKS>>& in,
                                  const char* name) const;
 
@@ -848,12 +978,24 @@ namespace heongpu
                        const MatrixLayout& layout,
                        Galoiskey<Scheme::CKKS>& galois_key);
 
-            /// RoPE across a head's channel blocks, in place.
+            /// RoPE across a head's channel blocks, in place. @p in is
+            /// channel-major over @p token_blocks, as everything here is.
             void rope_blocks(std::vector<Ciphertext<Scheme::CKKS>>& in,
-                             int per_head,
+                             int per_head, int token_blocks,
                              std::vector<Plaintext<Scheme::CKKS>>& rope_plain,
                              const MatrixLayout& layout,
                              Galoiskey<Scheme::CKKS>& galois_key);
+
+            /// The scores of one head against one query token block, summed
+            /// over the head's channel blocks: sum_t K[t][u]^T Q[t][s].
+            Ciphertext<Scheme::CKKS>
+            head_scores(std::vector<Ciphertext<Scheme::CKKS>>& key_t,
+                        std::vector<Ciphertext<Scheme::CKKS>>& query,
+                        int first_key, int first_query, int per_head,
+                        int token_blocks, int key_block, int query_block,
+                        const MatrixLayout& layout, double scale,
+                        Galoiskey<Scheme::CKKS>& galois_key,
+                        Relinkey<Scheme::CKKS>& relin_key);
 
             HEEncoder<Scheme::CKKS> encoder_;
             /// Cached: the context hands out its modulus chain by value.

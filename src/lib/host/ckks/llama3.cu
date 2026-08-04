@@ -775,19 +775,31 @@ namespace heongpu
                 throw std::invalid_argument(
                     "RMSNorm needs one weight plaintext per input, or none");
             }
-            // The reduction covers count channels in each of the inputs, and
-            // only the last one may be partly padding, so the true channel
-            // count is pinned between those two bounds. Getting this wrong
-            // scales every output by a constant and nothing else complains.
-            const int reduced =
-                config.count * static_cast<int>(in.size());
+            const int token_blocks =
+                config.token_blocks > 0 ? config.token_blocks : 1;
+            if (static_cast<int>(in.size()) % token_blocks != 0)
+            {
+                throw std::invalid_argument(
+                    "RMSNorm needs the same channel blocks in every token "
+                    "block");
+            }
+            const int channel_blocks =
+                static_cast<int>(in.size()) / token_blocks;
+
+            // The reduction covers count channels in each of the channel
+            // blocks, and only the last one may be partly padding, so the true
+            // channel count is pinned between those two bounds. Getting this
+            // wrong scales every output by a constant and nothing else
+            // complains.
+            const int reduced = config.count * channel_blocks;
             if (config.channels <= reduced - config.count ||
                 config.channels > reduced)
             {
                 throw std::invalid_argument(
-                    "RMSNorm's channel count must lie in (count * (inputs - "
-                    "1), count * inputs]: the reduction covers count channels "
-                    "per input and only the last input may be padded");
+                    "RMSNorm's channel count must lie in (count * (channel "
+                    "blocks - 1), count * channel blocks]: the reduction "
+                    "covers count channels per block and only the last block "
+                    "may be padded");
             }
 
             for (std::size_t i = 1; i < in.size(); i++)
@@ -807,24 +819,6 @@ namespace heongpu
                     "RMSNorm needs a positive range for the summed square");
             }
 
-            // The channels of a token may be split over several ciphertexts,
-            // so the squares are accumulated before the reduction and the mean
-            // covers every channel.
-            Ciphertext<Scheme::CKKS> total = in[0];
-            square(total, relin_key);
-            for (std::size_t i = 1; i < in.size(); i++)
-            {
-                Ciphertext<Scheme::CKKS> term = in[i];
-                square(term, relin_key);
-                add_same_scale(total, term, "rms_norm channel sum");
-            }
-
-            sum_strided(total, config.stride, config.count, galois_key);
-
-            // mean + eps. Both are one cheap step on an already reduced value.
-            multiply_constant(total, 1.0 / static_cast<double>(config.channels));
-            add_constant(total, config.eps);
-
             const double lo =
                 config.sum_lo / static_cast<double>(config.channels) +
                 config.eps;
@@ -832,24 +826,53 @@ namespace heongpu
                 config.sum_hi / static_cast<double>(config.channels) +
                 config.eps;
 
-            Ciphertext<Scheme::CKKS> scale_factor =
-                inverse_sqrt(total, lo, hi, config.degree,
-                             config.newton_iterations, relin_key);
+            std::vector<Ciphertext<Scheme::CKKS>> out(
+                in.size(), Ciphertext<Scheme::CKKS>(context_));
 
-            std::vector<Ciphertext<Scheme::CKKS>> out;
-            out.reserve(in.size());
-            for (std::size_t i = 0; i < in.size(); i++)
+            // Each token block normalises over its own channels, so the two
+            // never mix and the sequence length only says how to walk the
+            // inputs.
+            for (int s = 0; s < token_blocks; s++)
             {
-                Ciphertext<Scheme::CKKS> normalised =
-                    multiply_and_rescale(in[i], scale_factor, relin_key);
-
-                if (!weights.empty())
+                // The channels of a token may be split over several
+                // ciphertexts, so the squares are accumulated before the
+                // reduction and the mean covers every channel.
+                Ciphertext<Scheme::CKKS> total = in[s];
+                square(total, relin_key);
+                for (int j = 1; j < channel_blocks; j++)
                 {
-                    multiply_plaintext(normalised, weights[i]);
-                    rescale_inplace(normalised);
+                    Ciphertext<Scheme::CKKS> term = in[j * token_blocks + s];
+                    square(term, relin_key);
+                    add_same_scale(total, term, "rms_norm channel sum");
                 }
 
-                out.push_back(normalised);
+                sum_strided(total, config.stride, config.count, galois_key);
+
+                // mean + eps. Both are one cheap step on an already reduced
+                // value.
+                multiply_constant(
+                    total, 1.0 / static_cast<double>(config.channels));
+                add_constant(total, config.eps);
+
+                Ciphertext<Scheme::CKKS> scale_factor =
+                    inverse_sqrt(total, lo, hi, config.degree,
+                                 config.newton_iterations, relin_key);
+
+                for (int j = 0; j < channel_blocks; j++)
+                {
+                    const std::size_t at = static_cast<std::size_t>(j) *
+                                               token_blocks + s;
+                    Ciphertext<Scheme::CKKS> normalised = multiply_and_rescale(
+                        in[at], scale_factor, relin_key);
+
+                    if (!weights.empty())
+                    {
+                        multiply_plaintext(normalised, weights[at]);
+                        rescale_inplace(normalised);
+                    }
+
+                    out[at] = normalised;
+                }
             }
 
             return out;
@@ -872,12 +895,46 @@ namespace heongpu
                                 Galoiskey<Scheme::CKKS>& galois_key,
                                 Relinkey<Scheme::CKKS>& relin_key)
         {
-            if (!mask.empty() &&
-                static_cast<int>(mask.size()) != slot_count_)
+            std::vector<Ciphertext<Scheme::CKKS>> parts{ct};
+            std::vector<std::vector<double>> masks;
+            if (!mask.empty())
+            {
+                masks.push_back(mask);
+            }
+            return softmax(parts, config, masks, galois_key, relin_key)
+                .front();
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>> Llama3Operator::softmax(
+            std::vector<Ciphertext<Scheme::CKKS>>& parts,
+            const SoftmaxConfig& config,
+            const std::vector<std::vector<double>>& masks,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            if (parts.empty())
             {
                 throw std::invalid_argument(
-                    "A SoftMax mask must hold exactly slot_count() entries");
+                    "SoftMax needs at least one ciphertext to reduce over");
             }
+            if (!masks.empty() && masks.size() != parts.size())
+            {
+                throw std::invalid_argument(
+                    "A masked SoftMax needs one mask per part, or none at all");
+            }
+            for (const auto& mask : masks)
+            {
+                if (!mask.empty() &&
+                    static_cast<int>(mask.size()) != slot_count_)
+                {
+                    throw std::invalid_argument(
+                        "A SoftMax mask must hold exactly slot_count() "
+                        "entries");
+                }
+            }
+            // The parts are added together below, so a mismatch here would be
+            // a silently wrong denominator rather than an error.
+            require_uniform(parts, "SoftMax input");
             if (config.count <= 1 || !is_power_of_two(config.count))
             {
                 throw std::invalid_argument(
@@ -900,29 +957,56 @@ namespace heongpu
                     "count, so that every block is whole");
             }
 
-            const double d = static_cast<double>(config.count);
+            // The reduced axis runs across the parts, so the SoftMax length is
+            // the whole of it and that is what the fitted ranges below and the
+            // caller's mask weights are taken against.
+            const double d =
+                static_cast<double>(config.count) * parts.size();
 
-            Ciphertext<Scheme::CKKS> y = exp_scaled_negative(
-                ct, config.bound, config.iterations, config.exp_degree,
-                relin_key);
-
-            // Masking the exponentials rather than the scores removes a
-            // coordinate from the numerator and from the sum at once. The
-            // rounds below normalise, so a mask weight that is constant along
-            // the reduced axis cancels and only the pattern of zeros survives.
-            if (!mask.empty())
+            std::vector<Ciphertext<Scheme::CKKS>> y;
+            y.reserve(parts.size());
+            for (std::size_t p = 0; p < parts.size(); p++)
             {
-                multiply_vector(y, mask);
+                y.push_back(exp_scaled_negative(parts[p], config.bound,
+                                                config.iterations,
+                                                config.exp_degree, relin_key));
+
+                // Masking the exponentials rather than the scores removes a
+                // coordinate from the numerator and from the sum at once. The
+                // rounds below normalise, so a mask weight that is constant
+                // along the reduced axis cancels and only the pattern of zeros
+                // survives.
+                if (!masks.empty() && !masks[p].empty())
+                {
+                    multiply_vector(y.back(), masks[p]);
+                }
             }
 
             for (int round = 0; round < config.iterations; round++)
             {
                 // (y_i / ||y||_2)^2 is y_i^2 / sum_j y_j^2, so one squaring
                 // serves both the numerator and the sum.
-                Ciphertext<Scheme::CKKS> y_squared = y;
-                square(y_squared, relin_key);
+                std::vector<Ciphertext<Scheme::CKKS>> y_squared;
+                y_squared.reserve(y.size());
+                for (auto& part : y)
+                {
+                    Ciphertext<Scheme::CKKS> squared = part;
+                    square(squared, relin_key);
+                    y_squared.push_back(squared);
+                }
 
-                Ciphertext<Scheme::CKKS> total = y_squared;
+                // The parts hold different stretches of one axis in the same
+                // slots, and the reduction is linear, so summing them slot-wise
+                // and reducing once gives the same total as reducing each. One
+                // reduction and one reciprocal serve the whole axis however
+                // many ciphertexts it was cut into.
+                Ciphertext<Scheme::CKKS> total = y_squared[0];
+                for (std::size_t p = 1; p < y_squared.size(); p++)
+                {
+                    add_same_scale(total, y_squared[p],
+                                   "SoftMax denominator");
+                }
+
                 if (config.strided)
                 {
                     sum_strided(total, config.stride, config.count, galois_key);
@@ -954,7 +1038,11 @@ namespace heongpu
                     inverse(total, lo, hi, config.inverse_degree,
                             config.inverse_newton, relin_key);
 
-                y = multiply_and_rescale(y_squared, reciprocal, relin_key);
+                for (std::size_t p = 0; p < y.size(); p++)
+                {
+                    y[p] = multiply_and_rescale(y_squared[p], reciprocal,
+                                                relin_key);
+                }
             }
 
             return y;
@@ -1541,9 +1629,8 @@ namespace heongpu
         {
             if (in.empty())
             {
-                throw std::invalid_argument(
-                    std::string("The ") + name +
-                    " needs at least one channel block");
+                throw std::invalid_argument(std::string("The ") + name +
+                                            " needs at least one block");
             }
 
             const int depth = in.front().depth();
@@ -1554,8 +1641,8 @@ namespace heongpu
                 {
                     throw std::invalid_argument(
                         std::string("The ") + name +
-                        " channel blocks sit at different levels, so the block "
-                        "sums below them cannot be taken");
+                        " blocks sit at different levels, so the sums below "
+                        "them cannot be taken");
                 }
                 // The same relative test add_same_scale uses: rescaling drifts
                 // scales, and what must not happen is two blocks drifting
@@ -1565,8 +1652,8 @@ namespace heongpu
                 {
                     throw std::invalid_argument(
                         std::string("The ") + name +
-                        " channel blocks sit at different scales, so the block "
-                        "sums below them would be silently wrong");
+                        " blocks sit at different scales, so the sums below "
+                        "them would be silently wrong");
                 }
             }
         }
@@ -1588,7 +1675,8 @@ namespace heongpu
         std::vector<Ciphertext<Scheme::CKKS>> Llama3Operator::project_blocks(
             std::vector<Ciphertext<Scheme::CKKS>>& tau_x,
             const BlockMatrix& weight, const MatrixLayout& layout, int giant,
-            int baby, const char* name, Galoiskey<Scheme::CKKS>& galois_key)
+            int baby, const char* name, Galoiskey<Scheme::CKKS>& galois_key,
+            int token_blocks)
         {
             require_layout(layout);
             if (layout.slots != slot_count_)
@@ -1604,7 +1692,13 @@ namespace heongpu
                 throw std::invalid_argument(std::string("The ") + name +
                                             " weight has no blocks");
             }
-            if (weight.in_blocks != static_cast<int>(tau_x.size()))
+            if (token_blocks < 1)
+            {
+                throw std::invalid_argument(
+                    "A sequence is at least one token block long");
+            }
+            if (weight.in_blocks * token_blocks !=
+                static_cast<int>(tau_x.size()))
             {
                 throw std::invalid_argument(
                     std::string("The ") + name +
@@ -1613,47 +1707,54 @@ namespace heongpu
             }
 
             std::vector<Ciphertext<Scheme::CKKS>> out;
-            out.reserve(weight.out_blocks);
+            out.reserve(static_cast<std::size_t>(weight.out_blocks) *
+                        token_blocks);
 
             for (int i = 0; i < weight.out_blocks; i++)
             {
-                Ciphertext<Scheme::CKKS> row(context_);
-                bool started = false;
-
-                for (int j = 0; j < weight.in_blocks; j++)
+                // A weight reads channels, so the same plaintexts serve every
+                // token block and the two blockings simply multiply.
+                for (int s = 0; s < token_blocks; s++)
                 {
-                    const std::vector<double>& block = weight.at(i, j);
-                    if (block.empty())
-                    {
-                        continue; // A zero block is skipped, not encoded.
-                    }
+                    Ciphertext<Scheme::CKKS> row(context_);
+                    bool started = false;
 
-                    Ciphertext<Scheme::CKKS> term = project(
-                        tau_x[j], block, layout, giant, baby, name, galois_key);
+                    for (int j = 0; j < weight.in_blocks; j++)
+                    {
+                        const std::vector<double>& block = weight.at(i, j);
+                        if (block.empty())
+                        {
+                            continue; // A zero block is skipped, not encoded.
+                        }
+
+                        Ciphertext<Scheme::CKKS> term =
+                            project(tau_x[j * token_blocks + s], block, layout,
+                                    giant, baby, name, galois_key);
+
+                        if (!started)
+                        {
+                            row = term;
+                            started = true;
+                        }
+                        else
+                        {
+                            // Every term left Equation (5) one level below a
+                            // common input and at the input's own scale, so the
+                            // sum over the input blocks is exact and free.
+                            add_same_scale(row, term, name);
+                        }
+                    }
 
                     if (!started)
                     {
-                        row = term;
-                        started = true;
+                        throw std::invalid_argument(
+                            std::string("Row ") + std::to_string(i) +
+                            " of the " + name +
+                            " weight is entirely empty, so that output block "
+                            "would be a zero this cannot produce");
                     }
-                    else
-                    {
-                        // Every term left Equation (5) one level below a
-                        // common input and at the input's own scale, so the
-                        // sum over the input blocks is exact and free.
-                        add_same_scale(row, term, name);
-                    }
+                    out.push_back(row);
                 }
-
-                if (!started)
-                {
-                    throw std::invalid_argument(
-                        std::string("Row ") + std::to_string(i) + " of the " +
-                        name +
-                        " weight is entirely empty, so that output block would "
-                        "be a zero this cannot produce");
-                }
-                out.push_back(row);
             }
 
             return out;
@@ -1661,15 +1762,23 @@ namespace heongpu
 
         void Llama3Operator::rope_blocks(
             std::vector<Ciphertext<Scheme::CKKS>>& in, int per_head,
-            std::vector<Plaintext<Scheme::CKKS>>& rope_plain,
+            int token_blocks, std::vector<Plaintext<Scheme::CKKS>>& rope_plain,
             const MatrixLayout& layout, Galoiskey<Scheme::CKKS>& galois_key)
         {
-            if (static_cast<int>(rope_plain.size()) != 2 * per_head)
+            // The angle depends on the absolute position of the token, so a
+            // cut sequence needs its own pair per token block; the channel
+            // part of the angle is shared, which is why one head's plaintexts
+            // serve them all.
+            if (static_cast<int>(rope_plain.size()) !=
+                2 * per_head * token_blocks)
             {
                 throw std::invalid_argument(
                     "RoPE needs a cosine and a sine plaintext for each channel "
-                    "block of a head");
+                    "block of a head, in each token block");
             }
+
+            const int heads =
+                static_cast<int>(in.size()) / (per_head * token_blocks);
 
             if (per_head == 1)
             {
@@ -1677,10 +1786,15 @@ namespace heongpu
                 // c + d / 2 stays inside it and is the row rotation rope()
                 // takes.
                 const int swap = rope_swap_shift(layout);
-                for (auto& block : in)
+                for (int h = 0; h < heads; h++)
                 {
-                    block = rope(block, rope_plain[0], rope_plain[1], swap,
-                                 galois_key);
+                    for (int s = 0; s < token_blocks; s++)
+                    {
+                        Ciphertext<Scheme::CKKS>& block =
+                            in[h * token_blocks + s];
+                        block = rope(block, rope_plain[2 * s],
+                                     rope_plain[2 * s + 1], swap, galois_key);
+                    }
                 }
                 return;
             }
@@ -1694,38 +1808,47 @@ namespace heongpu
 
             // Wider than one block, the partner of channel c lands in another
             // block entirely, so the rotation disappears: the pairing is
-            // already there in the choice of which two blocks to combine.
+            // already there in the choice of which two blocks to combine. The
+            // partner is in the same token block, since RoPE mixes channels
+            // and never tokens.
             const int half = per_head / 2;
-            const int heads = static_cast<int>(in.size()) / per_head;
-            std::vector<Ciphertext<Scheme::CKKS>> out;
-            out.reserve(in.size());
+            std::vector<Ciphertext<Scheme::CKKS>> out(in.size(),
+                                                      Ciphertext<Scheme::CKKS>(
+                                                          context_));
 
             for (int h = 0; h < heads; h++)
             {
                 for (int t = 0; t < per_head; t++)
                 {
-                    const int index = h * per_head + t;
-                    const int partner =
-                        h * per_head + (t < half ? t + half : t - half);
+                    const int partner_t = (t < half) ? t + half : t - half;
 
-                    if (rope_plain[2 * t].scale() !=
-                        rope_plain[2 * t + 1].scale())
+                    for (int s = 0; s < token_blocks; s++)
                     {
-                        throw std::invalid_argument(
-                            "RoPE needs the cosine and sine plaintexts at one "
-                            "scale");
+                        const int index =
+                            (h * per_head + t) * token_blocks + s;
+                        const int partner =
+                            (h * per_head + partner_t) * token_blocks + s;
+                        const int cos_at = 2 * (s * per_head + t);
+
+                        if (rope_plain[cos_at].scale() !=
+                            rope_plain[cos_at + 1].scale())
+                        {
+                            throw std::invalid_argument(
+                                "RoPE needs the cosine and sine plaintexts at "
+                                "one scale");
+                        }
+
+                        Ciphertext<Scheme::CKKS> direct = in[index];
+                        multiply_plaintext(direct, rope_plain[cos_at]);
+                        rescale_inplace(direct);
+
+                        Ciphertext<Scheme::CKKS> crossed = in[partner];
+                        multiply_plaintext(crossed, rope_plain[cos_at + 1]);
+                        rescale_inplace(crossed);
+
+                        add_same_scale(direct, crossed, "rope across blocks");
+                        out[index] = direct;
                     }
-
-                    Ciphertext<Scheme::CKKS> direct = in[index];
-                    multiply_plaintext(direct, rope_plain[2 * t]);
-                    rescale_inplace(direct);
-
-                    Ciphertext<Scheme::CKKS> crossed = in[partner];
-                    multiply_plaintext(crossed, rope_plain[2 * t + 1]);
-                    rescale_inplace(crossed);
-
-                    add_same_scale(direct, crossed, "rope across blocks");
-                    out.push_back(direct);
                 }
             }
 
@@ -1748,26 +1871,65 @@ namespace heongpu
         std::vector<double>
         Llama3Operator::causal_mask(const MatrixLayout& layout)
         {
+            return causal_block_mask(layout, 0, 0, 1);
+        }
+
+        std::vector<double>
+        Llama3Operator::causal_block_mask(const MatrixLayout& layout,
+                                          int query_block, int key_block,
+                                          int token_blocks)
+        {
             require_layout(layout);
+            if (token_blocks < 1)
+            {
+                throw std::invalid_argument(
+                    "A sequence is at least one token block long");
+            }
+            if (query_block < 0 || query_block >= token_blocks ||
+                key_block < 0 || key_block >= token_blocks)
+            {
+                throw std::invalid_argument(
+                    "The score block asked for is outside the sequence");
+            }
 
             const int d = layout.d;
             const int batch = layout.batch;
+
+            if (key_block > query_block)
+            {
+                // Every key in the block is ahead of every query, so nothing
+                // survives. An empty mask says so, and the caller skips the
+                // block rather than forming it and multiplying it away.
+                return std::vector<double>();
+            }
+
             std::vector<double> mask(static_cast<std::size_t>(layout.slots),
                                      0.0);
+            // The key blocks a causal query block is handed at all: the ones
+            // ahead of it are not formed, so they are not what the SoftMax is
+            // normalising against either.
+            const double visible = static_cast<double>(d) * (query_block + 1);
 
             for (int query = 0; query < d; query++)
             {
                 // A query attends to itself and everything before it, so the
                 // number of surviving keys grows down the sequence. Weighting
-                // by sqrt(d / kept) leaves the sum of squares in the range a
-                // full row would give, which is the range the first round's
-                // reciprocal is fitted over; the rounds normalise, so a weight
-                // constant along the key axis cancels and the result is
-                // unchanged.
+                // by sqrt(visible / kept) leaves the sum of squares in the
+                // range a full set of blocks would give, which is the range
+                // the first round's reciprocal is fitted over; the rounds
+                // normalise, so a weight constant along the key axis cancels
+                // and the result is unchanged. The kept count is global rather
+                // than per block, because the key axis runs across the blocks
+                // and a weight varying along it would not cancel.
+                const int kept = query_block * d + query + 1;
                 const double weight =
-                    std::sqrt(static_cast<double>(d) /
-                              static_cast<double>(query + 1));
-                for (int key = 0; key <= query; key++)
+                    std::sqrt(visible / static_cast<double>(kept));
+
+                // On the diagonal the block is the triangle; behind it every
+                // key is already in the past and the block is kept whole.
+                const int last =
+                    (key_block < query_block) ? d - 1 : query;
+                for (int key = 0; key <= last; key++)
                 {
                     for (int m = 0; m < batch; m++)
                     {
@@ -1782,6 +1944,10 @@ namespace heongpu
         std::vector<int> Llama3Operator::attention_rotation_indices(
             const AttentionConfig& config)
         {
+            // Neither blocking adds a shift. Blocks are combined by adding and
+            // by multiplying, never by moving a slot from one to another, so
+            // the list depends on the layout and not on how many blocks a
+            // model or a prompt is cut into.
             const MatrixLayout& layout = config.layout;
             require_layout(layout);
 
@@ -1854,6 +2020,12 @@ namespace heongpu
                     "One channel block holds one head; a multi-head layer has "
                     "to be handed its blocks as a vector");
             }
+            if (config.token_blocks > 1)
+            {
+                throw std::invalid_argument(
+                    "One channel block holds d tokens; a longer sequence has "
+                    "to be handed its blocks as a vector");
+            }
 
             BlockAttentionWeights blocked;
             blocked.query = BlockMatrix(weights.query);
@@ -1863,6 +2035,8 @@ namespace heongpu
 
             AttentionConfig one = config;
             one.heads = 1;
+            one.kv_heads = 1;
+            one.token_blocks = 1;
 
             std::vector<Ciphertext<Scheme::CKKS>> in{x};
             std::vector<Ciphertext<Scheme::CKKS>> out =
@@ -1892,6 +2066,15 @@ namespace heongpu
             int baby = config.baby;
             bsgs_split(d, giant, baby);
 
+            const int token_blocks =
+                config.token_blocks > 0 ? config.token_blocks : 1;
+            if (static_cast<int>(x.size()) % token_blocks != 0)
+            {
+                throw std::invalid_argument(
+                    "The attention input must hold the same channel blocks in "
+                    "every token block");
+            }
+
             const bool any_projection = !weights.query.empty() ||
                                         !weights.key.empty() ||
                                         !weights.value.empty();
@@ -1911,13 +2094,12 @@ namespace heongpu
 
             if (all_projections)
             {
-                if (weights.query.out_blocks != weights.key.out_blocks ||
-                    weights.query.out_blocks != weights.value.out_blocks)
+                if (weights.key.out_blocks != weights.value.out_blocks)
                 {
                     throw std::invalid_argument(
-                        "The query, key and value weights must produce the "
-                        "same number of channel blocks, since that is what the "
-                        "heads are shared out between");
+                        "The key and value weights must produce the same "
+                        "number of channel blocks, since one head reads a run "
+                        "of both");
                 }
 
                 // One tau of each input block serves all three projections,
@@ -1926,11 +2108,13 @@ namespace heongpu
                 std::vector<Ciphertext<Scheme::CKKS>> tau_x =
                     tau_blocks(x, layout, galois_key);
                 query = project_blocks(tau_x, weights.query, layout, giant,
-                                       baby, "query", galois_key);
+                                       baby, "query", galois_key,
+                                       token_blocks);
                 key = project_blocks(tau_x, weights.key, layout, giant, baby,
-                                     "key", galois_key);
+                                     "key", galois_key, token_blocks);
                 value = project_blocks(tau_x, weights.value, layout, giant,
-                                       baby, "value", galois_key);
+                                       baby, "value", galois_key,
+                                       token_blocks);
             }
             else
             {
@@ -1939,20 +2123,58 @@ namespace heongpu
                 value = x;
             }
 
-            const int qkv = static_cast<int>(query.size());
+            const int q_blocks =
+                static_cast<int>(query.size()) / token_blocks;
+            const int kv_blocks = static_cast<int>(key.size()) / token_blocks;
             const int heads = config.heads > 0 ? config.heads : 1;
-            if (qkv % heads != 0)
+            const int kv_heads = config.kv_heads > 0 ? config.kv_heads : heads;
+
+            if (heads % kv_heads != 0)
+            {
+                throw std::invalid_argument(
+                    "Grouped-query attention shares one key head between a "
+                    "whole number of query heads, so kv_heads must divide "
+                    "heads");
+            }
+            if (q_blocks % heads != 0 || kv_blocks % kv_heads != 0)
             {
                 throw std::invalid_argument(
                     "The heads must share the query, key and value channel "
                     "blocks out evenly between them");
             }
-            const int per_head = qkv / heads;
+            const int per_head = q_blocks / heads;
+            if (kv_blocks / kv_heads != per_head)
+            {
+                throw std::invalid_argument(
+                    "A key head must be exactly as wide as a query head, "
+                    "since the scores are their product; with kv_heads left "
+                    "at the default that means the two weights agree on "
+                    "out_blocks");
+            }
+            // Query heads per key head: consecutive heads share a run.
+            const int group = heads / kv_heads;
 
             if (config.rope)
             {
-                rope_blocks(query, per_head, rope_plain, layout, galois_key);
-                rope_blocks(key, per_head, rope_plain, layout, galois_key);
+                rope_blocks(query, per_head, token_blocks, rope_plain, layout,
+                            galois_key);
+                rope_blocks(key, per_head, token_blocks, rope_plain, layout,
+                            galois_key);
+            }
+
+            // The scores are formed as K^T Q rather than Q^T K. That puts the
+            // key position on the slow axis, so the SoftMax denominator is the
+            // exact strided reduction and costs no level and no mask, and what
+            // comes out is already P^T, which is the operand the value product
+            // wants.
+            //
+            // Every key block is read by every query block it precedes, so the
+            // transposes are taken once here rather than inside the grid.
+            std::vector<Ciphertext<Scheme::CKKS>> key_t;
+            key_t.reserve(key.size());
+            for (auto& block : key)
+            {
+                key_t.push_back(transpose(block, layout, galois_key));
             }
 
             SoftmaxConfig softmax_config = config.softmax;
@@ -1960,73 +2182,100 @@ namespace heongpu
             softmax_config.stride = d * layout.batch;
             softmax_config.count = d;
 
-            const std::vector<double> mask =
-                config.causal ? causal_mask(layout) : std::vector<double>();
-
             // head_dim is the channel blocks a head owns, times d.
             const double head =
                 config.head_scale > 0.0
                     ? config.head_scale
                     : 1.0 / std::sqrt(static_cast<double>(per_head) * d);
 
-            std::vector<Ciphertext<Scheme::CKKS>> probabilities;
-            probabilities.reserve(heads);
+            std::vector<Ciphertext<Scheme::CKKS>> out(
+                static_cast<std::size_t>(q_blocks) * token_blocks,
+                Ciphertext<Scheme::CKKS>(context_));
+            std::vector<bool> started(out.size(), false);
 
             for (int h = 0; h < heads; h++)
             {
-                // The scores are formed as K^T Q rather than Q^T K. That puts
-                // the key position on the slow axis, so the SoftMax
-                // denominator is the exact strided reduction and costs no
-                // level and no mask, and what comes out is already P^T, which
-                // is the operand the value product wants.
-                //
-                // A head wider than one block sums its blocks' scores. Each
-                // term is a ccmm at the same level and scale, so the sum over
-                // the head is free and the SoftMax below runs once.
-                Ciphertext<Scheme::CKKS> scores(context_);
-                bool started = false;
+                // Under grouped-query attention the key and value run is
+                // shared; the query is not, so the scores and the SoftMax are
+                // still this head's own.
+                const int kv_first = (h / group) * per_head;
+                const int q_first = h * per_head;
 
-                for (int t = 0; t < per_head; t++)
+                for (int s = 0; s < token_blocks; s++)
                 {
-                    const int index = h * per_head + t;
-                    Ciphertext<Scheme::CKKS> key_t =
-                        transpose(key[index], layout, galois_key);
-                    Ciphertext<Scheme::CKKS> term = ccmm(
-                        key_t, query[index], layout, head, galois_key,
-                        relin_key);
+                    // A causal query block sees itself and what came before,
+                    // so the blocks ahead of it are never formed: masking them
+                    // afterwards would pay for the products and then throw
+                    // them away.
+                    const int last_key =
+                        config.causal ? s : token_blocks - 1;
 
-                    if (!started)
+                    std::vector<Ciphertext<Scheme::CKKS>> parts;
+                    std::vector<std::vector<double>> masks;
+                    parts.reserve(last_key + 1);
+
+                    for (int u = 0; u <= last_key; u++)
                     {
-                        scores = term;
-                        started = true;
+                        // A head wider than one block sums its blocks' scores.
+                        // Each term is a ccmm at the same level and scale, so
+                        // the sum over the head is free.
+                        Ciphertext<Scheme::CKKS> scores = head_scores(
+                            key_t, query, kv_first, q_first, per_head,
+                            token_blocks, u, s, layout, head, galois_key,
+                            relin_key);
+
+                        if (config.score_shift != 0.0)
+                        {
+                            // Translating the scores into [-bound, 0] is
+                            // calibration in the paper, not a homomorphic
+                            // maximum, so it is a constant.
+                            add_constant(scores, -config.score_shift);
+                        }
+
+                        parts.push_back(scores);
+                        if (config.causal)
+                        {
+                            masks.push_back(causal_block_mask(
+                                layout, s, u, token_blocks));
+                        }
                     }
-                    else
+
+                    // One SoftMax however many key blocks the query block
+                    // sees: the denominator is summed across them before the
+                    // single reduction.
+                    std::vector<Ciphertext<Scheme::CKKS>> probabilities =
+                        softmax(parts, softmax_config, masks, galois_key,
+                                relin_key);
+
+                    for (int t = 0; t < per_head; t++)
                     {
-                        add_same_scale(scores, term, "attention scores");
+                        const std::size_t at =
+                            static_cast<std::size_t>(q_first + t) *
+                                token_blocks + s;
+
+                        for (int u = 0; u <= last_key; u++)
+                        {
+                            const int from =
+                                (kv_first + t) * token_blocks + u;
+                            Ciphertext<Scheme::CKKS> term = ccmm(
+                                value[from], probabilities[u], layout, 1.0,
+                                galois_key, relin_key);
+
+                            if (!started[at])
+                            {
+                                out[at] = term;
+                                started[at] = true;
+                            }
+                            else
+                            {
+                                // The probability blocks left one SoftMax
+                                // together and the value blocks share a level,
+                                // so summing over the key blocks is free.
+                                add_same_scale(out[at], term,
+                                               "attention value product");
+                            }
+                        }
                     }
-                }
-
-                if (config.score_shift != 0.0)
-                {
-                    // Translating the scores into [-bound, 0] is calibration
-                    // in the paper, not a homomorphic maximum, so it is a
-                    // constant.
-                    add_constant(scores, -config.score_shift);
-                }
-
-                probabilities.push_back(softmax(scores, softmax_config, mask,
-                                                galois_key, relin_key));
-            }
-
-            std::vector<Ciphertext<Scheme::CKKS>> out;
-            out.reserve(qkv);
-            for (int h = 0; h < heads; h++)
-            {
-                for (int t = 0; t < per_head; t++)
-                {
-                    const int index = h * per_head + t;
-                    out.push_back(ccmm(value[index], probabilities[h], layout,
-                                       1.0, galois_key, relin_key));
                 }
             }
 
@@ -2035,10 +2284,43 @@ namespace heongpu
                 std::vector<Ciphertext<Scheme::CKKS>> tau_out =
                     tau_blocks(out, layout, galois_key);
                 out = project_blocks(tau_out, weights.output, layout, giant,
-                                     baby, "output", galois_key);
+                                     baby, "output", galois_key, token_blocks);
             }
 
             return out;
+        }
+
+        Ciphertext<Scheme::CKKS> Llama3Operator::head_scores(
+            std::vector<Ciphertext<Scheme::CKKS>>& key_t,
+            std::vector<Ciphertext<Scheme::CKKS>>& query, int first_key,
+            int first_query, int per_head, int token_blocks, int key_block,
+            int query_block, const MatrixLayout& layout, double scale,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            Ciphertext<Scheme::CKKS> scores(context_);
+            bool started = false;
+
+            for (int t = 0; t < per_head; t++)
+            {
+                const int k = (first_key + t) * token_blocks + key_block;
+                const int q = (first_query + t) * token_blocks + query_block;
+
+                Ciphertext<Scheme::CKKS> term = ccmm(
+                    key_t[k], query[q], layout, scale, galois_key, relin_key);
+
+                if (!started)
+                {
+                    scores = term;
+                    started = true;
+                }
+                else
+                {
+                    add_same_scale(scores, term, "attention scores");
+                }
+            }
+
+            return scores;
         }
 
         Ciphertext<Scheme::CKKS> Llama3Operator::feed_forward(
@@ -2047,6 +2329,13 @@ namespace heongpu
             Galoiskey<Scheme::CKKS>& galois_key,
             Relinkey<Scheme::CKKS>& relin_key)
         {
+            if (config.token_blocks > 1)
+            {
+                throw std::invalid_argument(
+                    "One channel block holds d tokens; a longer sequence has "
+                    "to be handed its blocks as a vector");
+            }
+
             BlockFeedForwardWeights blocked;
             blocked.gate = BlockMatrix(weights.gate);
             blocked.up = BlockMatrix(weights.up);
@@ -2090,15 +2379,22 @@ namespace heongpu
             int baby = config.baby;
             bsgs_split(layout.d, giant, baby);
 
+            const int token_blocks =
+                config.token_blocks > 0 ? config.token_blocks : 1;
+
             // The gate and the up projection read the same input, so the tau
             // Equation (5) consumes is taken once for both.
             std::vector<Ciphertext<Scheme::CKKS>> tau_x =
                 tau_blocks(x, layout, galois_key);
-            std::vector<Ciphertext<Scheme::CKKS>> gate = project_blocks(
-                tau_x, weights.gate, layout, giant, baby, "gate", galois_key);
-            std::vector<Ciphertext<Scheme::CKKS>> up = project_blocks(
-                tau_x, weights.up, layout, giant, baby, "up", galois_key);
+            std::vector<Ciphertext<Scheme::CKKS>> gate =
+                project_blocks(tau_x, weights.gate, layout, giant, baby,
+                               "gate", galois_key, token_blocks);
+            std::vector<Ciphertext<Scheme::CKKS>> up =
+                project_blocks(tau_x, weights.up, layout, giant, baby, "up",
+                               galois_key, token_blocks);
 
+            // SwiGLU is a map on one token's channels, so the token blocks
+            // never meet and this loop covers both blockings at once.
             std::vector<Ciphertext<Scheme::CKKS>> hidden;
             hidden.reserve(gate.size());
             for (std::size_t i = 0; i < gate.size(); i++)
@@ -2113,7 +2409,7 @@ namespace heongpu
             std::vector<Ciphertext<Scheme::CKKS>> tau_hidden =
                 tau_blocks(hidden, layout, galois_key);
             return project_blocks(tau_hidden, weights.down, layout, giant, baby,
-                                  "down", galois_key);
+                                  "down", galois_key, token_blocks);
         }
 
     } // namespace llama

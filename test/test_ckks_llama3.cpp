@@ -232,6 +232,93 @@ namespace
         return out;
     }
 
+    /// The causal SoftMax of one query token block whose keys are cut into
+    /// blocks: @p scores holds key block 0 up to @p query_block, and every
+    /// query normalises over every key it admits, wherever that key sits.
+    ///
+    /// The mask weights are absent here on purpose. They are constant along
+    /// the key axis and the normalisation cancels them, so a reference that
+    /// reproduced them would only be testing that they cancel.
+    std::vector<ChannelBlock> causal_block_softmax_host(
+        const std::vector<ChannelBlock>& scores, double scale, double shift,
+        int d, int query_block)
+    {
+        const std::size_t blocks = scores.size();
+        const std::size_t batch = scores.front().size();
+        std::vector<ChannelBlock> out(
+            blocks,
+            ChannelBlock(batch, std::vector<double>(
+                                    static_cast<std::size_t>(d) * d, 0.0)));
+
+        for (std::size_t m = 0; m < batch; m++)
+        {
+            for (int query = 0; query < d; query++)
+            {
+                const int reach = query_block * d + query;
+                double total = 0.0;
+                for (std::size_t u = 0; u < blocks; u++)
+                {
+                    for (int key = 0; key < d; key++)
+                    {
+                        if (static_cast<int>(u) * d + key > reach)
+                        {
+                            continue;
+                        }
+                        total += std::exp(
+                            scores[u][m][key * d + query] * scale - shift);
+                    }
+                }
+                for (std::size_t u = 0; u < blocks; u++)
+                {
+                    for (int key = 0; key < d; key++)
+                    {
+                        if (static_cast<int>(u) * d + key > reach)
+                        {
+                            continue;
+                        }
+                        out[u][m][key * d + query] =
+                            std::exp(scores[u][m][key * d + query] * scale -
+                                     shift) /
+                            total;
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    /// The widest scaled score, for calibrating a SoftMax into [-bound, 0].
+    void score_range(const std::vector<ChannelBlock>& blocks, double& lowest,
+                     double& highest)
+    {
+        lowest = std::numeric_limits<double>::max();
+        highest = std::numeric_limits<double>::lowest();
+        for (const auto& block : blocks)
+        {
+            for (const auto& entry : block)
+            {
+                for (double v : entry)
+                {
+                    lowest = std::min(lowest, v);
+                    highest = std::max(highest, v);
+                }
+            }
+        }
+    }
+
+    /// K^T Q with the keys landing on the slow axis, as attention forms them.
+    ChannelBlock scores_host(const ChannelBlock& key, const ChannelBlock& query,
+                             int d)
+    {
+        ChannelBlock out(key.size());
+        for (std::size_t m = 0; m < key.size(); m++)
+        {
+            out[m] = llama::matmul_host(llama::transpose_host(key[m], d),
+                                        query[m], d);
+        }
+        return out;
+    }
+
     // -----------------------------------------------------------------------
     // Host-only checks
     // -----------------------------------------------------------------------
@@ -2883,6 +2970,630 @@ namespace
             EXPECT_LT(reported(label.c_str(), decrypt(got[k]),
                                pack_blocks(want[k], layout)),
                       1e-5);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Sequences longer than one token block
+    // -----------------------------------------------------------------------
+
+    /// The mask is what tells a cut sequence which score blocks exist, so its
+    /// three cases are worth pinning without a GPU in the way.
+    TEST(CKKS_Llama3, CausalMaskCutsTheSequenceIntoBlocks)
+    {
+        const int d = 4;
+        const int batch = 2;
+        const int token_blocks = 3;
+        const llama::MatrixLayout layout(d, batch);
+
+        // A key block ahead of the query block survives nowhere, and says so
+        // by coming back empty rather than as a slot vector of zeros.
+        EXPECT_TRUE(
+            llama::Llama3Operator::causal_block_mask(layout, 0, 1, token_blocks)
+                .empty());
+        EXPECT_TRUE(
+            llama::Llama3Operator::causal_block_mask(layout, 1, 2, token_blocks)
+                .empty());
+
+        // One token block of sequence is the mask attention already had.
+        EXPECT_EQ(llama::Llama3Operator::causal_block_mask(layout, 0, 0, 1),
+                  llama::Llama3Operator::causal_mask(layout));
+
+        for (int query_block = 0; query_block < token_blocks; query_block++)
+        {
+            const double visible = static_cast<double>(d) * (query_block + 1);
+
+            for (int key_block = 0; key_block <= query_block; key_block++)
+            {
+                const std::vector<double> mask =
+                    llama::Llama3Operator::causal_block_mask(
+                        layout, query_block, key_block, token_blocks);
+                ASSERT_EQ(mask.size(), static_cast<std::size_t>(layout.slots));
+
+                for (int query = 0; query < d; query++)
+                {
+                    const int kept = query_block * d + query + 1;
+                    const double weight =
+                        std::sqrt(visible / static_cast<double>(kept));
+
+                    for (int key = 0; key < d; key++)
+                    {
+                        // Behind the diagonal every key is already in the
+                        // past, so only the diagonal block is a triangle.
+                        const bool admitted =
+                            key_block * d + key <= query_block * d + query;
+                        for (int m = 0; m < batch; m++)
+                        {
+                            EXPECT_DOUBLE_EQ(
+                                mask[(key * d + query) * batch + m],
+                                admitted ? weight : 0.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The denominator of a query has to cover keys held in another
+    /// ciphertext, which is what makes a sequence longer than d possible.
+    TEST_F(Llama3LayerEnv, SoftmaxSumsAcrossCiphertexts)
+    {
+        const int d = layout.d;
+        const int parts = 2;
+        auto key = narrow_key(llama::Llama3Operator::strided_rotation_indices(
+            d * layout.batch, d));
+
+        llama::Llama3Operator::SoftmaxConfig config;
+        config.strided = true;
+        config.stride = d * layout.batch;
+        config.count = d;
+        config.bound = 2.0;
+        config.iterations = 1;
+        config.exp_degree = 15;
+        config.inverse_degree = 15;
+        config.inverse_newton = 2;
+
+        std::mt19937_64 rng(905);
+        std::uniform_real_distribution<double> dist(-config.bound, 0.0);
+        std::vector<ChannelBlock> scores(parts);
+        std::vector<heongpu::Ciphertext<S>> in;
+        for (int p = 0; p < parts; p++)
+        {
+            scores[p] = zero_block(layout);
+            for (auto& block : scores[p])
+            {
+                for (double& v : block)
+                {
+                    v = dist(rng);
+                }
+            }
+            in.push_back(encrypt(pack_blocks(scores[p], layout)));
+        }
+
+        std::vector<std::vector<double>> no_masks;
+        std::vector<heongpu::Ciphertext<S>> got =
+            ops->softmax(in, config, no_masks, *key, *relin);
+        ASSERT_EQ(got.size(), static_cast<std::size_t>(parts));
+
+        // Every part holds a stretch of one axis of length count, so the
+        // SoftMax is over parts * count coordinates.
+        std::vector<ChannelBlock> want(parts, zero_block(layout));
+        for (int m = 0; m < layout.batch; m++)
+        {
+            for (int query = 0; query < d; query++)
+            {
+                double total = 0.0;
+                for (int p = 0; p < parts; p++)
+                {
+                    for (int k = 0; k < d; k++)
+                    {
+                        total += std::exp(scores[p][m][k * d + query]);
+                    }
+                }
+                for (int p = 0; p < parts; p++)
+                {
+                    for (int k = 0; k < d; k++)
+                    {
+                        want[p][m][k * d + query] =
+                            std::exp(scores[p][m][k * d + query]) / total;
+                    }
+                }
+            }
+        }
+
+        for (int p = 0; p < parts; p++)
+        {
+            const std::string label =
+                "split softmax[" + std::to_string(p) + "]";
+            EXPECT_LT(reported(label.c_str(), decrypt(got[p]),
+                               pack_blocks(want[p], layout)),
+                      1e-6);
+        }
+    }
+
+    /// A prompt longer than d, which makes the scores a grid: two query
+    /// blocks, and the second attends back into the first.
+    TEST_F(Llama3LayerEnv, AttentionSpansSeveralTokenBlocks)
+    {
+        const int d = layout.d;
+        const int token_blocks = 2;
+        const int entries = d * d;
+        const double weight_scale = 1.0 / std::sqrt(static_cast<double>(d));
+
+        std::mt19937_64 rng(906);
+        std::vector<ChannelBlock> x;
+        for (int s = 0; s < token_blocks; s++)
+        {
+            x.push_back(random_blocks(layout, 1.0, rng));
+        }
+
+        const ChannelBlock wq = random_blocks(layout, weight_scale, rng);
+        const ChannelBlock wk = random_blocks(layout, weight_scale, rng);
+        const ChannelBlock wv = random_blocks(layout, weight_scale, rng);
+        const ChannelBlock wo = random_blocks(layout, weight_scale, rng);
+
+        llama::Llama3Operator::BlockAttentionWeights weights;
+        weights.query = llama::BlockMatrix(flatten_block(wq));
+        weights.key = llama::BlockMatrix(flatten_block(wk));
+        weights.value = llama::BlockMatrix(flatten_block(wv));
+        weights.output = llama::BlockMatrix(flatten_block(wo));
+
+        // The head is one block wide, so RoPE is the half-swap inside it. The
+        // angle carries the ABSOLUTE token position, so the second token block
+        // gets its own pair of plaintexts and they are what pins the indexing.
+        std::vector<std::vector<double>> cos_values(
+            token_blocks, std::vector<double>(entries));
+        std::vector<std::vector<double>> sin_values(
+            token_blocks, std::vector<double>(entries));
+        for (int s = 0; s < token_blocks; s++)
+        {
+            for (int r = 0; r < d; r++)
+            {
+                for (int t = 0; t < d; t++)
+                {
+                    const double position = s * d + t;
+                    const double theta =
+                        0.05 * position * std::pow(2.0, -(r % (d / 2)));
+                    cos_values[s][r * d + t] = std::cos(theta);
+                    sin_values[s][r * d + t] =
+                        (r < d / 2) ? -std::sin(theta) : std::sin(theta);
+                }
+            }
+        }
+
+        std::vector<std::vector<double>> rope_slots;
+        for (int s = 0; s < token_blocks; s++)
+        {
+            std::vector<double> cos_slots(slots);
+            std::vector<double> sin_slots(slots);
+            for (int e = 0; e < entries; e++)
+            {
+                for (int m = 0; m < layout.batch; m++)
+                {
+                    cos_slots[e * layout.batch + m] = cos_values[s][e];
+                    sin_slots[e * layout.batch + m] = sin_values[s][e];
+                }
+            }
+            rope_slots.push_back(cos_slots);
+            rope_slots.push_back(sin_slots);
+        }
+
+        std::vector<heongpu::Plaintext<S>> rope_plain;
+        for (std::size_t i = 0; i < rope_slots.size(); i++)
+        {
+            rope_plain.emplace_back(context);
+        }
+        for (std::size_t i = 0; i < rope_slots.size(); i++)
+        {
+            encoder->encode(rope_plain[i], rope_slots[i], scale);
+        }
+
+        // The reference, one token block at a time.
+        std::vector<ChannelBlock> q(token_blocks), k(token_blocks),
+            v(token_blocks);
+        for (int s = 0; s < token_blocks; s++)
+        {
+            q[s] = matmul_block(wq, x[s], d);
+            k[s] = matmul_block(wk, x[s], d);
+            v[s] = matmul_block(wv, x[s], d);
+        }
+
+        std::vector<ChannelBlock> q_roped(token_blocks), k_roped(token_blocks);
+        for (int s = 0; s < token_blocks; s++)
+        {
+            q_roped[s] = zero_block(layout);
+            k_roped[s] = zero_block(layout);
+            for (int m = 0; m < layout.batch; m++)
+            {
+                for (int r = 0; r < d; r++)
+                {
+                    // The swap is a row rotation by half the matrix, so the
+                    // partner of channel r is channel (r + d / 2) mod d.
+                    const int partner = (r + d / 2) % d;
+                    for (int t = 0; t < d; t++)
+                    {
+                        const int at = r * d + t;
+                        const int from = partner * d + t;
+                        q_roped[s][m][at] = q[s][m][at] * cos_values[s][at] +
+                                            q[s][m][from] * sin_values[s][at];
+                        k_roped[s][m][at] = k[s][m][at] * cos_values[s][at] +
+                                            k[s][m][from] * sin_values[s][at];
+                    }
+                }
+            }
+        }
+
+        // The score grid, upper half only: key block u is formed against query
+        // block s exactly when u <= s.
+        std::vector<std::vector<ChannelBlock>> raw(token_blocks);
+        std::vector<ChannelBlock> formed;
+        for (int s = 0; s < token_blocks; s++)
+        {
+            for (int u = 0; u <= s; u++)
+            {
+                raw[s].push_back(scores_host(k_roped[u], q_roped[s], d));
+                formed.push_back(raw[s].back());
+            }
+        }
+
+        double lowest = 0.0;
+        double highest = 0.0;
+        score_range(formed, lowest, highest);
+
+        llama::Llama3Operator::AttentionConfig config;
+        config.layout = layout;
+        config.heads = 1;
+        config.token_blocks = token_blocks;
+        config.causal = true;
+        config.rope = true;
+        config.head_scale = 2.0 / (highest - lowest);
+        config.score_shift = highest * config.head_scale;
+        config.softmax.bound = 2.0;
+        config.softmax.iterations = 1;
+        config.softmax.exp_degree = 15;
+        config.softmax.inverse_degree = 15;
+        config.softmax.inverse_newton = 2;
+
+        std::vector<ChannelBlock> want(token_blocks);
+        for (int s = 0; s < token_blocks; s++)
+        {
+            const std::vector<ChannelBlock> probabilities =
+                causal_block_softmax_host(raw[s], config.head_scale,
+                                          config.score_shift, d, s);
+
+            // The value product sums over the key blocks the same way.
+            ChannelBlock weighted = zero_block(layout);
+            for (int u = 0; u <= s; u++)
+            {
+                add_into(weighted, matmul_block(v[u], probabilities[u], d));
+            }
+            want[s] = matmul_block(wo, weighted, d);
+        }
+
+        std::vector<heongpu::Ciphertext<S>> in;
+        for (int s = 0; s < token_blocks; s++)
+        {
+            in.push_back(encrypt(pack_blocks(x[s], layout)));
+        }
+
+        std::vector<heongpu::Ciphertext<S>> got =
+            ops->attention(in, weights, rope_plain, config, *galois, *relin);
+        ASSERT_EQ(got.size(), static_cast<std::size_t>(token_blocks));
+
+        for (int s = 0; s < token_blocks; s++)
+        {
+            const std::string label =
+                "long attention[" + std::to_string(s) + "]";
+            EXPECT_LT(reported(label.c_str(), decrypt(got[s]),
+                               pack_blocks(want[s], layout)),
+                      1e-6);
+        }
+    }
+
+    /// Grouped-query attention: two query heads reading one key and value
+    /// head, which is the shape Llama-3-8B actually has.
+    TEST_F(Llama3LayerEnv, AttentionSharesKeyValueHeads)
+    {
+        const int d = layout.d;
+        const int in_blocks = 2;
+        const int heads = 2;
+        const double weight_scale =
+            1.0 / std::sqrt(static_cast<double>(d * in_blocks));
+
+        std::mt19937_64 rng(907);
+        std::vector<ChannelBlock> x;
+        for (int j = 0; j < in_blocks; j++)
+        {
+            x.push_back(random_blocks(layout, 1.0, rng));
+        }
+
+        // The query weight is as wide as the model; the key and value weights
+        // are half of it, which is the whole saving grouped-query buys.
+        llama::Llama3Operator::BlockAttentionWeights weights;
+        weights.query = llama::BlockMatrix(heads, in_blocks);
+        weights.key = llama::BlockMatrix(1, in_blocks);
+        weights.value = llama::BlockMatrix(1, in_blocks);
+        weights.output = llama::BlockMatrix(in_blocks, heads);
+
+        std::vector<std::vector<ChannelBlock>> wq(heads), wk(1), wv(1),
+            wo(in_blocks);
+        wk[0].resize(in_blocks);
+        wv[0].resize(in_blocks);
+        for (int j = 0; j < in_blocks; j++)
+        {
+            wk[0][j] = random_blocks(layout, weight_scale, rng);
+            wv[0][j] = random_blocks(layout, weight_scale, rng);
+            weights.key.at(0, j) = flatten_block(wk[0][j]);
+            weights.value.at(0, j) = flatten_block(wv[0][j]);
+        }
+        for (int h = 0; h < heads; h++)
+        {
+            wq[h].resize(in_blocks);
+            for (int j = 0; j < in_blocks; j++)
+            {
+                wq[h][j] = random_blocks(layout, weight_scale, rng);
+                weights.query.at(h, j) = flatten_block(wq[h][j]);
+            }
+        }
+        for (int i = 0; i < in_blocks; i++)
+        {
+            wo[i].resize(heads);
+            for (int h = 0; h < heads; h++)
+            {
+                wo[i][h] = random_blocks(layout, weight_scale, rng);
+                weights.output.at(i, h) = flatten_block(wo[i][h]);
+            }
+        }
+
+        const std::vector<ChannelBlock> q = block_project_host(wq, x, layout);
+        const std::vector<ChannelBlock> k = block_project_host(wk, x, layout);
+        const std::vector<ChannelBlock> v = block_project_host(wv, x, layout);
+
+        // Both heads read k[0] and v[0]; only the query differs, which is
+        // exactly what makes the two outputs differ.
+        std::vector<ChannelBlock> raw(heads);
+        for (int h = 0; h < heads; h++)
+        {
+            raw[h] = scores_host(k[0], q[h], d);
+        }
+
+        double lowest = 0.0;
+        double highest = 0.0;
+        score_range(raw, lowest, highest);
+
+        llama::Llama3Operator::AttentionConfig config;
+        config.layout = layout;
+        config.heads = heads;
+        config.kv_heads = 1;
+        config.causal = true;
+        config.rope = false;
+        config.head_scale = 2.0 / (highest - lowest);
+        config.score_shift = highest * config.head_scale;
+        config.softmax.bound = 2.0;
+        config.softmax.iterations = 1;
+        config.softmax.exp_degree = 15;
+        config.softmax.inverse_degree = 15;
+        config.softmax.inverse_newton = 2;
+
+        std::vector<ChannelBlock> weighted(heads);
+        for (int h = 0; h < heads; h++)
+        {
+            const ChannelBlock probabilities = causal_softmax_host(
+                raw[h], config.head_scale, config.score_shift, d);
+            weighted[h] = matmul_block(v[0], probabilities, d);
+        }
+        const std::vector<ChannelBlock> want =
+            block_project_host(wo, weighted, layout);
+
+        std::vector<heongpu::Ciphertext<S>> in;
+        for (int j = 0; j < in_blocks; j++)
+        {
+            in.push_back(encrypt(pack_blocks(x[j], layout)));
+        }
+
+        std::vector<heongpu::Plaintext<S>> no_rope;
+        std::vector<heongpu::Ciphertext<S>> got =
+            ops->attention(in, weights, no_rope, config, *galois, *relin);
+        ASSERT_EQ(got.size(), static_cast<std::size_t>(in_blocks));
+
+        for (int i = 0; i < in_blocks; i++)
+        {
+            const std::string label =
+                "grouped attention[" + std::to_string(i) + "]";
+            EXPECT_LT(reported(label.c_str(), decrypt(got[i]),
+                               pack_blocks(want[i], layout)),
+                      1e-6);
+        }
+    }
+
+    /// SwiGLU never mixes tokens, so a cut sequence is only an indexing
+    /// question -- which is worth a test precisely because it is silent when
+    /// it is wrong.
+    TEST_F(Llama3LayerEnv, FeedForwardRunsOverTokenBlocks)
+    {
+        const int d = layout.d;
+        const int token_blocks = 2;
+        const int hidden_blocks = 2;
+        const double weight_scale = 1.0 / std::sqrt(static_cast<double>(d));
+
+        llama::Llama3Operator::FeedForwardConfig config;
+        config.layout = layout;
+        config.token_blocks = token_blocks;
+        config.silu_bound = 4.0;
+        config.silu_degree = 31;
+
+        auto key = narrow_key(
+            llama::Llama3Operator::feed_forward_rotation_indices(config));
+
+        std::mt19937_64 rng(908);
+        std::vector<ChannelBlock> x;
+        for (int s = 0; s < token_blocks; s++)
+        {
+            x.push_back(random_blocks(layout, 1.0, rng));
+        }
+
+        llama::Llama3Operator::BlockFeedForwardWeights weights;
+        weights.gate = llama::BlockMatrix(hidden_blocks, 1);
+        weights.up = llama::BlockMatrix(hidden_blocks, 1);
+        weights.down = llama::BlockMatrix(1, hidden_blocks);
+
+        std::vector<ChannelBlock> wg(hidden_blocks), wu(hidden_blocks),
+            wd(hidden_blocks);
+        const double down_scale =
+            1.0 / std::sqrt(static_cast<double>(d * hidden_blocks));
+        for (int i = 0; i < hidden_blocks; i++)
+        {
+            wg[i] = random_blocks(layout, weight_scale, rng);
+            wu[i] = random_blocks(layout, weight_scale, rng);
+            wd[i] = random_blocks(layout, down_scale, rng);
+            weights.gate.at(i, 0) = flatten_block(wg[i]);
+            weights.up.at(i, 0) = flatten_block(wu[i]);
+            weights.down.at(0, i) = flatten_block(wd[i]);
+        }
+
+        std::vector<ChannelBlock> want(token_blocks);
+        double widest = 0.0;
+        for (int s = 0; s < token_blocks; s++)
+        {
+            want[s] = zero_block(layout);
+            for (int i = 0; i < hidden_blocks; i++)
+            {
+                const ChannelBlock gate = matmul_block(wg[i], x[s], d);
+                const ChannelBlock up = matmul_block(wu[i], x[s], d);
+
+                ChannelBlock hidden = zero_block(layout);
+                for (int m = 0; m < layout.batch; m++)
+                {
+                    for (std::size_t e = 0; e < gate[m].size(); e++)
+                    {
+                        widest = std::max(widest, std::abs(gate[m][e]));
+                        hidden[m][e] = silu_host(gate[m][e]) * up[m][e];
+                    }
+                }
+                add_into(want[s], matmul_block(wd[i], hidden, d));
+            }
+        }
+        ASSERT_LT(widest, config.silu_bound);
+
+        std::vector<heongpu::Ciphertext<S>> in;
+        for (int s = 0; s < token_blocks; s++)
+        {
+            in.push_back(encrypt(pack_blocks(x[s], layout)));
+        }
+
+        std::vector<heongpu::Ciphertext<S>> got =
+            ops->feed_forward(in, weights, config, *key, *relin);
+        ASSERT_EQ(got.size(), static_cast<std::size_t>(token_blocks));
+
+        for (int s = 0; s < token_blocks; s++)
+        {
+            const std::string label =
+                "long feed_forward[" + std::to_string(s) + "]";
+            EXPECT_LT(reported(label.c_str(), decrypt(got[s]),
+                               pack_blocks(want[s], layout)),
+                      1e-5);
+        }
+    }
+
+    /// Each token block is normalised over its own channels, so a wrong walk
+    /// of the inputs would average a token against a different one.
+    TEST_F(Llama3LayerEnv, RmsNormKeepsTheTokenBlocksApart)
+    {
+        const int d = layout.d;
+        const int token_blocks = 2;
+        const int channel_blocks = 2;
+
+        auto key = narrow_key(llama::Llama3Operator::strided_rotation_indices(
+            d * layout.batch, d));
+
+        std::mt19937_64 rng(909);
+        std::vector<ChannelBlock> x;
+        for (int j = 0; j < channel_blocks; j++)
+        {
+            for (int s = 0; s < token_blocks; s++)
+            {
+                // Every block is a fresh draw, so the four summed squares are
+                // all different and normalising against the wrong partner is a
+                // whole-number error rather than a subtle one.
+                x.push_back(random_blocks(layout, 1.0, rng));
+            }
+        }
+
+        llama::Llama3Operator::RMSNormConfig config;
+        config.stride = d * layout.batch;
+        config.count = d;
+        config.channels = d * channel_blocks;
+        config.token_blocks = token_blocks;
+        config.eps = 1e-5;
+        config.degree = 31;
+        config.newton_iterations = 0;
+
+        std::vector<std::vector<double>> totals(
+            token_blocks, std::vector<double>(config.stride, 0.0));
+        double lowest = std::numeric_limits<double>::max();
+        double highest = 0.0;
+        for (int s = 0; s < token_blocks; s++)
+        {
+            for (int i = 0; i < config.stride; i++)
+            {
+                double total = 0.0;
+                for (int j = 0; j < channel_blocks; j++)
+                {
+                    const std::vector<double> packed =
+                        pack_blocks(x[j * token_blocks + s], layout);
+                    for (int c = 0; c < config.count; c++)
+                    {
+                        const double value = packed[c * config.stride + i];
+                        total += value * value;
+                    }
+                }
+                totals[s][i] = total;
+                lowest = std::min(lowest, total);
+                highest = std::max(highest, total);
+            }
+        }
+        config.sum_lo = 0.8 * lowest;
+        config.sum_hi = 1.2 * highest;
+
+        std::vector<std::vector<double>> want(x.size());
+        for (int s = 0; s < token_blocks; s++)
+        {
+            for (int j = 0; j < channel_blocks; j++)
+            {
+                const std::size_t at = j * token_blocks + s;
+                const std::vector<double> packed = pack_blocks(x[at], layout);
+                want[at].assign(packed.size(), 0.0);
+                for (int i = 0; i < config.stride; i++)
+                {
+                    const double factor =
+                        1.0 / std::sqrt(totals[s][i] / config.channels +
+                                        config.eps);
+                    for (int c = 0; c < config.count; c++)
+                    {
+                        want[at][c * config.stride + i] =
+                            packed[c * config.stride + i] * factor;
+                    }
+                }
+            }
+        }
+
+        std::vector<heongpu::Ciphertext<S>> in;
+        for (const auto& block : x)
+        {
+            in.push_back(encrypt(pack_blocks(block, layout)));
+        }
+
+        std::vector<heongpu::Plaintext<S>> no_weights;
+        std::vector<heongpu::Ciphertext<S>> got =
+            ops->rms_norm(in, no_weights, config, *key, *relin);
+        ASSERT_EQ(got.size(), x.size());
+
+        for (std::size_t at = 0; at < x.size(); at++)
+        {
+            const std::string label =
+                "rms_norm block[" + std::to_string(at) + "]";
+            EXPECT_LT(reported(label.c_str(), decrypt(got[at]), want[at]),
+                      1e-6);
         }
     }
 
