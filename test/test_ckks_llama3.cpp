@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <memory>
 #include <random>
 #include <set>
@@ -35,6 +36,17 @@ namespace
         {
             worst = std::max(worst, std::abs(got[i] - want[i]));
         }
+        return worst;
+    }
+
+    /// Print the measured error alongside the bound it is checked against, so
+    /// a primitive that is still passing but has lost a digit is visible.
+    double reported(const char* label, const std::vector<double>& got,
+                    const std::vector<double>& want)
+    {
+        const double worst = max_error(got, want);
+        std::cout << "[ MEASURED ] " << label << " max error " << worst
+                  << std::endl;
         return worst;
     }
 
@@ -274,6 +286,22 @@ namespace
             return values;
         }
 
+        /// A Galois key holding exactly @p shifts and nothing else.
+        ///
+        /// Galoiskey(context, shift_vec) stores only what it is handed, with
+        /// no power-of-two fallback, and leaves the bounds the fallback path
+        /// reads uninitialised. Building a key from exactly what a primitive
+        /// advertises is therefore the only way to find out whether the
+        /// advertised list is complete; the fixture's union key would hide a
+        /// missing index until it became undefined behaviour in a layer.
+        std::unique_ptr<heongpu::Galoiskey<S>> narrow_key(std::vector<int>
+                                                              shifts)
+        {
+            auto key = std::make_unique<heongpu::Galoiskey<S>>(context, shifts);
+            keygen->generate_galois_key(*key, *secret);
+            return key;
+        }
+
         std::vector<double> uniform(double lo, double hi, uint64_t seed)
         {
             std::mt19937_64 rng(seed);
@@ -407,7 +435,7 @@ namespace
             want[i] = 1.0 / std::sqrt(values[i]);
         }
 
-        EXPECT_LT(max_error(got, want), 1e-5);
+        EXPECT_LT(reported("inverse_sqrt", got, want), 1e-5);
     }
 
     TEST_F(Llama3Env, InverseMatchesTheFunction)
@@ -425,7 +453,7 @@ namespace
             want[i] = 1.0 / values[i];
         }
 
-        EXPECT_LT(max_error(got, want), 1e-4);
+        EXPECT_LT(reported("inverse", got, want), 1e-4);
     }
 
     TEST_F(Llama3Env, SiluMatchesTheActivation)
@@ -445,7 +473,7 @@ namespace
             want[i] = values[i] / (1.0 + std::exp(-values[i]));
         }
 
-        EXPECT_LT(max_error(got, want), 5e-3);
+        EXPECT_LT(reported("silu", got, want), 5e-3);
     }
 
     // -----------------------------------------------------------------------
@@ -547,7 +575,7 @@ namespace
             }
         }
 
-        EXPECT_LT(max_error(got, want), 5e-3);
+        EXPECT_LT(reported("rms_norm", got, want), 5e-3);
     }
 
     TEST_F(Llama3Env, SoftmaxNormalisesEachInstance)
@@ -584,7 +612,7 @@ namespace
             }
         }
 
-        EXPECT_LT(max_error(got, want), 5e-3);
+        EXPECT_LT(reported("softmax k=1 strided", got, want), 5e-3);
 
         // Whatever the approximation error, every instance must still sum to
         // one: that is what the normalise-and-square round enforces.
@@ -642,7 +670,7 @@ namespace
                 ops->pcmm(cipher, stored, layout, 4, 4, ell, *galois);
             const std::vector<double> got = decrypt(result);
 
-            EXPECT_LT(max_error(got, want), 1e-4) << "ell=" << ell;
+            EXPECT_LT(reported("pcmm", got, want), 1e-4) << "ell=" << ell;
         }
     }
 
@@ -780,7 +808,7 @@ namespace
             }
         }
 
-        EXPECT_LT(max_error(got, want), 5e-3);
+        EXPECT_LT(reported("softmax k=1 blocked", got, want), 5e-3);
     }
 
     /// One weight matrix shared by every matrix in the batch, the form a
@@ -890,6 +918,252 @@ namespace
 
         EXPECT_LT(max_error(decrypt(deep), want_deep), 1e-4);
         EXPECT_LT(max_error(decrypt(shallow), want_shallow), 1e-4);
+    }
+
+    // -----------------------------------------------------------------------
+    // The advertised rotation indices are the whole contract
+    // -----------------------------------------------------------------------
+
+    /// Each reduction, given a key holding only what it asked for.
+    TEST_F(Llama3Env, ReductionsAskForEveryRotationTheyUse)
+    {
+        for (int count : {2, 8, 32, 128})
+        {
+            SCOPED_TRACE("strided count=" + std::to_string(count));
+            const int stride = slots / count;
+            auto key = narrow_key(
+                llama::Llama3Operator::strided_rotation_indices(stride, count));
+
+            const std::vector<double> values = uniform(-1.0, 1.0, 200 + count);
+            heongpu::Ciphertext<S> cipher = encrypt(values);
+            ASSERT_NO_THROW(ops->sum_strided(cipher, stride, count, *key));
+
+            std::vector<double> want(slots);
+            for (int i = 0; i < stride; i++)
+            {
+                double total = 0.0;
+                for (int j = 0; j < count; j++)
+                {
+                    total += values[j * stride + i];
+                }
+                for (int j = 0; j < count; j++)
+                {
+                    want[j * stride + i] = total;
+                }
+            }
+            EXPECT_LT(max_error(decrypt(cipher), want), 1e-5);
+        }
+
+        for (int span : {2, 8, 64})
+        {
+            SCOPED_TRACE("blocked span=" + std::to_string(span));
+            auto key = narrow_key(
+                llama::Llama3Operator::blocked_rotation_indices(span));
+
+            const std::vector<double> values = uniform(-1.0, 1.0, 300 + span);
+            heongpu::Ciphertext<S> cipher = encrypt(values);
+            ASSERT_NO_THROW(ops->sum_blocked(cipher, span, *key));
+
+            std::vector<double> want(slots);
+            for (int base = 0; base < slots; base += span)
+            {
+                double total = 0.0;
+                for (int j = 0; j < span; j++)
+                {
+                    total += values[base + j];
+                }
+                for (int j = 0; j < span; j++)
+                {
+                    want[base + j] = total;
+                }
+            }
+            EXPECT_LT(max_error(decrypt(cipher), want), 1e-5);
+        }
+    }
+
+    /// PCMM over every square matrix that fills these slots, both BSGS
+    /// orientations and both tau exponents, each against a key built from
+    /// pcmm_rotation_indices alone. d = 64 leaves batch = 1, the degenerate
+    /// packing where the batch axis disappears.
+    TEST_F(Llama3Env, PcmmCoversEveryShapeWithTheKeysItAsksFor)
+    {
+        std::mt19937_64 rng(401);
+        constexpr int kElls = 2;
+
+        for (int d : {8, 16, 32, 64})
+        {
+            const llama::MatrixLayout layout(d, slots / (d * d));
+            ASSERT_EQ(layout.slots, slots);
+            const int batch = layout.batch;
+            const std::size_t entries = static_cast<std::size_t>(d) * d;
+
+            // One operand set per tau exponent, built once: the rotation keys
+            // do not depend on ell, so keeping the splits outside keeps the
+            // key generations down to one per split.
+            std::vector<std::vector<double>> stored(kElls);
+            std::vector<std::vector<double>> operand_slots(
+                kElls, std::vector<double>(slots, 0.0));
+            std::vector<std::vector<double>> want(
+                kElls, std::vector<double>(slots, 0.0));
+
+            for (int m = 0; m < batch; m++)
+            {
+                const std::vector<double> a = random_matrix(d, rng);
+                const std::vector<double> b = random_matrix(d, rng);
+                const std::vector<double> product = llama::matmul_host(a, b, d);
+                const std::vector<double> sigma_a = llama::permute_sigma(a, d);
+
+                for (int ell = 0; ell < kElls; ell++)
+                {
+                    const std::vector<double> stored_m =
+                        apply_tau(sigma_a, d, ell);
+                    stored[ell].insert(stored[ell].end(), stored_m.begin(),
+                                       stored_m.end());
+
+                    const std::vector<double> operand =
+                        apply_tau(b, d, ell + 1);
+                    const std::vector<double> expected =
+                        apply_tau(product, d, ell);
+                    for (std::size_t e = 0; e < entries; e++)
+                    {
+                        operand_slots[ell][e * batch + m] = operand[e];
+                        want[ell][e * batch + m] = expected[e];
+                    }
+                }
+            }
+
+            for (int baby = 2; baby <= d / 2; baby <<= 1)
+            {
+                const int giant = d / baby;
+                auto key =
+                    narrow_key(llama::Llama3Operator::pcmm_rotation_indices(
+                        layout, giant, baby));
+
+                for (int ell = 0; ell < kElls; ell++)
+                {
+                    SCOPED_TRACE("d=" + std::to_string(d) + " ell=" +
+                                 std::to_string(ell) + " giant=" +
+                                 std::to_string(giant) + " baby=" +
+                                 std::to_string(baby));
+
+                    heongpu::Ciphertext<S> cipher =
+                        encrypt(operand_slots[ell]);
+                    heongpu::Ciphertext<S> result(context);
+                    ASSERT_NO_THROW(result = ops->pcmm(cipher, stored[ell],
+                                                       layout, giant, baby,
+                                                       ell, *key));
+                    // The product sums d terms, so the error grows with d.
+                    EXPECT_LT(max_error(decrypt(result), want[ell]), 1e-4 * d);
+                }
+            }
+        }
+    }
+
+    /// RoPE below the top of the chain, on a key holding only its own shift.
+    TEST_F(Llama3Env, RopeWorksBelowTheTopOfTheChain)
+    {
+        const int half = kRopeSwap;
+        auto key = narrow_key({half});
+
+        const std::vector<double> values = uniform(-1.0, 1.0, 501);
+        std::vector<double> cos_values(slots);
+        std::vector<double> sin_values(slots);
+        for (int i = 0; i < slots; i++)
+        {
+            const double theta = 0.01 * ((i / (2 * half)) + 1) * ((i % half) + 1);
+            cos_values[i] = std::cos(theta);
+            sin_values[i] = ((i % (2 * half)) < half) ? -std::sin(theta)
+                                                      : std::sin(theta);
+        }
+
+        heongpu::Plaintext<S> cos_plain(context);
+        heongpu::Plaintext<S> sin_plain(context);
+        encoder->encode(cos_plain, cos_values, scale);
+        encoder->encode(sin_plain, sin_values, scale);
+
+        // Square first, so the plaintexts arrive three levels above the
+        // ciphertext and must be dropped to meet it.
+        heongpu::Ciphertext<S> cipher = encrypt(values);
+        ops->square(cipher, *relin);
+        ops->multiply_constant(cipher, 0.5);
+        ASSERT_EQ(cipher.depth(), 2);
+
+        heongpu::Ciphertext<S> result =
+            ops->rope(cipher, cos_plain, sin_plain, half, *key);
+
+        std::vector<double> want(slots);
+        for (int i = 0; i < slots; i++)
+        {
+            const double x = 0.5 * values[i] * values[i];
+            const int j = (i + half) % slots;
+            want[i] = x * cos_values[i] +
+                      0.5 * values[j] * values[j] * sin_values[i];
+        }
+        EXPECT_LT(reported("rope at depth 2", decrypt(result), want), 1e-4);
+    }
+
+    /// A channel count that does not fill the last ciphertext.
+    ///
+    /// The guard admits this on purpose: padding contributes zero squares, so
+    /// the mean is still over the real channels only.
+    TEST_F(Llama3Env, RMSNormAcceptsAPaddedLastInput)
+    {
+        const int count = 32;
+        const int stride = slots / count;
+        const int real = 20; // channels carried by the second ciphertext
+
+        llama::Llama3Operator::RMSNormConfig config;
+        config.stride = stride;
+        config.count = count;
+        config.channels = count + real;
+        config.eps = 1e-5;
+        config.sum_lo = 20.0;
+        config.sum_hi = 110.0;
+        config.degree = 15;
+        config.newton_iterations = 1;
+
+        std::mt19937_64 rng(601);
+        std::normal_distribution<double> dist(0.0, 1.0);
+        std::vector<std::vector<double>> values(2,
+                                                std::vector<double>(slots, 0.0));
+        for (double& x : values[0])
+        {
+            x = dist(rng);
+        }
+        for (int j = 0; j < real; j++)
+        {
+            for (int i = 0; i < stride; i++)
+            {
+                values[1][j * stride + i] = dist(rng);
+            }
+        }
+
+        std::vector<heongpu::Ciphertext<S>> in{encrypt(values[0]),
+                                               encrypt(values[1])};
+        std::vector<heongpu::Plaintext<S>> no_weights;
+        std::vector<heongpu::Ciphertext<S>> out =
+            ops->rms_norm(in, no_weights, config, *galois, *relin);
+
+        std::vector<double> want(slots);
+        for (int i = 0; i < stride; i++)
+        {
+            double total = 0.0;
+            for (int j = 0; j < count; j++)
+            {
+                for (int p = 0; p < 2; p++)
+                {
+                    const double v = values[p][j * stride + i];
+                    total += v * v;
+                }
+            }
+            const double factor =
+                1.0 / std::sqrt(total / config.channels + config.eps);
+            for (int j = 0; j < count; j++)
+            {
+                want[j * stride + i] = values[0][j * stride + i] * factor;
+            }
+        }
+        EXPECT_LT(reported("rms_norm padded", decrypt(out[0]), want), 5e-3);
     }
 
     /// The mistakes that would otherwise pass silently.
@@ -1047,7 +1321,133 @@ namespace
             }
         }
 
-        EXPECT_LT(max_error(decrypt(activated), want), 2e-2);
+        EXPECT_LT(reported("rms_norm -> pcmm -> silu", decrypt(activated), want),
+                  2e-2);
+    }
+
+    // -----------------------------------------------------------------------
+    // The SoftMax the paper actually specifies
+    // -----------------------------------------------------------------------
+
+    /// Section 4.3 fixes two normalise-and-square rounds, which does not fit
+    /// the 24-limb chain the other tests share, so this one gets its own.
+    ///
+    /// Two rounds matter beyond costing more: only the second round runs on an
+    /// input that already sums to one, which is the regime the round bounds
+    /// switch to, and the reciprocal is approximated over a much wider range
+    /// there than in the first round.
+    class Llama3DeepEnv : public ::testing::Test
+    {
+      protected:
+        static constexpr int kDegree = 8192;
+        static constexpr int kLimbs = 32;
+        static constexpr int kCount = 8;
+
+        heongpu::HEContext<S> context =
+            heongpu::GenHEContext<S>(heongpu::sec_level_type::none);
+        std::unique_ptr<heongpu::HEKeyGenerator<S>> keygen;
+        std::unique_ptr<heongpu::Secretkey<S>> secret;
+        std::unique_ptr<heongpu::Publickey<S>> pub;
+        std::unique_ptr<heongpu::HEEncryptor<S>> encryptor;
+        std::unique_ptr<heongpu::HEDecryptor<S>> decryptor;
+        std::unique_ptr<heongpu::HEEncoder<S>> encoder;
+        std::unique_ptr<heongpu::Galoiskey<S>> galois;
+        std::unique_ptr<heongpu::Relinkey<S>> relin;
+        std::unique_ptr<llama::Llama3Operator> ops;
+
+        double scale = std::pow(2.0, 40);
+        int slots = 0;
+
+        void SetUp() override
+        {
+            std::vector<int> logq{60};
+            logq.insert(logq.end(), kLimbs - 1, 40);
+            context->set_poly_modulus_degree(kDegree);
+            context->set_coeff_modulus_bit_sizes(logq, {60, 60});
+            context->generate();
+
+            keygen = std::make_unique<heongpu::HEKeyGenerator<S>>(context);
+            secret = std::make_unique<heongpu::Secretkey<S>>(context);
+            keygen->generate_secret_key(*secret);
+            pub = std::make_unique<heongpu::Publickey<S>>(context);
+            keygen->generate_public_key(*pub, *secret);
+            encryptor = std::make_unique<heongpu::HEEncryptor<S>>(context, *pub);
+            decryptor =
+                std::make_unique<heongpu::HEDecryptor<S>>(context, *secret);
+            encoder = std::make_unique<heongpu::HEEncoder<S>>(context);
+            ops = std::make_unique<llama::Llama3Operator>(context, *encoder,
+                                                          scale);
+            slots = encoder->slot_count();
+
+            std::vector<int> shifts =
+                llama::Llama3Operator::strided_rotation_indices(slots / kCount,
+                                                                kCount);
+            galois = std::make_unique<heongpu::Galoiskey<S>>(context, shifts);
+            keygen->generate_galois_key(*galois, *secret);
+            relin = std::make_unique<heongpu::Relinkey<S>>(context);
+            keygen->generate_relin_key(*relin, *secret);
+        }
+    };
+
+    TEST_F(Llama3DeepEnv, SoftmaxRunsTheTwoRoundsOfSectionFourPointThree)
+    {
+        llama::Llama3Operator::SoftmaxConfig config;
+        config.strided = true;
+        config.count = kCount;
+        config.stride = slots / kCount;
+        config.bound = 2.0;
+        config.iterations = 2;
+        config.exp_degree = 15;
+        config.inverse_degree = 15;
+        config.inverse_newton = 2;
+
+        std::mt19937_64 rng(701);
+        std::uniform_real_distribution<double> dist(-config.bound, 0.0);
+        std::vector<double> values(slots);
+        for (double& x : values)
+        {
+            x = dist(rng);
+        }
+
+        heongpu::Plaintext<S> plain(context);
+        encoder->encode(plain, values, scale);
+        heongpu::Ciphertext<S> cipher(context);
+        encryptor->encrypt(cipher, plain);
+
+        heongpu::Ciphertext<S> result =
+            ops->softmax(cipher, config, *galois, *relin);
+
+        heongpu::Plaintext<S> out_plain(context);
+        decryptor->decrypt(out_plain, result);
+        std::vector<double> got;
+        encoder->decode(got, out_plain);
+
+        std::vector<double> want(slots);
+        for (int i = 0; i < config.stride; i++)
+        {
+            double total = 0.0;
+            for (int j = 0; j < config.count; j++)
+            {
+                total += std::exp(values[j * config.stride + i]);
+            }
+            for (int j = 0; j < config.count; j++)
+            {
+                const int p = j * config.stride + i;
+                want[p] = std::exp(values[p]) / total;
+            }
+        }
+
+        EXPECT_LT(reported("softmax k=2", got, want), 5e-3);
+
+        for (int i = 0; i < config.stride; i++)
+        {
+            double total = 0.0;
+            for (int j = 0; j < config.count; j++)
+            {
+                total += got[j * config.stride + i];
+            }
+            EXPECT_NEAR(total, 1.0, 1e-3) << "instance " << i;
+        }
     }
 
 } // namespace

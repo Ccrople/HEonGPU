@@ -28,6 +28,17 @@
 //            extra masking multiplication, hence one level. This is the layout
 //            a SoftMax over the token axis lands in.
 //
+// ROTATION KEYS
+// -------------
+// Every routine that rotates publishes the exact shifts it needs, and a caller
+// must build the Galois key from those lists. This is not an optimisation.
+// Galoiskey(context, shift_vec) stores exactly the shifts it is handed, with no
+// power-of-two fallback set, and leaves max_shift_ and max_log_slot_
+// uninitialised; they are only assigned by the Galoiskey(context, max_shift)
+// constructor. A rotation by an unlisted shift therefore does not report a
+// missing key, it reaches rotation_index_generator with uninitialised bounds.
+// Take the union of the index lists and generate one key from that.
+//
 // SCALE DISCIPLINE
 // ----------------
 // A ciphertext is held at the scale it happens to carry; no routine assumes
@@ -417,6 +428,18 @@ namespace heongpu
           private:
             /// The prime the next rescale of @p ct will divide by.
             double rescale_prime(const Ciphertext<Scheme::CKKS>& ct) const;
+
+            /**
+             * @brief a += b, refusing operands that disagree on scale.
+             *
+             * CKKS addition is only meaningful between equal scales, and the
+             * library checks the level but not the scale, so a mismatch here
+             * is a silently wrong sum. Every addition in this file goes
+             * through this.
+             */
+            void add_same_scale(Ciphertext<Scheme::CKKS>& a,
+                                Ciphertext<Scheme::CKKS>& b,
+                                const char* context);
 
             /// Encode @p values at @p scale, dropped onto @p depth.
             Plaintext<Scheme::CKKS> encode(const std::vector<double>& values,

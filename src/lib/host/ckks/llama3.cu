@@ -202,6 +202,28 @@ namespace heongpu
             return static_cast<double>(primes_[level].value);
         }
 
+        void Llama3Operator::add_same_scale(Ciphertext<Scheme::CKKS>& a,
+                                            Ciphertext<Scheme::CKKS>& b,
+                                            const char* context)
+        {
+            // Rescaling divides by a prime that is near but not equal to the
+            // nominal scale, so tracked scales drift; what must not happen is
+            // two operands drifting apart. A relative comparison catches that
+            // without tripping on the drift itself.
+            const double lhs = a.scale();
+            const double rhs = b.scale();
+            const double spread = std::abs(lhs - rhs);
+            if (spread > 1e-9 * std::max(std::abs(lhs), std::abs(rhs)))
+            {
+                throw std::logic_error(
+                    std::string("Refusing to add ciphertexts at different "
+                                "scales in ") +
+                    context + ": " + std::to_string(lhs) + " against " +
+                    std::to_string(rhs));
+            }
+            add_inplace(a, b);
+        }
+
         Plaintext<Scheme::CKKS>
         Llama3Operator::encode(const std::vector<double>& values, double scale,
                                int depth)
@@ -388,7 +410,7 @@ namespace heongpu
             {
                 Ciphertext<Scheme::CKKS> shifted(context_);
                 rotate_rows(ct, shifted, galois_key, stride * t);
-                add_inplace(ct, shifted);
+                add_same_scale(ct, shifted, "sum_strided");
             }
         }
 
@@ -413,7 +435,7 @@ namespace heongpu
             {
                 Ciphertext<Scheme::CKKS> shifted(context_);
                 rotate_rows(ct, shifted, galois_key, s);
-                add_inplace(ct, shifted);
+                add_same_scale(ct, shifted, "sum_blocked window");
             }
 
             // Keep those positions and discard the rest.
@@ -431,7 +453,7 @@ namespace heongpu
             {
                 Ciphertext<Scheme::CKKS> shifted(context_);
                 rotate_rows(ct, shifted, galois_key, -s);
-                add_inplace(ct, shifted);
+                add_same_scale(ct, shifted, "sum_blocked fan-out");
             }
         }
 
@@ -669,7 +691,7 @@ namespace heongpu
             {
                 Ciphertext<Scheme::CKKS> term = in[i];
                 square(term, relin_key);
-                add_inplace(total, term);
+                add_same_scale(total, term, "rms_norm channel sum");
             }
 
             sum_strided(total, config.stride, config.count, galois_key);
@@ -728,6 +750,12 @@ namespace heongpu
             {
                 throw std::invalid_argument(
                     "SoftMax needs at least one normalise-and-square round");
+            }
+            if (!config.strided && slot_count_ % config.count != 0)
+            {
+                throw std::invalid_argument(
+                    "A blocked SoftMax needs its length to divide the slot "
+                    "count, so that every block is whole");
             }
 
             const double d = static_cast<double>(config.count);
@@ -806,7 +834,7 @@ namespace heongpu
             multiply_plaintext(swapped, sin_plain);
             rescale_inplace(swapped);
 
-            add_inplace(direct, swapped);
+            add_same_scale(direct, swapped, "rope");
             return direct;
         }
 
@@ -834,10 +862,11 @@ namespace heongpu
         Llama3Operator::pcmm_rotation_indices(const MatrixLayout& layout,
                                               int giant, int baby)
         {
-            if (giant * baby != layout.d)
+            if (giant < 1 || baby < 1 || giant * baby != layout.d)
             {
                 throw std::invalid_argument(
-                    "BSGS factors must multiply to the matrix dimension");
+                    "BSGS factors must be positive and multiply to the matrix "
+                    "dimension");
             }
 
             const int row = layout.d * layout.batch;
@@ -864,10 +893,16 @@ namespace heongpu
                 throw std::invalid_argument(
                     "The matrix layout must fill the slot vector exactly");
             }
-            if (giant * baby != layout.d)
+            if (giant < 1 || baby < 1 || giant * baby != layout.d)
             {
                 throw std::invalid_argument(
-                    "BSGS factors must multiply to the matrix dimension");
+                    "BSGS factors must be positive and multiply to the matrix "
+                    "dimension");
+            }
+            if (ell < 0)
+            {
+                throw std::invalid_argument(
+                    "The tau exponent of Equation (5) must not be negative");
             }
 
             const int d = layout.d;
@@ -944,7 +979,7 @@ namespace heongpu
                     }
                     else
                     {
-                        add_inplace(inner, term);
+                        add_same_scale(inner, term, "pcmm baby step");
                     }
                 }
 
@@ -967,7 +1002,7 @@ namespace heongpu
                 }
                 else
                 {
-                    add_inplace(result, inner);
+                    add_same_scale(result, inner, "pcmm giant step");
                 }
             }
 
