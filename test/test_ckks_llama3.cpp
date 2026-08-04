@@ -3639,4 +3639,161 @@ namespace
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Bootstrapping
+    // -----------------------------------------------------------------------
+
+    /// A context that can bootstrap, which is a different regime and not
+    /// merely a longer chain.
+    ///
+    /// Bootstrapping spends a fixed slice of the modulus chain on itself: the
+    /// transform that moves the coefficients into the slots, the sine that
+    /// stands in for the modular reduction, and the transform back. What a
+    /// caller gets is the chain minus that slice, so the chain has to be long
+    /// enough to pay for the slice and for the work afterwards. It also wants
+    /// a sparse secret, which is what keeps the sine argument small enough to
+    /// approximate, and that is one reason nothing here claims a security
+    /// level.
+    class Llama3BootstrapEnv : public ::testing::Test
+    {
+      protected:
+        static constexpr int kDegree = 4096;
+        /// Long enough that a sublayer still fits in what comes back.
+        /// BootstrappingBuysBackTheChain measures what that actually is.
+        static constexpr int kLimbs = 45;
+        static constexpr int kD = 8;
+        /// The shipped bootstrapping example's configuration.
+        static constexpr int kCtoSPiece = 3;
+        static constexpr int kStoCPiece = 3;
+        static constexpr int kTaylor = 11;
+        static constexpr int kHammingWeight = 16;
+
+        heongpu::HEContext<S> context =
+            heongpu::GenHEContext<S>(heongpu::sec_level_type::none);
+        std::unique_ptr<heongpu::HEKeyGenerator<S>> keygen;
+        std::unique_ptr<heongpu::Secretkey<S>> secret;
+        std::unique_ptr<heongpu::Publickey<S>> pub;
+        std::unique_ptr<heongpu::HEEncryptor<S>> encryptor;
+        std::unique_ptr<heongpu::HEDecryptor<S>> decryptor;
+        std::unique_ptr<heongpu::HEEncoder<S>> encoder;
+        std::unique_ptr<heongpu::Galoiskey<S>> boot_galois;
+        std::unique_ptr<heongpu::Relinkey<S>> relin;
+        std::unique_ptr<llama::Llama3Operator> ops;
+
+        double scale = std::pow(2.0, 40);
+        int slots = 0;
+        llama::MatrixLayout layout;
+
+        void SetUp() override
+        {
+            std::vector<int> logq{60};
+            logq.insert(logq.end(), kLimbs - 1, 40);
+            context->set_poly_modulus_degree(kDegree);
+            context->set_coeff_modulus_bit_sizes(logq, {60, 60, 60});
+            context->generate();
+
+            keygen = std::make_unique<heongpu::HEKeyGenerator<S>>(context);
+            secret =
+                std::make_unique<heongpu::Secretkey<S>>(context,
+                                                        kHammingWeight);
+            keygen->generate_secret_key(*secret);
+            pub = std::make_unique<heongpu::Publickey<S>>(context);
+            keygen->generate_public_key(*pub, *secret);
+            encryptor = std::make_unique<heongpu::HEEncryptor<S>>(context, *pub);
+            decryptor =
+                std::make_unique<heongpu::HEDecryptor<S>>(context, *secret);
+            encoder = std::make_unique<heongpu::HEEncoder<S>>(context);
+            ops = std::make_unique<llama::Llama3Operator>(context, *encoder,
+                                                          scale);
+            slots = encoder->slot_count();
+            layout = llama::MatrixLayout(kD, slots / (kD * kD));
+
+            relin = std::make_unique<heongpu::Relinkey<S>>(context);
+            keygen->generate_relin_key(*relin, *secret);
+
+            // The bootstrapping scale is the working scale on purpose.
+            // generate_bootstrapping_params writes it into scale_boot_, and
+            // that is the same field evaluate_poly consults when deciding
+            // whether an intermediate has grown enough to need rescaling, so
+            // a different one would quietly change how every Llama-3
+            // polynomial rescales.
+            heongpu::BootstrappingConfig boot_config(kCtoSPiece, kStoCPiece,
+                                                     kTaylor, true);
+            ops->generate_bootstrapping_params(
+                scale, boot_config,
+                heongpu::arithmetic_bootstrapping_type::REGULAR_BOOTSTRAPPING);
+
+            std::vector<int> boot_shifts = ops->bootstrapping_key_indexs();
+            boot_galois =
+                std::make_unique<heongpu::Galoiskey<S>>(context, boot_shifts);
+            keygen->generate_galois_key(*boot_galois, *secret);
+        }
+
+        heongpu::Ciphertext<S> encrypt(const std::vector<double>& values)
+        {
+            heongpu::Plaintext<S> plain(context);
+            encoder->encode(plain, values, scale);
+            heongpu::Ciphertext<S> cipher(context);
+            encryptor->encrypt(cipher, plain);
+            return cipher;
+        }
+
+        std::vector<double> decrypt(heongpu::Ciphertext<S>& cipher)
+        {
+            heongpu::Plaintext<S> plain(context);
+            decryptor->decrypt(plain, cipher);
+            std::vector<double> values;
+            encoder->decode(values, plain);
+            return values;
+        }
+
+        std::unique_ptr<heongpu::Galoiskey<S>> narrow_key(std::vector<int>
+                                                              shifts)
+        {
+            auto key = std::make_unique<heongpu::Galoiskey<S>>(context, shifts);
+            keygen->generate_galois_key(*key, *secret);
+            return key;
+        }
+
+        /// Moduli still available to spend.
+        int levels_left(heongpu::Ciphertext<S>& cipher) const
+        {
+            return kLimbs - cipher.depth();
+        }
+    };
+
+    /// What one bootstrap costs and what it returns, on the packed layout
+    /// every sublayer holds an activation in.
+    ///
+    /// The block structure is the thing to watch: bootstrapping is a
+    /// slot-wise operation and knows nothing about the batch packing, so if
+    /// the layout survived by accident rather than by construction it would
+    /// show up here as blocks coming back interleaved.
+    TEST_F(Llama3BootstrapEnv, BootstrappingBuysBackTheChain)
+    {
+        std::mt19937_64 rng(1001);
+        const std::vector<std::vector<double>> blocks =
+            random_blocks(layout, 0.5, rng);
+        const std::vector<double> packed = pack_blocks(blocks, layout);
+
+        heongpu::Ciphertext<S> cipher = encrypt(packed);
+        ops->drop_to_depth(cipher, kLimbs - 1);
+        ASSERT_EQ(levels_left(cipher), 1);
+
+        heongpu::Ciphertext<S> refreshed =
+            ops->regular_bootstrapping(cipher, *boot_galois, *relin);
+
+        const int usable = levels_left(refreshed);
+        std::cout << "[ MEASURED ] bootstrap returns " << usable << " of "
+                  << kLimbs << " levels" << std::endl;
+        EXPECT_GT(usable, 1);
+
+        // Bootstrapping is the least accurate thing in this file by a wide
+        // margin: the sine standing in for the modular reduction is a
+        // Taylor-and-double-angle approximation, not a Chebyshev fit over the
+        // data, so the bound here is set from what it delivers rather than
+        // from the noise floor everything else lands on.
+        EXPECT_LT(reported("bootstrap", decrypt(refreshed), packed), 1e-3);
+    }
+
 } // namespace
