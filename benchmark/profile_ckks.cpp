@@ -14,17 +14,19 @@
 //   ckks_profile boot     one regular_bootstrapping_v2
 //   ckks_profile relin    one relinearisation (a key switch with no automorphism)
 //   ckks_profile rotate   one rotation (the same key switch plus an automorphism)
+//   ckks_profile pcmm     one batch PCMM (Algorithm 1)
 //
 // The modulus chain is the one from example/bootstrapping/5_ckks_regular_-
 // bootstrapping_v2.cpp: the only chain in this tree demonstrated to bootstrap
-// at logN = 16. All three modes share it, so the key-switch reports are
-// directly comparable with the bootstrapping report.
+// at logN = 16. Every mode shares it, so all four reports are directly
+// comparable with each other.
 
 #include <heongpu/heongpu.hpp>
 
 #include <cuda_profiler_api.h>
 
 #include <cmath>
+#include <complex>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -121,9 +123,10 @@ struct RegionTimer
 int main(int argc, char* argv[])
 {
     const std::string mode = (argc > 1) ? argv[1] : "boot";
-    if (mode != "boot" && mode != "relin" && mode != "rotate")
+    if (mode != "boot" && mode != "relin" && mode != "rotate" &&
+        mode != "pcmm")
     {
-        std::cerr << "usage: " << argv[0] << " <boot|relin|rotate>"
+        std::cerr << "usage: " << argv[0] << " <boot|relin|rotate|pcmm>"
                   << std::endl;
         return EXIT_FAILURE;
     }
@@ -280,6 +283,84 @@ int main(int argc, char* argv[])
 
         std::cout << "[profile] one relinearisation: " << elapsed
                   << " ms, level " << C1.level() << std::endl;
+    }
+    else if (mode == "pcmm")
+    {
+        // Shape matched to the FIDESlib PaperProfile.PCMM capture so the two
+        // reports differ only in the modulus chain: module rank d = 1024, so
+        // k = 64 and 32 complex matrices ride together, an encrypted 1024 x 8
+        // matrix encryption and an 8 x 8 plaintext matrix.
+        const int d = EnvInt("HEONGPU_PROFILE_D", 1024);
+        const int inner = EnvInt("HEONGPU_PROFILE_INNER", 8);
+        const int cols = EnvInt("HEONGPU_PROFILE_COLS", 8);
+
+        heongpu::BatchMatrixLayout layout(static_cast<int>(kPolyModulusDegree),
+                                          d);
+        heongpu::HEBatchMatrixOperator<Scheme> op(context, layout);
+        heongpu::BatchMatrixEncoder enc(layout.k);
+        const int nslots = enc.slots();
+
+        const double scale_m = pow(2.0, 20);
+        const double scale_u = pow(2.0, 20);
+
+        // BatchMatrixEncoder takes std::complex<double>, not the library's
+        // Complex64.
+        using cd = std::complex<double>;
+        std::vector<std::vector<cd>> M(
+            nslots,
+            std::vector<cd>(static_cast<size_t>(d) * inner, cd(0.3, -0.2)));
+        std::vector<std::vector<cd>> U(
+            nslots,
+            std::vector<cd>(static_cast<size_t>(inner) * cols, cd(0.1, 0.4)));
+
+        // The encrypted operand: column j of the matrix encryption holds
+        // sum_i M[i][j] X^i (Definition 2), which is a coefficient-domain
+        // object and so goes in through load_coefficients, not the encoder.
+        std::vector<int64_t> m_coeffs;
+        enc.encode(M, d, inner, scale_m, m_coeffs);
+        std::vector<std::vector<int64_t>> columns;
+        heongpu::build_matrix_encryption_coefficients(m_coeffs, layout, d,
+                                                      inner, columns);
+        std::vector<heongpu::Ciphertext<Scheme>> cts;
+        cts.reserve(inner);
+        for (int j = 0; j < inner; ++j)
+        {
+            heongpu::Plaintext<Scheme> pt(context);
+            op.load_coefficients(pt, columns[j], scale_m);
+            heongpu::Ciphertext<Scheme> c(context);
+            encryptor.encrypt(c, pt);
+            cts.push_back(std::move(c));
+        }
+
+        std::vector<int64_t> u_coeffs;
+        enc.encode(U, inner, cols, scale_u, u_coeffs);
+        op.encode_plaintext_matrix(u_coeffs, inner, cols, 0, scale_u);
+
+        std::vector<heongpu::Ciphertext<Scheme>*> in;
+        for (auto& ct : cts)
+            in.push_back(&ct);
+
+        {
+            std::vector<heongpu::Ciphertext<Scheme>> warm;
+            op.pcmm(warm, in, /*rescale=*/false);
+            cudaDeviceSynchronize();
+        }
+
+        std::cout << "[profile] PCMM N=" << layout.N << " d=" << d
+                  << " k=" << layout.k << " inner=" << inner
+                  << " cols=" << cols << " limbs=" << (cts[0].level() + 1)
+                  << std::endl;
+
+        std::vector<heongpu::Ciphertext<Scheme>> out;
+        cudaProfilerStart();
+        RegionTimer timer;
+        op.pcmm(out, in, /*rescale=*/false);
+        cudaDeviceSynchronize();
+        const float elapsed = timer.ms();
+        cudaProfilerStop();
+
+        std::cout << "[profile] one PCMM: " << elapsed << " ms, "
+                  << out.size() << " output ciphertexts" << std::endl;
     }
     else
     {
