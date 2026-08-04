@@ -9,6 +9,16 @@
 // than the layer that contained it. The host-only tests come first: they pin
 // the permutation algebra of Section 4.2 and the Chebyshev fits before any GPU
 // time is spent on them.
+//
+// TOLERANCES
+// ----------
+// Every bound here is set from the error actually measured, with a couple of
+// orders of headroom, not from what would merely look acceptable. Almost all of
+// these primitives land on the CKKS noise floor around 1e-8, so a bound of 1e-6
+// still passes comfortably while catching a real loss of precision; a bound of
+// 1e-3 would have let a five hundred fold regression through. The exceptions
+// are the Chebyshev approximations themselves, where the fit error dominates
+// and the bound is set from the degree instead.
 
 #include <heongpu/heongpu.hpp>
 #include <gtest/gtest.h>
@@ -435,7 +445,7 @@ namespace
             want[i] = 1.0 / std::sqrt(values[i]);
         }
 
-        EXPECT_LT(reported("inverse_sqrt", got, want), 1e-5);
+        EXPECT_LT(reported("inverse_sqrt", got, want), 1e-6);
     }
 
     TEST_F(Llama3Env, InverseMatchesTheFunction)
@@ -453,7 +463,7 @@ namespace
             want[i] = 1.0 / values[i];
         }
 
-        EXPECT_LT(reported("inverse", got, want), 1e-4);
+        EXPECT_LT(reported("inverse", got, want), 1e-6);
     }
 
     TEST_F(Llama3Env, SiluMatchesTheActivation)
@@ -473,7 +483,7 @@ namespace
             want[i] = values[i] / (1.0 + std::exp(-values[i]));
         }
 
-        EXPECT_LT(reported("silu", got, want), 5e-3);
+        EXPECT_LT(reported("silu", got, want), 1e-3);
     }
 
     // -----------------------------------------------------------------------
@@ -515,7 +525,7 @@ namespace
                       values[(i + half) % slots] * sin_values[i];
         }
 
-        EXPECT_LT(max_error(got, want), 1e-4);
+        EXPECT_LT(max_error(got, want), 1e-6);
     }
 
     TEST_F(Llama3Env, RMSNormMatchesThePlaintextLayer)
@@ -575,7 +585,7 @@ namespace
             }
         }
 
-        EXPECT_LT(reported("rms_norm", got, want), 5e-3);
+        EXPECT_LT(reported("rms_norm", got, want), 1e-6);
     }
 
     TEST_F(Llama3Env, SoftmaxNormalisesEachInstance)
@@ -612,7 +622,7 @@ namespace
             }
         }
 
-        EXPECT_LT(reported("softmax k=1 strided", got, want), 5e-3);
+        EXPECT_LT(reported("softmax k=1 strided", got, want), 1e-6);
 
         // Whatever the approximation error, every instance must still sum to
         // one: that is what the normalise-and-square round enforces.
@@ -670,7 +680,7 @@ namespace
                 ops->pcmm(cipher, stored, layout, 4, 4, ell, *galois);
             const std::vector<double> got = decrypt(result);
 
-            EXPECT_LT(reported("pcmm", got, want), 1e-4) << "ell=" << ell;
+            EXPECT_LT(reported("pcmm", got, want), 1e-6) << "ell=" << ell;
         }
     }
 
@@ -769,7 +779,7 @@ namespace
                     want[p] = values[part][p] * factor;
                 }
             }
-            EXPECT_LT(max_error(got, want), 5e-3) << "part " << part;
+            EXPECT_LT(max_error(got, want), 1e-6) << "part " << part;
         }
     }
 
@@ -808,7 +818,7 @@ namespace
             }
         }
 
-        EXPECT_LT(reported("softmax k=1 blocked", got, want), 5e-3);
+        EXPECT_LT(reported("softmax k=1 blocked", got, want), 1e-6);
     }
 
     /// One weight matrix shared by every matrix in the batch, the form a
@@ -840,7 +850,7 @@ namespace
         heongpu::Ciphertext<S> cipher = encrypt(operand_slots);
         heongpu::Ciphertext<S> result =
             ops->pcmm(cipher, stored, layout, 4, 4, 0, *galois);
-        EXPECT_LT(max_error(decrypt(result), want), 1e-4);
+        EXPECT_LT(max_error(decrypt(result), want), 1e-6);
     }
 
     /// Lopsided BSGS splits. The rotation sets differ from the square split,
@@ -874,7 +884,7 @@ namespace
             heongpu::Ciphertext<S> cipher = encrypt(operand_slots);
             heongpu::Ciphertext<S> result =
                 ops->pcmm(cipher, stored, layout, d / baby, baby, 0, *galois);
-            EXPECT_LT(max_error(decrypt(result), want), 1e-4)
+            EXPECT_LT(max_error(decrypt(result), want), 1e-6)
                 << "baby=" << baby;
         }
     }
@@ -916,8 +926,8 @@ namespace
             want_shallow[i] = values[i] * weight[i];
         }
 
-        EXPECT_LT(max_error(decrypt(deep), want_deep), 1e-4);
-        EXPECT_LT(max_error(decrypt(shallow), want_shallow), 1e-4);
+        EXPECT_LT(max_error(decrypt(deep), want_deep), 1e-6);
+        EXPECT_LT(max_error(decrypt(shallow), want_shallow), 1e-6);
     }
 
     // -----------------------------------------------------------------------
@@ -1053,7 +1063,7 @@ namespace
                                                        layout, giant, baby,
                                                        ell, *key));
                     // The product sums d terms, so the error grows with d.
-                    EXPECT_LT(max_error(decrypt(result), want[ell]), 1e-4 * d);
+                    EXPECT_LT(max_error(decrypt(result), want[ell]), 1e-6 * d);
                 }
             }
         }
@@ -1099,7 +1109,7 @@ namespace
             want[i] = x * cos_values[i] +
                       0.5 * values[j] * values[j] * sin_values[i];
         }
-        EXPECT_LT(reported("rope at depth 2", decrypt(result), want), 1e-4);
+        EXPECT_LT(reported("rope at depth 2", decrypt(result), want), 1e-6);
     }
 
     /// A channel count that does not fill the last ciphertext.
@@ -1163,7 +1173,7 @@ namespace
                 want[j * stride + i] = values[0][j * stride + i] * factor;
             }
         }
-        EXPECT_LT(reported("rms_norm padded", decrypt(out[0]), want), 5e-3);
+        EXPECT_LT(reported("rms_norm padded", decrypt(out[0]), want), 1e-6);
     }
 
     /// The mistakes that would otherwise pass silently.
@@ -1322,7 +1332,7 @@ namespace
         }
 
         EXPECT_LT(reported("rms_norm -> pcmm -> silu", decrypt(activated), want),
-                  2e-2);
+                  1e-2);
     }
 
     // -----------------------------------------------------------------------
@@ -1437,7 +1447,7 @@ namespace
             }
         }
 
-        EXPECT_LT(reported("softmax k=2", got, want), 5e-3);
+        EXPECT_LT(reported("softmax k=2", got, want), 1e-6);
 
         for (int i = 0; i < config.stride; i++)
         {
