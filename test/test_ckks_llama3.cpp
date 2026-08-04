@@ -227,15 +227,23 @@ namespace
             {
                 indices.insert(r);
             }
-            for (int r : llama::Llama3Operator::blocked_rotation_indices(16))
+            for (int span : {16, 32})
             {
-                indices.insert(r);
+                for (int r :
+                     llama::Llama3Operator::blocked_rotation_indices(span))
+                {
+                    indices.insert(r);
+                }
             }
             const llama::MatrixLayout layout(16, slots / 256);
-            for (int r : llama::Llama3Operator::pcmm_rotation_indices(layout, 4,
-                                                                      4))
+            // Every BSGS split of d = 16 the tests exercise.
+            for (int baby : {2, 4, 8})
             {
-                indices.insert(r);
+                for (int r : llama::Llama3Operator::pcmm_rotation_indices(
+                         layout, 16 / baby, baby))
+                {
+                    indices.insert(r);
+                }
             }
             indices.insert(kRopeSwap);
 
@@ -636,6 +644,347 @@ namespace
 
             EXPECT_LT(max_error(got, want), 1e-4) << "ell=" << ell;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Branches the first round of tests never reached
+    // -----------------------------------------------------------------------
+
+    /// A polynomial result must be usable, not merely correct.
+    ///
+    /// evaluate_poly rescales its result only when the scale has grown past
+    /// half the target, so it can hand back a ciphertext with a rescale still
+    /// pending. multiply, rotate and mod_drop all refuse such a ciphertext, so
+    /// a primitive that returns one is a delayed exception rather than a
+    /// value. Squaring and rotating the output is the cheapest way to say so.
+    TEST_F(Llama3Env, PolynomialResultsAreReadyForFurtherWork)
+    {
+        const int count = 32;
+        const int stride = slots / count;
+
+        const std::vector<double> values = uniform(-11.0, 11.0, 71);
+        heongpu::Ciphertext<S> cipher = encrypt(values);
+
+        heongpu::Ciphertext<S> activated = ops->silu(cipher, 11.0, 15, *relin);
+        ASSERT_NO_THROW(ops->sum_strided(activated, stride, count, *galois));
+        ASSERT_NO_THROW(ops->square(activated, *relin));
+
+        heongpu::Ciphertext<S> wide = encrypt(uniform(2.0, 48.0, 72));
+        heongpu::Ciphertext<S> inverted =
+            ops->inverse(wide, 2.0, 48.0, 15, 1, *relin);
+        ASSERT_NO_THROW(ops->multiply_constant(inverted, 2.0));
+
+        // newton_iterations = 0 returns the bare Chebyshev seed, the one path
+        // that leaves evaluate_poly's output completely untouched.
+        heongpu::Ciphertext<S> narrow = encrypt(uniform(0.5, 2.0, 73));
+        heongpu::Ciphertext<S> root =
+            ops->inverse_sqrt(narrow, 0.5, 2.0, 15, 0, *relin);
+        ASSERT_NO_THROW(ops->square(root, *relin));
+    }
+
+    /// The channel split, which is the whole reason rms_norm takes a vector.
+    TEST_F(Llama3Env, RMSNormSplitsChannelsOverSeveralCiphertexts)
+    {
+        const int count = 32;
+        const int stride = slots / count;
+
+        llama::Llama3Operator::RMSNormConfig config;
+        config.stride = stride;
+        config.count = count;
+        config.channels = 2 * count; // two ciphertexts of count channels
+        config.eps = 1e-5;
+        config.sum_lo = 20.0;
+        config.sum_hi = 150.0;
+        config.degree = 15;
+        config.newton_iterations = 1;
+
+        std::mt19937_64 rng(81);
+        std::normal_distribution<double> dist(0.0, 1.0);
+        std::vector<std::vector<double>> values(2,
+                                                std::vector<double>(slots));
+        for (auto& v : values)
+        {
+            for (double& x : v)
+            {
+                x = dist(rng);
+            }
+        }
+
+        std::vector<heongpu::Ciphertext<S>> in{encrypt(values[0]),
+                                               encrypt(values[1])};
+        std::vector<heongpu::Plaintext<S>> no_weights;
+
+        std::vector<heongpu::Ciphertext<S>> out =
+            ops->rms_norm(in, no_weights, config, *galois, *relin);
+        ASSERT_EQ(out.size(), 2u);
+
+        for (int part = 0; part < 2; part++)
+        {
+            const std::vector<double> got = decrypt(out[part]);
+            std::vector<double> want(slots);
+            for (int i = 0; i < stride; i++)
+            {
+                double total = 0.0;
+                for (int j = 0; j < count; j++)
+                {
+                    for (int p = 0; p < 2; p++)
+                    {
+                        const double v = values[p][j * stride + i];
+                        total += v * v;
+                    }
+                }
+                const double factor =
+                    1.0 / std::sqrt(total / config.channels + config.eps);
+                for (int j = 0; j < count; j++)
+                {
+                    const int p = j * stride + i;
+                    want[p] = values[part][p] * factor;
+                }
+            }
+            EXPECT_LT(max_error(got, want), 5e-3) << "part " << part;
+        }
+    }
+
+    /// The blocked layout, which is what a SoftMax over the token axis needs
+    /// when the reduced axis is contiguous rather than strided.
+    TEST_F(Llama3Env, SoftmaxNormalisesContiguousBlocks)
+    {
+        llama::Llama3Operator::SoftmaxConfig config;
+        config.strided = false;
+        config.count = 32;
+        config.stride = 0; // unused in the blocked layout
+        config.bound = 2.0;
+        config.iterations = 1;
+        config.exp_degree = 15;
+        config.inverse_degree = 15;
+        config.inverse_newton = 2;
+
+        const std::vector<double> values = uniform(-config.bound, 0.0, 91);
+        heongpu::Ciphertext<S> cipher = encrypt(values);
+
+        heongpu::Ciphertext<S> result =
+            ops->softmax(cipher, config, *galois, *relin);
+        const std::vector<double> got = decrypt(result);
+
+        std::vector<double> want(slots);
+        for (int base = 0; base < slots; base += config.count)
+        {
+            double total = 0.0;
+            for (int j = 0; j < config.count; j++)
+            {
+                total += std::exp(values[base + j]);
+            }
+            for (int j = 0; j < config.count; j++)
+            {
+                want[base + j] = std::exp(values[base + j]) / total;
+            }
+        }
+
+        EXPECT_LT(max_error(got, want), 5e-3);
+    }
+
+    /// One weight matrix shared by every matrix in the batch, the form a
+    /// projection actually takes: one plaintext W against many token blocks.
+    TEST_F(Llama3Env, PcmmSharesOneBlockAcrossTheBatch)
+    {
+        const int d = 16;
+        const llama::MatrixLayout layout(d, slots / (d * d));
+        const int batch = layout.batch;
+
+        std::mt19937_64 rng(101);
+        const std::vector<double> a = random_matrix(d, rng);
+        const std::vector<double> stored = llama::permute_sigma(a, d);
+
+        std::vector<double> operand_slots(slots, 0.0);
+        std::vector<double> want(slots, 0.0);
+        for (int m = 0; m < batch; m++)
+        {
+            const std::vector<double> b = random_matrix(d, rng);
+            const std::vector<double> operand = llama::permute_tau(b, d);
+            const std::vector<double> expected = llama::matmul_host(a, b, d);
+            for (int e = 0; e < d * d; e++)
+            {
+                operand_slots[e * batch + m] = operand[e];
+                want[e * batch + m] = expected[e];
+            }
+        }
+
+        heongpu::Ciphertext<S> cipher = encrypt(operand_slots);
+        heongpu::Ciphertext<S> result =
+            ops->pcmm(cipher, stored, layout, 4, 4, 0, *galois);
+        EXPECT_LT(max_error(decrypt(result), want), 1e-4);
+    }
+
+    /// Lopsided BSGS splits. The rotation sets differ from the square split,
+    /// so a key or an index that is only right when giant == baby shows here.
+    TEST_F(Llama3Env, PcmmHandlesLopsidedBsgsSplits)
+    {
+        const int d = 16;
+        const llama::MatrixLayout layout(d, slots / (d * d));
+        const int batch = layout.batch;
+
+        std::mt19937_64 rng(111);
+        const std::vector<double> a = random_matrix(d, rng);
+        const std::vector<double> stored = llama::permute_sigma(a, d);
+
+        std::vector<double> operand_slots(slots, 0.0);
+        std::vector<double> want(slots, 0.0);
+        for (int m = 0; m < batch; m++)
+        {
+            const std::vector<double> b = random_matrix(d, rng);
+            const std::vector<double> operand = llama::permute_tau(b, d);
+            const std::vector<double> expected = llama::matmul_host(a, b, d);
+            for (int e = 0; e < d * d; e++)
+            {
+                operand_slots[e * batch + m] = operand[e];
+                want[e * batch + m] = expected[e];
+            }
+        }
+
+        for (int baby : {2, 8})
+        {
+            heongpu::Ciphertext<S> cipher = encrypt(operand_slots);
+            heongpu::Ciphertext<S> result =
+                ops->pcmm(cipher, stored, layout, d / baby, baby, 0, *galois);
+            EXPECT_LT(max_error(decrypt(result), want), 1e-4)
+                << "baby=" << baby;
+        }
+    }
+
+    /// A weight plaintext is prepared once and used at every level it meets.
+    /// multiply_plaintext promises to take the drop on a copy; if it dropped
+    /// the caller's plaintext instead, the second use would be at the wrong
+    /// level and would either throw or decode as noise.
+    TEST_F(Llama3Env, PlaintextOperandSurvivesReuseAtSeveralLevels)
+    {
+        const std::vector<double> values = uniform(-1.0, 1.0, 121);
+        std::vector<double> weight(slots);
+        for (int i = 0; i < slots; i++)
+        {
+            weight[i] = 0.25 + 0.5 * ((i % 5) / 5.0);
+        }
+
+        heongpu::Plaintext<S> weight_plain(context);
+        encoder->encode(weight_plain, weight, scale);
+
+        // Deep first, so a mutated plaintext would break the shallow use.
+        heongpu::Ciphertext<S> deep = encrypt(values);
+        ops->square(deep, *relin);
+        ops->multiply_constant(deep, 0.5);
+        ASSERT_EQ(deep.depth(), 2);
+        ops->multiply_plaintext(deep, weight_plain);
+        ops->rescale_inplace(deep);
+
+        heongpu::Ciphertext<S> shallow = encrypt(values);
+        ASSERT_EQ(shallow.depth(), 0);
+        ops->multiply_plaintext(shallow, weight_plain);
+        ops->rescale_inplace(shallow);
+
+        std::vector<double> want_deep(slots);
+        std::vector<double> want_shallow(slots);
+        for (int i = 0; i < slots; i++)
+        {
+            want_deep[i] = values[i] * values[i] * 0.5 * weight[i];
+            want_shallow[i] = values[i] * weight[i];
+        }
+
+        EXPECT_LT(max_error(decrypt(deep), want_deep), 1e-4);
+        EXPECT_LT(max_error(decrypt(shallow), want_shallow), 1e-4);
+    }
+
+    /// Primitives back to back on one ciphertext.
+    ///
+    /// Each test above starts from a fresh encryption, which is exactly the
+    /// state in which the plaintext-level bug was invisible. A layer never
+    /// does that, so this runs a normalisation, a projection and an activation
+    /// in sequence and checks the result against the same sequence on doubles.
+    TEST_F(Llama3Env, PrimitivesComposeIntoOneChain)
+    {
+        const int d = 16;
+        const llama::MatrixLayout layout(d, slots / (d * d));
+        const int batch = layout.batch;
+        const int count = 32;
+        const int stride = slots / count;
+
+        llama::Llama3Operator::RMSNormConfig config;
+        config.stride = stride;
+        config.count = count;
+        config.channels = count;
+        config.eps = 1e-5;
+        config.sum_lo = 8.0;
+        config.sum_hi = 72.0;
+        config.degree = 15;
+        config.newton_iterations = 1;
+
+        std::mt19937_64 rng(131);
+        std::normal_distribution<double> dist(0.0, 1.0);
+        std::vector<double> values(slots);
+        for (double& x : values)
+        {
+            x = dist(rng);
+        }
+
+        const std::vector<double> a = random_matrix(d, rng);
+        const std::vector<double> stored = llama::permute_sigma(a, d);
+
+        std::vector<heongpu::Ciphertext<S>> in{encrypt(values)};
+        std::vector<heongpu::Plaintext<S>> no_weights;
+        std::vector<heongpu::Ciphertext<S>> normed =
+            ops->rms_norm(in, no_weights, config, *galois, *relin);
+
+        // The projection consumes tau(X), so the normalised block is read in
+        // that layout; the chain is what matters here, not the packing.
+        heongpu::Ciphertext<S> projected =
+            ops->pcmm(normed[0], stored, layout, 4, 4, 0, *galois);
+        // Each product is a sum of d terms of size about one, so the range is
+        // several times wider than the normalised input it came from.
+        heongpu::Ciphertext<S> activated =
+            ops->silu(projected, 14.0, 31, *relin);
+
+        // The same sequence on doubles.
+        std::vector<double> normalised(slots);
+        for (int i = 0; i < stride; i++)
+        {
+            double total = 0.0;
+            for (int j = 0; j < count; j++)
+            {
+                const double v = values[j * stride + i];
+                total += v * v;
+            }
+            const double factor =
+                1.0 / std::sqrt(total / config.channels + config.eps);
+            for (int j = 0; j < count; j++)
+            {
+                normalised[j * stride + i] = values[j * stride + i] * factor;
+            }
+        }
+
+        std::vector<double> want(slots);
+        for (int m = 0; m < batch; m++)
+        {
+            std::vector<double> block(static_cast<std::size_t>(d) * d);
+            for (int e = 0; e < d * d; e++)
+            {
+                block[e] = normalised[e * batch + m];
+            }
+            // pcmm was handed tau(B) and returns A B, so undo tau to recover B.
+            std::vector<double> b(static_cast<std::size_t>(d) * d);
+            for (int i = 0; i < d; i++)
+            {
+                for (int j = 0; j < d; j++)
+                {
+                    b[((i + j) % d) * d + j] = block[i * d + j];
+                }
+            }
+            const std::vector<double> product = llama::matmul_host(a, b, d);
+            for (int e = 0; e < d * d; e++)
+            {
+                const double x = product[e];
+                want[e * batch + m] = x / (1.0 + std::exp(-x));
+            }
+        }
+
+        EXPECT_LT(max_error(decrypt(activated), want), 2e-2);
     }
 
 } // namespace
