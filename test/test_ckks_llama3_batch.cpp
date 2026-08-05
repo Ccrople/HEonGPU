@@ -566,3 +566,178 @@ TEST(HEonGPU, CKKS_Llama3Batch_FeedForwardMatchesHostSwiGLU)
     std::cout << "batch SwiGLU worst absolute error: " << worst << std::endl;
     EXPECT_LT(worst, 1e-2);
 }
+
+// A whole pre-norm block, which is what the composition is actually for. The
+// degrees are cut to the bone so the chain fits at this ring size; what is
+// being checked here is that the pieces compose -- that the residual reaches
+// across two sublayers' worth of level and scale drift without a bridge, and
+// that the stream stays in matrix form from one end to the other -- and not
+// the accuracy of any one approximation, which the tests above pin down.
+TEST(HEonGPU, CKKS_Llama3Batch_TransformerBlockMatchesHostBlock)
+{
+    Fixture f(70);
+    const int d = Fixture::d;
+    const int channels = d;
+    const int hidden = 12;
+    const double eps = 1e-5;
+
+    namespace llama = heongpu::llama;
+
+    const auto x = f.random_batch(d, channels, 20260805u);
+    const double amp = 1.0 / std::sqrt(static_cast<double>(channels));
+    const auto w_norm1 = random_weight(1, channels, 101u, 0.5);
+    const auto w_norm2 = random_weight(1, channels, 102u, 0.5);
+    const auto wq = random_weight(channels, channels, 111u, amp);
+    const auto wk = random_weight(channels, channels, 112u, amp);
+    const auto wv = random_weight(channels, channels, 113u, amp);
+    const auto wo = random_weight(channels, channels, 114u, amp);
+    const auto wg = random_weight(channels, hidden, 121u, amp);
+    const auto wu = random_weight(channels, hidden, 122u, amp);
+    const auto wd = random_weight(hidden, channels, 123u, amp);
+
+    auto silu = [](double z) { return z / (1.0 + std::exp(-z)); };
+
+    // The host block, and every calibrated interval taken off it as it runs.
+    auto norm = [&](const std::vector<double>& in,
+                    const std::vector<double>& w, double& lo, double& hi)
+    {
+        std::vector<double> out(in.size());
+        for (int u = 0; u < d; ++u)
+        {
+            double total = 0.0;
+            for (int c = 0; c < channels; ++c)
+            {
+                const double v = in[static_cast<size_t>(u) * channels + c];
+                total += v * v;
+            }
+            lo = std::min(lo, total);
+            hi = std::max(hi, total);
+            const double inv =
+                1.0 / std::sqrt(total / static_cast<double>(channels) + eps);
+            for (int c = 0; c < channels; ++c)
+                out[static_cast<size_t>(u) * channels + c] =
+                    in[static_cast<size_t>(u) * channels + c] * w[c] * inv;
+        }
+        return out;
+    };
+
+    double n1_lo = 1e300, n1_hi = 0.0, n2_lo = 1e300, n2_hi = 0.0;
+    double score_hi = -1e300, score_lo = 1e300, gate_bound = 0.0;
+
+    // Pass one: the norms and the raw scores, which fix the intervals.
+    std::vector<std::vector<double>> normed(f.layout.batch);
+    std::vector<std::vector<double>> raw(f.layout.batch);
+    for (int s = 0; s < f.layout.batch; ++s)
+    {
+        normed[s] = norm(x[s], w_norm1, n1_lo, n1_hi);
+        const auto q = host_product(normed[s], wq, d, channels, channels);
+        const auto k = host_product(normed[s], wk, d, channels, channels);
+        raw[s] = host_product(q, host_transpose(k, d, channels), d, channels,
+                              d);
+        for (int u = 0; u < d; ++u)
+            for (int j = 0; j <= u; ++j)
+            {
+                const double v = raw[s][static_cast<size_t>(u) * d + j];
+                score_hi = std::max(score_hi, v);
+                score_lo = std::min(score_lo, v);
+            }
+    }
+    const double head_scale = 2.0 / (score_hi - score_lo);
+    const double score_shift = score_hi * head_scale;
+
+    // Pass two: the rest of the block, on the intervals pass one fixed.
+    std::vector<std::vector<double>> want(f.layout.batch);
+    std::vector<std::vector<double>> mid(f.layout.batch);
+    for (int s = 0; s < f.layout.batch; ++s)
+    {
+        const auto v = host_product(normed[s], wv, d, channels, channels);
+        std::vector<double> p(static_cast<size_t>(d) * d, 0.0);
+        for (int u = 0; u < d; ++u)
+        {
+            double total = 0.0;
+            for (int j = 0; j <= u; ++j)
+            {
+                const double e =
+                    std::exp(raw[s][static_cast<size_t>(u) * d + j] *
+                                 head_scale - score_shift);
+                p[static_cast<size_t>(u) * d + j] = e;
+                total += e;
+            }
+            for (int j = 0; j <= u; ++j)
+                p[static_cast<size_t>(u) * d + j] /= total;
+        }
+        const auto head = host_product(p, v, d, d, channels);
+        const auto attn = host_product(head, wo, d, channels, channels);
+
+        mid[s].resize(x[s].size());
+        for (size_t e = 0; e < x[s].size(); ++e)
+            mid[s][e] = x[s][e] + attn[e];
+
+        const auto n2 = norm(mid[s], w_norm2, n2_lo, n2_hi);
+        const auto g = host_product(n2, wg, d, channels, hidden);
+        const auto u2 = host_product(n2, wu, d, channels, hidden);
+        std::vector<double> h(g.size());
+        for (size_t e = 0; e < g.size(); ++e)
+        {
+            gate_bound = std::max(gate_bound, std::abs(g[e]));
+            h[e] = silu(g[e]) * u2[e];
+        }
+        const auto ff = host_product(h, wd, d, hidden, channels);
+
+        want[s].resize(mid[s].size());
+        for (size_t e = 0; e < mid[s].size(); ++e)
+            want[s][e] = mid[s][e] + ff[e];
+    }
+
+    llama::Llama3BatchOperator::BatchTransformerBlockConfig config;
+    config.attention_norm.eps = eps;
+    config.attention_norm.sum_lo = n1_lo * 0.8;
+    config.attention_norm.sum_hi = n1_hi * 1.2;
+    config.attention_norm.degree = 15;
+    config.attention_norm.newton_iterations = 1;
+    config.feed_forward_norm = config.attention_norm;
+    config.feed_forward_norm.sum_lo = n2_lo * 0.8;
+    config.feed_forward_norm.sum_hi = n2_hi * 1.2;
+
+    config.attention.in_channels = channels;
+    config.attention.q_channels = channels;
+    config.attention.kv_channels = channels;
+    config.attention.heads = 1;
+    config.attention.causal = true;
+    config.attention.head_scale = head_scale;
+    config.attention.score_shift = score_shift;
+    config.attention.softmax.bound = 2.0;
+    config.attention.softmax.iterations = 2;
+    config.attention.softmax.exp_degree = 7;
+    config.attention.softmax.inverse_degree = 7;
+    config.attention.softmax.inverse_newton = 1;
+
+    config.feed_forward.in_channels = channels;
+    config.feed_forward.hidden_channels = hidden;
+    config.feed_forward.silu_bound = gate_bound * 1.25;
+    config.feed_forward.silu_degree = 15;
+
+    llama::Llama3BatchOperator::BatchTransformerBlockWeights weights;
+    weights.attention_norm = w_norm1;
+    weights.feed_forward_norm = w_norm2;
+    weights.attention.query = wq;
+    weights.attention.key = wk;
+    weights.attention.value = wv;
+    weights.attention.output = wo;
+    weights.feed_forward.gate = wg;
+    weights.feed_forward.up = wu;
+    weights.feed_forward.down = wd;
+
+    auto ct = f.op->encrypt(x, d, channels, *f.encryptor, f.scale);
+    auto out =
+        f.op->transformer_block(ct, weights, config, *f.galois, *f.relin);
+    ASSERT_EQ(out.columns(), channels);
+
+    const auto got =
+        f.op->decrypt(out, *f.decryptor, out.column.front().scale());
+
+    const double worst = max_abs_diff(want, got);
+    std::cout << "batch transformer block worst absolute error: " << worst
+              << std::endl;
+    EXPECT_LT(worst, 2e-1);
+}

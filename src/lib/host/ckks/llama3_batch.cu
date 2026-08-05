@@ -892,6 +892,50 @@ namespace heongpu
                            config.in_channels, "ffn.down");
         }
 
+        BatchActivation Llama3BatchOperator::transformer_block(
+            BatchActivation& x, const BatchTransformerBlockWeights& weights,
+            const BatchTransformerBlockConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            require_uniform(x, "transformer_block");
+
+            Range _r("transformer_block");
+
+            BatchActivation stream;
+            stream.rows = x.rows;
+            stream.column = x.column;
+
+            {
+                Range _r_half("transformer_block.attention_half");
+                BatchActivation normed =
+                    rms_norm(stream, weights.attention_norm,
+                             config.attention_norm, galois_key, relin_key);
+                BatchActivation sublayer =
+                    attention(normed, weights.attention, config.attention,
+                              galois_key, relin_key);
+                // The two operands have been through completely different
+                // circuits, so neither the level nor the scale lines up; this
+                // is the one level a pre-norm residual pays.
+                stream.column = arith_.residual_add(stream.column,
+                                                    sublayer.column);
+            }
+
+            {
+                Range _r_half("transformer_block.feed_forward_half");
+                BatchActivation normed =
+                    rms_norm(stream, weights.feed_forward_norm,
+                             config.feed_forward_norm, galois_key, relin_key);
+                BatchActivation sublayer =
+                    feed_forward(normed, weights.feed_forward,
+                                 config.feed_forward, galois_key, relin_key);
+                stream.column = arith_.residual_add(stream.column,
+                                                    sublayer.column);
+            }
+
+            return stream;
+        }
+
         // -------------------------------------------------------------------
         // Host-side staging
         // -------------------------------------------------------------------

@@ -440,6 +440,52 @@ namespace heongpu
                          Galoiskey<Scheme::CKKS>& galois_key,
                          Relinkey<Scheme::CKKS>& relin_key);
 
+            /** @brief Plaintext weights of one whole transformer block. */
+            struct BatchTransformerBlockWeights
+            {
+                /// One learned scale per channel, or empty to leave the
+                /// scaling out.
+                std::vector<double> attention_norm;
+                std::vector<double> feed_forward_norm;
+                BatchAttentionWeights attention;
+                BatchFeedForwardWeights feed_forward;
+            };
+
+            /** @brief Shape and approximation settings for a whole block. */
+            struct BatchTransformerBlockConfig
+            {
+                BatchRMSNormConfig attention_norm;
+                BatchAttentionConfig attention;
+                BatchRMSNormConfig feed_forward_norm;
+                BatchFeedForwardConfig feed_forward;
+            };
+
+            /**
+             * @brief One pre-norm transformer block on the batch path.
+             *
+             * Norm, attention, residual; then norm, SwiGLU, residual. The
+             * residual addition needs no bridge: it reconciles level and scale
+             * with a mod drop and a multiplication by a constant, and a
+             * constant is the constant POLYNOMIAL, which scales every
+             * coefficient of a matrix encryption exactly as it scales every
+             * slot of a slot encoding. The stream therefore stays in matrix
+             * form from one end of the block to the other, and the only
+             * crossings are the ones the non-linearities force.
+             *
+             * There is no refresh here yet, and that is the open question on
+             * this path rather than an omission. CKKS bootstrapping is the
+             * identity on the plaintext polynomial, so it should carry a
+             * matrix encryption unchanged, but "should" is not "does" and
+             * nothing here has measured it. A caller wanting a stack must
+             * bootstrap between blocks itself, and check what comes back.
+             */
+            BatchActivation
+            transformer_block(BatchActivation& x,
+                              const BatchTransformerBlockWeights& weights,
+                              const BatchTransformerBlockConfig& config,
+                              Galoiskey<Scheme::CKKS>& galois_key,
+                              Relinkey<Scheme::CKKS>& relin_key);
+
           private:
             /// The d x d Vandermonde of (*) at batch index b, and its inverse.
             /// Built once per operator: it depends only on the ring.
