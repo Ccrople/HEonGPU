@@ -140,6 +140,10 @@ struct RegionTimer
 /// circuit and which are properties of a ring too small to fill the device.
 constexpr int kDefaultLogN = 12;
 constexpr int kLimbs = 60;
+/// Special primes, which set the key-switching decomposition: the chain is cut
+/// into ceil(limbs / this) groups and a rotation key holds two polynomials per
+/// group at every prime. See the key-size arithmetic in main().
+constexpr int kSpecialPrimes = 3;
 constexpr int kPrimeBits = 50;
 constexpr int kLogScale = 50;
 constexpr int kCtoSPiece = 3;
@@ -404,6 +408,44 @@ int main(int argc, char* argv[])
                   << (cost.bootstraps * shape.blocks - shape.channel_blocks *
                                                            shape.token_blocks)
                   << " bootstraps" << std::endl;
+    }
+
+    // What the rotation keys will cost, before any of them exists.
+    //
+    // A key holds two polynomials for each of the decomposition groups at every
+    // prime of the chain and the special primes, so one of them is
+    //
+    //   2 * ceil(Q / P) * (Q + P) * N * 8 bytes
+    //
+    // which at logN 15 and sixty limbs is 630 MiB apiece. The index list is a
+    // property of the shape alone, so both numbers are available here and a
+    // shape whose keys do not fit says so in a second rather than after five
+    // minutes of key generation.
+    {
+        const int slots = poly_modulus_degree / 2;
+        if (slots % (shape.d * shape.d) == 0)
+        {
+            const llama::MatrixLayout probe_layout(
+                shape.d, slots / (shape.d * shape.d));
+            llama::Llama3Operator::ModelConfig probe;
+            probe.layout = probe_layout;
+            probe.token_blocks = shape.token_blocks;
+            probe.stack.bootstrap_between_blocks = true;
+            for (int b = 0; b < shape.blocks; b++)
+                probe.stack.blocks.push_back(block_config(shape, probe_layout));
+            probe.final_norm = probe.stack.blocks.front().attention_norm;
+
+            const std::size_t count =
+                llama::Llama3Operator::model_rotation_indices(probe).size();
+            const int groups = (kLimbs + kSpecialPrimes - 1) / kSpecialPrimes;
+            const double key_bytes = 2.0 * groups * (kLimbs + kSpecialPrimes) *
+                                     poly_modulus_degree * 8.0;
+            const double gib = 1024.0 * 1024.0 * 1024.0;
+            std::cout << "[profile] rotation keys: " << count << " indices at "
+                      << (key_bytes / (1024.0 * 1024.0)) << " MiB each = "
+                      << (count * key_bytes / gib)
+                      << " GiB, before the bootstrapping key" << std::endl;
+        }
     }
 
     if (EnvInt("HEONGPU_LLAMA_DRY_RUN", 0) != 0)
