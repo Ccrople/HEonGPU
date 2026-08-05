@@ -857,39 +857,114 @@ namespace heongpu
 
             Range _r("feed_forward");
 
-            BatchActivation gate =
-                project(x, weights.gate, config.in_channels,
-                        config.hidden_channels, "ffn.gate");
-            BatchActivation up = project(x, weights.up, config.in_channels,
-                                         config.hidden_channels, "ffn.up");
-
-            // The gate meets the up projection in a Hadamard product, which
-            // the matrix encoding does not have: multiplying two columns
-            // convolves their coefficients. Both branches therefore cross to
-            // slot form, where a product is slot-wise, and the result crosses
-            // back for the down projection.
-            std::vector<Ciphertext<Scheme::CKKS>> gate_slots =
-                to_slots(gate, galois_key);
-            std::vector<Ciphertext<Scheme::CKKS>> up_slots =
-                to_slots(up, galois_key);
-
-            std::vector<Ciphertext<Scheme::CKKS>> hidden;
-            hidden.reserve(gate_slots.size());
+            const int in_channels = config.in_channels;
+            const int hidden_channels = config.hidden_channels;
+            if (weights.gate.size() != static_cast<size_t>(in_channels) *
+                                           static_cast<size_t>(hidden_channels)
+                || weights.up.size() != weights.gate.size()
+                || weights.down.size() != weights.gate.size())
             {
-                Range _r_silu("ffn.silu");
-                for (size_t j = 0; j < gate_slots.size(); ++j)
+                throw std::invalid_argument(
+                    "The SwiGLU weights must be in_channels by "
+                    "hidden_channels, and down its transpose shape");
+            }
+
+            // The hidden axis is streamed rather than held whole. See the
+            // config for why: the Hadamard product needs both branches in both
+            // encodings at once, so the whole width would be four ciphertexts
+            // per hidden channel resident simultaneously.
+            int block = config.hidden_block > 0 ? config.hidden_block
+                                                : hidden_channels;
+            block = std::min(block, hidden_channels);
+
+            BatchActivation out;
+            out.rows = x.rows;
+
+            for (int base = 0; base < hidden_channels; base += block)
+            {
+                const int cols = std::min(block, hidden_channels - base);
+
+                // The gate and up weights are in_channels x hidden_channels,
+                // so a chunk of the hidden axis is a set of columns and has to
+                // be gathered. The down weight is hidden_channels x
+                // in_channels, so the same chunk is a contiguous span of rows.
+                std::vector<double> gate_w(static_cast<size_t>(in_channels) *
+                                           cols);
+                std::vector<double> up_w(gate_w.size());
+                for (int i = 0; i < in_channels; ++i)
                 {
-                    Ciphertext<Scheme::CKKS> activated =
-                        arith_.silu(gate_slots[j], config.silu_bound,
-                                    config.silu_degree, relin_key);
-                    hidden.push_back(arith_.multiply_and_rescale(
-                        activated, up_slots[j], relin_key));
+                    const size_t src =
+                        static_cast<size_t>(i) * hidden_channels + base;
+                    const size_t dst = static_cast<size_t>(i) * cols;
+                    for (int j = 0; j < cols; ++j)
+                    {
+                        gate_w[dst + j] = weights.gate[src + j];
+                        up_w[dst + j] = weights.up[src + j];
+                    }
+                }
+
+                BatchActivation gate =
+                    project(x, gate_w, in_channels, cols, "ffn.gate");
+                BatchActivation up =
+                    project(x, up_w, in_channels, cols, "ffn.up");
+
+                // The gate meets the up projection in a Hadamard product,
+                // which the matrix encoding does not have: multiplying two
+                // columns convolves their coefficients. Both branches
+                // therefore cross to slot form, where a product is slot-wise,
+                // and the result crosses back for the down projection.
+                std::vector<Ciphertext<Scheme::CKKS>> gate_slots =
+                    to_slots(gate, galois_key);
+                std::vector<Ciphertext<Scheme::CKKS>> up_slots =
+                    to_slots(up, galois_key);
+                gate.column.clear();
+                up.column.clear();
+
+                std::vector<Ciphertext<Scheme::CKKS>> hidden;
+                hidden.reserve(gate_slots.size());
+                {
+                    Range _r_silu("ffn.silu");
+                    for (size_t j = 0; j < gate_slots.size(); ++j)
+                    {
+                        Ciphertext<Scheme::CKKS> activated =
+                            arith_.silu(gate_slots[j], config.silu_bound,
+                                        config.silu_degree, relin_key);
+                        hidden.push_back(arith_.multiply_and_rescale(
+                            activated, up_slots[j], relin_key));
+                    }
+                }
+                gate_slots.clear();
+                up_slots.clear();
+
+                BatchActivation h = from_slots(hidden, x.rows, galois_key);
+                hidden.clear();
+
+                const std::vector<double> down_w(
+                    weights.down.begin() +
+                        static_cast<size_t>(base) * in_channels,
+                    weights.down.begin() +
+                        static_cast<size_t>(base + cols) * in_channels);
+                BatchActivation part =
+                    project(h, down_w, cols, in_channels, "ffn.down");
+
+                if (out.column.empty())
+                {
+                    out.column = std::move(part.column);
+                }
+                else
+                {
+                    // Every chunk's partial product leaves the same sequence
+                    // of operations behind it, so they meet at one level and
+                    // one scale and the sum is a plain addition.
+                    Range _r_acc("ffn.accumulate");
+                    for (size_t j = 0; j < out.column.size(); ++j)
+                    {
+                        arith_.add_inplace(out.column[j], part.column[j]);
+                    }
                 }
             }
 
-            BatchActivation h = from_slots(hidden, x.rows, galois_key);
-            return project(h, weights.down, config.hidden_channels,
-                           config.in_channels, "ffn.down");
+            return out;
         }
 
         BatchActivation Llama3BatchOperator::transformer_block(

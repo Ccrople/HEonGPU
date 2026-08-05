@@ -430,6 +430,24 @@ namespace heongpu
                 int hidden_channels = 0;
                 double silu_bound = 10.8; ///< Table 2 after calibration.
                 int silu_degree = 31;     ///< Section 3.1.3.
+                /// Hidden channels held at once; 0 takes the whole width.
+                ///
+                /// This is the memory lever on the sublayer and, at Llama-3
+                /// widths, the difference between fitting on one card and not.
+                /// A matrix encryption spends one ciphertext per channel, and
+                /// the Hadamard product needs the gate and the up projection
+                /// in BOTH forms at once, so holding the whole hidden width
+                /// costs 4 * hidden_channels ciphertexts -- 57,344 of them at
+                /// the published 14336, which is hundreds of gigabytes at any
+                /// useful chain length.
+                ///
+                /// The down projection sums over the hidden axis, and a sum
+                /// splits over disjoint ranges of its index, so a chunk can be
+                /// projected down and accumulated the moment it is formed and
+                /// then released. The arithmetic is unchanged -- same products,
+                /// same scales, same levels, only the order of a homomorphic
+                /// sum -- and the peak falls to 4 * hidden_block.
+                int hidden_block = 0;
             };
 
             /** @brief The SwiGLU sublayer, W_down (SiLU(W_gate x) * W_up x). */
