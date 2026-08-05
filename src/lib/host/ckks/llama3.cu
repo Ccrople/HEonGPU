@@ -1068,10 +1068,21 @@ namespace heongpu
             // The parts are added together below, so a mismatch here would be
             // a silently wrong denominator rather than an error.
             require_uniform(parts, "SoftMax input");
-            if (config.count <= 1 || !is_power_of_two(config.count))
+            if (config.count < 1 || !is_power_of_two(config.count))
             {
                 throw std::invalid_argument(
-                    "SoftMax length must be a power of two above one");
+                    "The SoftMax length held inside one ciphertext must be a "
+                    "power of two");
+            }
+            // One is allowed, and it is not a degenerate case: a matrix
+            // encryption puts each coordinate of the reduced axis in its own
+            // ciphertext, so the whole axis runs across the parts and there is
+            // nothing left to reduce inside one. The reduction below is then
+            // the slot-wise sum alone, which costs no rotation at all.
+            if (static_cast<double>(config.count) * parts.size() <= 1.0)
+            {
+                throw std::invalid_argument(
+                    "SoftMax length must be above one, counting every part");
             }
             if (!(config.bound > 0.0))
             {

@@ -125,8 +125,9 @@ namespace heongpu
         Llama3BatchOperator::Llama3BatchOperator(
             HEContext<Scheme::CKKS> context, HEEncoder<Scheme::CKKS>& encoder,
             const BatchMatrixLayout& layout, double scale)
-            : context_(context), encoder_(encoder), arith_(context, encoder),
-              matrix_(context, layout), batch_encoder_(layout.k),
+            : context_(context), encoder_(encoder),
+              arith_(context, encoder, scale), matrix_(context, layout),
+              batch_encoder_(layout.k),
               layout_(layout), primes_(context->get_key_modulus()),
               slot_count_(encoder.slot_count()), default_scale_(scale)
         {
@@ -461,15 +462,14 @@ namespace heongpu
             return out;
         }
 
-        BatchActivation
-        Llama3BatchOperator::matmul(BatchActivation& a, BatchActivation& b,
-                                    const char* name,
-                                    Galoiskey<Scheme::CKKS>& galois_key,
-                                    Relinkey<Scheme::CKKS>& relin_key)
+        std::vector<Ciphertext<Scheme::CKKS>> Llama3BatchOperator::product(
+            const std::vector<Ciphertext<Scheme::CKKS>*>& a,
+            const std::vector<Ciphertext<Scheme::CKKS>*>& b, const char* name,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
         {
-            require_uniform(a, name);
-            require_uniform(b, name);
-            if (a.columns() != layout_.d || b.columns() != layout_.d)
+            if (static_cast<int>(a.size()) != layout_.d ||
+                static_cast<int>(b.size()) != layout_.d)
             {
                 throw std::invalid_argument(
                     std::string("The ") + name +
@@ -480,6 +480,32 @@ namespace heongpu
             char range_name[64];
             std::snprintf(range_name, sizeof(range_name), "matmul.%s", name);
             Range _r(range_name);
+
+            std::vector<Ciphertext<Scheme::CKKS>> out;
+            matrix_.ccmm(out, a, b, galois_key, relin_key, arith_,
+                         /*rescale=*/true);
+
+            // Algorithm 4, like Algorithm 1, only MARKS the rescale: it leaves
+            // the product at scale_a * scale_b and sets rescale_required_.
+            // Spending it here is not tidiness. Unspent, the plaintext's
+            // centered coefficients have outgrown int64 and the very next
+            // decryption throws, while every downstream operation sees a scale
+            // no caller expects.
+            for (auto& c : out)
+            {
+                arith_.rescale_inplace(c);
+            }
+            return out;
+        }
+
+        BatchActivation
+        Llama3BatchOperator::matmul(BatchActivation& a, BatchActivation& b,
+                                    const char* name,
+                                    Galoiskey<Scheme::CKKS>& galois_key,
+                                    Relinkey<Scheme::CKKS>& relin_key)
+        {
+            require_uniform(a, name);
+            require_uniform(b, name);
 
             std::vector<Ciphertext<Scheme::CKKS>*> lhs, rhs;
             lhs.reserve(a.column.size());
@@ -495,9 +521,266 @@ namespace heongpu
 
             BatchActivation out;
             out.rows = a.rows;
-            matrix_.ccmm(out.column, lhs, rhs, galois_key, relin_key, arith_,
-                         /*rescale=*/true);
+            out.column = product(lhs, rhs, name, galois_key, relin_key);
             return out;
+        }
+
+        BatchActivation
+        Llama3BatchOperator::transpose(BatchActivation& in, const char* name,
+                                       Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            require_uniform(in, name);
+            if (in.columns() != layout_.d || in.rows != layout_.d)
+            {
+                throw std::invalid_argument(
+                    std::string("The ") + name +
+                    " transpose is only defined on the square block the ring "
+                    "fixes, which is layout.d by layout.d");
+            }
+
+            char range_name[64];
+            std::snprintf(range_name, sizeof(range_name), "transpose.%s", name);
+            Range _r(range_name);
+
+            BatchActivation out;
+            out.rows = in.rows;
+            out.column = in.column;
+            matrix_.cmt(out.column, galois_key, arith_);
+            return out;
+        }
+
+        std::vector<int> Llama3BatchOperator::product_rotation_indices() const
+        {
+            return get_batch_cmt_rotation_indices(layout_);
+        }
+
+        std::vector<int> Llama3BatchOperator::rotation_indices() const
+        {
+            std::vector<int> all = bridge_rotation_indices();
+            const std::vector<int> cmt = product_rotation_indices();
+            all.insert(all.end(), cmt.begin(), cmt.end());
+            std::sort(all.begin(), all.end());
+            all.erase(std::unique(all.begin(), all.end()), all.end());
+            return all;
+        }
+
+        // -------------------------------------------------------------------
+        // Attention
+        // -------------------------------------------------------------------
+
+        std::vector<double>
+        Llama3BatchOperator::causal_column_mask(int key) const
+        {
+            const int d = layout_.d;
+            const int step = layout_.k / 2;
+
+            std::vector<double> mask(slot_count_, 0.0);
+            for (int u = key; u < d; ++u)
+            {
+                // Query u admits keys 0..u, so it keeps u + 1 of the d
+                // coordinates. Weighting by sqrt(d / (u + 1)) is constant
+                // along the key axis and therefore cancels in the SoftMax
+                // rounds, but it leaves the sum of squares where a full row
+                // would have left it.
+                const double w = std::sqrt(static_cast<double>(d) /
+                                           static_cast<double>(u + 1));
+                for (int b = 0; b < step; ++b)
+                {
+                    mask[b + u * step] = w;
+                }
+            }
+            return mask;
+        }
+
+        BatchActivation Llama3BatchOperator::attention(
+            BatchActivation& x, const BatchAttentionWeights& weights,
+            const BatchAttentionConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            const int d = layout_.d;
+            const int heads = config.heads;
+            const int kv_heads =
+                config.kv_heads > 0 ? config.kv_heads : config.heads;
+
+            if (heads < 1 || kv_heads < 1 || heads % kv_heads != 0)
+            {
+                throw std::invalid_argument(
+                    "Grouped-query attention needs kv_heads to divide heads");
+            }
+            if (config.q_channels % (heads * d) != 0 ||
+                config.kv_channels % (kv_heads * d) != 0)
+            {
+                throw std::invalid_argument(
+                    "Every head must own a whole number of layout.d channel "
+                    "blocks, because Algorithm 4's operands are square at d");
+            }
+            const int per_head = config.q_channels / (heads * d);
+            if (config.kv_channels / (kv_heads * d) != per_head)
+            {
+                throw std::invalid_argument(
+                    "The key and value heads must be as wide as the query "
+                    "heads; only their number may differ");
+            }
+
+            Range _r_attention("attention");
+
+            // 1/sqrt(head_dim) rides on the query weight. A scaling is free on
+            // the host and one homomorphic level anywhere else, and the score
+            // shift that follows is an addition in slot form, which is free
+            // too -- so the whole of the score calibration costs nothing.
+            const double head_scale =
+                config.head_scale != 0.0
+                    ? config.head_scale
+                    : 1.0 / std::sqrt(static_cast<double>(per_head * d));
+            std::vector<double> query_weight = weights.query;
+            for (auto& w : query_weight)
+            {
+                w *= head_scale;
+            }
+
+            BatchActivation q = project(x, query_weight, config.in_channels,
+                                        config.q_channels, "attention.q");
+            BatchActivation k = project(x, weights.key, config.in_channels,
+                                        config.kv_channels, "attention.k");
+            BatchActivation v = project(x, weights.value, config.in_channels,
+                                        config.kv_channels, "attention.v");
+
+            // K^T, one CMT per channel block. This is the only transpose the
+            // sublayer pays for: the value product P V already reads V with
+            // the key on its rows, which is where the projection left it.
+            std::vector<Ciphertext<Scheme::CKKS>> key_t;
+            key_t.reserve(k.column.size());
+            {
+                Range _r("attention.transpose_key");
+                for (int base = 0; base < k.columns(); base += d)
+                {
+                    std::vector<Ciphertext<Scheme::CKKS>> block(
+                        k.column.begin() + base, k.column.begin() + base + d);
+                    matrix_.cmt(block, galois_key, arith_);
+                    for (auto& c : block)
+                    {
+                        key_t.push_back(std::move(c));
+                    }
+                }
+            }
+
+            const int group = heads / kv_heads;
+
+            BatchActivation out;
+            out.rows = x.rows;
+            out.column.reserve(static_cast<size_t>(config.q_channels));
+
+            for (int h = 0; h < heads; ++h)
+            {
+                const int q_base = h * per_head * d;
+                const int kv_base = (h / group) * per_head * d;
+
+                // S = sum_t Q[t] K[t]^T. Every term is one CCMM at the same
+                // level and the same scale, so a head wider than one block
+                // costs products and no depth at all.
+                std::vector<Ciphertext<Scheme::CKKS>> scores;
+                {
+                    Range _r("attention.scores");
+                    for (int t = 0; t < per_head; ++t)
+                    {
+                        std::vector<Ciphertext<Scheme::CKKS>*> lhs, rhs;
+                        for (int j = 0; j < d; ++j)
+                        {
+                            lhs.push_back(&q.column[q_base + t * d + j]);
+                            rhs.push_back(&key_t[kv_base + t * d + j]);
+                        }
+                        std::vector<Ciphertext<Scheme::CKKS>> term = product(
+                            lhs, rhs, "attention.score", galois_key, relin_key);
+                        if (scores.empty())
+                        {
+                            scores = std::move(term);
+                        }
+                        else
+                        {
+                            for (int j = 0; j < d; ++j)
+                            {
+                                arith_.add_inplace(scores[j], term[j]);
+                            }
+                        }
+                    }
+                }
+
+                // The SoftMax is slot-wise, so this is where the sublayer
+                // leaves the matrix encoding -- and the only place it does.
+                BatchActivation score_matrix;
+                score_matrix.rows = d;
+                score_matrix.column = std::move(scores);
+                std::vector<Ciphertext<Scheme::CKKS>> slots =
+                    to_slots(score_matrix, galois_key);
+
+                if (config.score_shift != 0.0)
+                {
+                    for (auto& c : slots)
+                    {
+                        arith_.add_constant(c, -config.score_shift);
+                    }
+                }
+
+                Llama3Operator::SoftmaxConfig softmax = config.softmax;
+                // The key axis is entirely across ciphertexts: one coordinate
+                // per part, so nothing is reduced inside a ciphertext and the
+                // denominator costs a slot-wise addition and no rotation.
+                softmax.strided = true;
+                softmax.stride = slot_count_;
+                softmax.count = 1;
+
+                std::vector<std::vector<double>> masks;
+                if (config.causal)
+                {
+                    masks.reserve(d);
+                    for (int j = 0; j < d; ++j)
+                    {
+                        masks.push_back(causal_column_mask(j));
+                    }
+                }
+
+                std::vector<Ciphertext<Scheme::CKKS>> p_slots =
+                    arith_.softmax(slots, softmax, masks, galois_key,
+                                   relin_key);
+
+                BatchActivation p = from_slots(p_slots, d, galois_key);
+
+                // The value blocks are still where the projection left them,
+                // several levels above P, so they come down to meet it. The
+                // drop is free and what it discards was unreachable anyway.
+                {
+                    Range _r("attention.value_product");
+                    const int depth = p.column.front().depth();
+                    for (int t = 0; t < per_head; ++t)
+                    {
+                        std::vector<Ciphertext<Scheme::CKKS>> value(
+                            v.column.begin() + kv_base + t * d,
+                            v.column.begin() + kv_base + (t + 1) * d);
+                        std::vector<Ciphertext<Scheme::CKKS>*> lhs, rhs;
+                        for (int j = 0; j < d; ++j)
+                        {
+                            arith_.drop_to_depth(value[j], depth);
+                            lhs.push_back(&p.column[j]);
+                            rhs.push_back(&value[j]);
+                        }
+                        std::vector<Ciphertext<Scheme::CKKS>> head_out =
+                            product(lhs, rhs, "attention.value", galois_key,
+                                    relin_key);
+                        for (auto& c : head_out)
+                        {
+                            out.column.push_back(std::move(c));
+                        }
+                    }
+                }
+            }
+
+            if (weights.output.empty())
+            {
+                return out;
+            }
+            return project(out, weights.output, config.q_channels,
+                           config.in_channels, "attention.o");
         }
 
         // -------------------------------------------------------------------
