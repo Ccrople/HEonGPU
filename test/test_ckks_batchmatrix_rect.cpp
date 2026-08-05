@@ -38,11 +38,15 @@ namespace
 
     /// Everything the rectangular tests need from a context, at one shape.
     ///
-    /// The ring is deliberately small. Algorithm 5's summation asks for the
-    /// whole rotation group -- N/2 - 1 Galois keys -- and that count depends on
-    /// N alone, so the ring degree is the only thing standing between a test
-    /// and a key set that does not fit on the card. Three limbs keep each key
-    /// small enough that 1023 of them cost well under a gigabyte.
+    /// The ring is the smallest HEonGPU supports, 4096, and that is not a
+    /// convenience: Algorithm 5's summation asks for the whole rotation group,
+    /// N/2 - 1 Galois keys, and that count depends on N ALONE -- not on d, not
+    /// on the width of whatever is being multiplied. So the ring degree is the
+    /// only thing standing between a test and a key set that does not fit on
+    /// the card. What makes 2047 keys affordable here is the chain: at three
+    /// limbs and one special prime a key is 768 KiB, so the set is 1.5 GiB.
+    /// The same 2047 keys on the 70-limb chain a transformer block needs would
+    /// be 96 GiB.
     struct RectFixture
     {
         heongpu::HEContext<S> context;
@@ -148,7 +152,7 @@ namespace
 // only thing that could put mass in the later blocks.
 TEST(HEonGPU, CKKS_BatchMatrix_RectangularPCMMMatchesReference)
 {
-    const int degree = 2048;
+    const int degree = 4096;
     const int d = 128;
     RectFixture fx(degree, d);
 
@@ -339,7 +343,7 @@ namespace
 
 TEST(HEonGPU, CKKS_BatchMatrix_RectangularPCMMOnCoefficientAxis)
 {
-    const int degree = 2048;
+    const int degree = 4096;
     const int d = 128;
     RectFixture fx(degree, d);
 
@@ -398,7 +402,7 @@ TEST(HEonGPU, CKKS_BatchMatrix_RectangularPCMMOnCoefficientAxis)
 // pay a homomorphic transform to put its blocks back on the batch axis.
 TEST(HEonGPU, CKKS_BatchMatrix_RectangularPCMMChainsWithoutReencoding)
 {
-    const int degree = 2048;
+    const int degree = 4096;
     const int d = 128;
     RectFixture fx(degree, d);
 
