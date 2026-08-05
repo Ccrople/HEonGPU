@@ -76,6 +76,28 @@ int EnvInt(const char* name, int fallback)
     return std::atoi(v);
 }
 
+bool EnvIs(const char* name, const char* value)
+{
+    const char* v = std::getenv(name);
+    return v != nullptr && std::string(v) == value;
+}
+
+/// Free and total device memory, so a shape that does not fit says where it
+/// stopped fitting rather than dying inside the allocator.
+void ReportMemory(const char* stage)
+{
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess)
+        return;
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    std::cout << "[profile] memory after " << stage << ": "
+              << (static_cast<double>(total_bytes - free_bytes) / gib)
+              << " GiB used of "
+              << (static_cast<double>(total_bytes) / gib) << " GiB"
+              << std::endl;
+}
+
 /// Wall time of the measured region.
 ///
 /// The same reasoning as the CKKS profile target: most of the host time here is
@@ -136,6 +158,73 @@ struct Shape
     int vocab_blocks = 2;   ///< 0 leaves the embedding and the head out.
     int blocks = 1;         ///< Transformer blocks in the stack.
 };
+
+/// The published Llama-3-8B configuration, in the units this module packs in.
+///
+/// A ciphertext holds d channels of d tokens, so d is set by the head
+/// dimension -- 128, which makes one head exactly one block and RoPE a
+/// rotation inside it -- and every other width is that model dimension over
+/// d. This costs d * d = 16384 slots and therefore logN 15, which is the price
+/// of the real shape rather than a choice: at any smaller ring a head spans
+/// several blocks and the block counts below all change.
+///
+///   hidden 4096 / 128 = 32 channel blocks
+///   intermediate 14336 / 128 = 112 hidden blocks
+///   32 query heads over 8 key/value heads
+///   vocabulary 128256 / 128 = 1002 blocks at each end
+///   32 transformer blocks
+///
+/// HEONGPU_LLAMA_* still overrides any single field afterwards, which is what
+/// makes the parts of the full shape that do not fit on one card separable
+/// from the parts that do.
+constexpr int kLlama38BHidden = 4096;
+constexpr int kLlama38BIntermediate = 14336;
+constexpr int kLlama38BHeadDim = 128;
+constexpr int kLlama38BHeads = 32;
+constexpr int kLlama38BKVHeads = 8;
+constexpr int kLlama38BLayers = 32;
+constexpr int kLlama38BVocab = 128256;
+
+Shape Llama38BShape()
+{
+    Shape shape;
+    shape.d = kLlama38BHeadDim;
+    shape.channel_blocks = kLlama38BHidden / kLlama38BHeadDim;
+    shape.hidden_blocks = kLlama38BIntermediate / kLlama38BHeadDim;
+    shape.heads = kLlama38BHeads;
+    shape.kv_heads = kLlama38BKVHeads;
+    shape.token_blocks = 1;
+    shape.vocab_blocks =
+        (kLlama38BVocab + kLlama38BHeadDim - 1) / kLlama38BHeadDim;
+    shape.blocks = kLlama38BLayers;
+    return shape;
+}
+
+/// Calls of Equation (5) in one transformer block, and refreshes.
+///
+/// A projection from I input blocks to O output blocks is O * I block
+/// products, and grouped-query attention narrows the key and the value by the
+/// number of query heads sharing one of them. The stream is C blocks and each
+/// is refreshed at both of the block's two seams.
+struct BlockCost
+{
+    long long pcmm = 0;
+    long long bootstraps = 0;
+};
+
+BlockCost block_cost(const Shape& shape)
+{
+    const long long c = shape.channel_blocks;
+    const long long h = shape.hidden_blocks;
+    const long long kv = c / (shape.heads / shape.kv_heads);
+    const long long t = shape.token_blocks;
+
+    BlockCost cost;
+    // query + output, key + value, then gate + up + down.
+    cost.pcmm = (2 * c * c + 2 * kv * c + 3 * h * c) * t;
+    cost.bootstraps = 2 * c * t;
+    return cost;
+}
 
 std::vector<double> random_matrix(int d, double amplitude, std::mt19937_64& rng)
 {
@@ -237,9 +326,14 @@ block_weights(const Shape& shape, std::mt19937_64& rng)
 
 int main(int argc, char* argv[])
 {
-    Shape shape;
+    // The preset supplies the published Llama-3-8B widths as defaults; the
+    // command line still names the block count and every HEONGPU_LLAMA_* below
+    // still overrides one field of it.
+    const bool full = EnvIs("HEONGPU_LLAMA_PRESET", "8b");
+    Shape shape = full ? Llama38BShape() : Shape();
+
     shape.blocks = (argc > 1) ? std::atoi(argv[1])
-                              : EnvInt("HEONGPU_LLAMA_BLOCKS", 1);
+                              : EnvInt("HEONGPU_LLAMA_BLOCKS", shape.blocks);
     shape.d = EnvInt("HEONGPU_LLAMA_D", shape.d);
     shape.channel_blocks =
         EnvInt("HEONGPU_LLAMA_CHANNEL_BLOCKS", shape.channel_blocks);
@@ -258,8 +352,65 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    const int log_n = EnvInt("HEONGPU_LLAMA_LOGN", kDefaultLogN);
+    // A ciphertext is d by d, so the full shape sets the ring rather than the
+    // other way round: d = 128 needs 16384 slots and therefore logN 15.
+    int default_log_n = kDefaultLogN;
+    if (full)
+    {
+        default_log_n = 1;
+        while ((1 << (default_log_n - 1)) < shape.d * shape.d)
+            default_log_n++;
+    }
+    const int log_n = EnvInt("HEONGPU_LLAMA_LOGN", default_log_n);
     const int poly_modulus_degree = 1 << log_n;
+
+    // What the shape costs, before anything is allocated. A configuration that
+    // will not fit or will not finish should say so here rather than after an
+    // hour of key generation.
+    {
+        const BlockCost cost = block_cost(shape);
+        const long long vocab_pcmm =
+            2LL * shape.vocab_blocks * shape.channel_blocks * shape.token_blocks;
+        std::cout << "[profile] model: hidden=" << (shape.d * shape.channel_blocks)
+                  << " intermediate=" << (shape.d * shape.hidden_blocks)
+                  << " heads=" << shape.heads << "/" << shape.kv_heads
+                  << " head_dim=" << shape.d
+                  << " seq=" << (shape.d * shape.token_blocks)
+                  << " vocab=" << (shape.d * shape.vocab_blocks)
+                  << " layers=" << shape.blocks << std::endl;
+        // The weights are host doubles, one d by d block per call of Equation
+        // (5), and at the full width they are the first thing to run out
+        // rather than anything on the device.
+        const double block_bytes =
+            static_cast<double>(cost.pcmm / (shape.token_blocks > 0
+                                                 ? shape.token_blocks
+                                                 : 1)) *
+            shape.d * shape.d * 8.0;
+        const double vocab_bytes = 2.0 * shape.vocab_blocks *
+                                   shape.channel_blocks * shape.d * shape.d *
+                                   8.0;
+        const double gib = 1024.0 * 1024.0 * 1024.0;
+        std::cout << "[profile] host weights: "
+                  << (block_bytes * shape.blocks + vocab_bytes) / gib
+                  << " GiB (" << (block_bytes / gib) << " per block, "
+                  << (vocab_bytes / gib) << " for the two ends)" << std::endl;
+        std::cout << "[profile] per block: " << cost.pcmm << " pcmm, "
+                  << cost.bootstraps << " bootstraps ("
+                  << (cost.bootstraps > 0
+                          ? static_cast<double>(cost.pcmm) / cost.bootstraps
+                          : 0.0)
+                  << ":1); whole pass: "
+                  << (cost.pcmm * shape.blocks + vocab_pcmm) << " pcmm, "
+                  << (cost.bootstraps * shape.blocks - shape.channel_blocks *
+                                                           shape.token_blocks)
+                  << " bootstraps" << std::endl;
+    }
+
+    if (EnvInt("HEONGPU_LLAMA_DRY_RUN", 0) != 0)
+    {
+        std::cout << "[profile] dry run, nothing allocated" << std::endl;
+        return EXIT_SUCCESS;
+    }
 
     heongpu::HEContext<S> context =
         heongpu::GenHEContext<S>(heongpu::sec_level_type::none);
@@ -289,8 +440,11 @@ int main(int argc, char* argv[])
     }
     const llama::MatrixLayout layout(shape.d, slots / (shape.d * shape.d));
 
+    ReportMemory("context and encryption keys");
+
     heongpu::Relinkey<S> relin(context);
     keygen.generate_relin_key(relin, secret);
+    ReportMemory("relinearisation key");
 
     heongpu::BootstrappingConfig boot_config(kCtoSPiece, kStoCPiece, kTaylor,
                                              true);
@@ -300,6 +454,7 @@ int main(int argc, char* argv[])
     std::vector<int> boot_shifts = ops.bootstrapping_key_indexs();
     heongpu::Galoiskey<S> boot_key(context, boot_shifts);
     keygen.generate_galois_key(boot_key, secret);
+    ReportMemory("bootstrapping key");
 
     std::mt19937_64 rng(2026);
 
@@ -333,6 +488,7 @@ int main(int argc, char* argv[])
         llama::Llama3Operator::model_rotation_indices(config);
     heongpu::Galoiskey<S> galois_key(context, shifts);
     keygen.generate_galois_key(galois_key, secret);
+    ReportMemory("model rotation key");
 
     // The entry blocks: the one-hot columns when there is an embedding table,
     // and the activation itself when there is not.
@@ -372,6 +528,13 @@ int main(int argc, char* argv[])
 
     // The warm-up is a whole forward over one block, which touches every kernel
     // the measured pass will. A forward consumes its input, so it gets its own.
+    //
+    // At the full width one block is minutes rather than milliseconds and the
+    // warm-up doubles a single-block capture, so it is switchable. Turning it
+    // off puts module load and JIT inside the measured region; the ranges that
+    // pay for it are whichever ran first, so read a cold capture's first block
+    // with that in mind.
+    if (EnvInt("HEONGPU_LLAMA_WARMUP", 1) != 0)
     {
         llama::Llama3Operator::ModelConfig warm_config = config;
         warm_config.stack.blocks.resize(1);

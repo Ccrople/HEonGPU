@@ -55,6 +55,26 @@ namespace heongpu
                 ~IndexedRange() { nvtxRangePop(); }
             };
 
+            /// The same, for a step inside a helper that several primitives
+            /// share.
+            ///
+            /// The summary groups by name rather than by position in the tree,
+            /// so a helper marked with one fixed name merges every caller into
+            /// a single row and says nothing about which of them paid. The
+            /// caller's own name is therefore the prefix.
+            struct SuffixRange
+            {
+                SuffixRange(const char* prefix, const char* suffix)
+                {
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "%s.%s", prefix, suffix);
+                    nvtxRangePushA(name);
+                }
+                SuffixRange(const SuffixRange&) = delete;
+                SuffixRange& operator=(const SuffixRange&) = delete;
+                ~SuffixRange() { nvtxRangePop(); }
+            };
+
             bool is_power_of_two(int v)
             {
                 return v > 0 && (v & (v - 1)) == 0;
@@ -521,8 +541,18 @@ namespace heongpu
             Ciphertext<Scheme::CKKS>& ct, const std::vector<double>& values,
             double plain_scale, const char* context)
         {
-            Plaintext<Scheme::CKKS> plain =
-                encode(values, plain_scale, ct.depth());
+            // Deriving and encoding the mask is host work in a device
+            // pipeline, and every diagonal of every call pays it, so it is
+            // separated from the ciphertext product it feeds. This is the same
+            // cost pcmm.weight_encode exposes, in the primitives that mask
+            // rather than the one that multiplies by a weight.
+            Plaintext<Scheme::CKKS> plain = [&]
+            {
+                SuffixRange _r(context, "mask_encode");
+                return encode(values, plain_scale, ct.depth());
+            }();
+
+            SuffixRange _r(context, "mask_multiply_add");
             Ciphertext<Scheme::CKKS> term(context_);
             multiply_plain(ct, plain, term);
 
@@ -593,6 +623,8 @@ namespace heongpu
                                             "two");
             }
 
+            Range _r("sum_strided");
+
             for (int t = 1; t < count; t <<= 1)
             {
                 Ciphertext<Scheme::CKKS> shifted(context_);
@@ -616,31 +648,42 @@ namespace heongpu
                 return;
             }
 
+            Range _r_sum("sum_blocked");
+
             // Rotate-and-add gives slot p the window sum over p .. p+span-1,
             // which is the block total only where p is a multiple of span.
-            for (int s = 1; s < span; s <<= 1)
             {
-                Ciphertext<Scheme::CKKS> shifted(context_);
-                rotate_rows(ct, shifted, galois_key, s);
-                add_same_scale(ct, shifted, "sum_blocked window");
+                Range _r("sum_blocked.window");
+                for (int s = 1; s < span; s <<= 1)
+                {
+                    Ciphertext<Scheme::CKKS> shifted(context_);
+                    rotate_rows(ct, shifted, galois_key, s);
+                    add_same_scale(ct, shifted, "sum_blocked window");
+                }
             }
 
             // Keep those positions and discard the rest.
-            std::vector<double> mask(slot_count_, 0.0);
-            for (int p = 0; p < slot_count_; p += span)
             {
-                mask[p] = 1.0;
+                Range _r("sum_blocked.mask");
+                std::vector<double> mask(slot_count_, 0.0);
+                for (int p = 0; p < slot_count_; p += span)
+                {
+                    mask[p] = 1.0;
+                }
+                multiply_vector(ct, mask);
             }
-            multiply_vector(ct, mask);
 
             // Fan each surviving total across its own block. Shifting right by
             // less than span cannot cross into the next block, because every
             // other slot of the block is zero.
-            for (int s = 1; s < span; s <<= 1)
             {
-                Ciphertext<Scheme::CKKS> shifted(context_);
-                rotate_rows(ct, shifted, galois_key, -s);
-                add_same_scale(ct, shifted, "sum_blocked fan-out");
+                Range _r("sum_blocked.fan_out");
+                for (int s = 1; s < span; s <<= 1)
+                {
+                    Ciphertext<Scheme::CKKS> shifted(context_);
+                    rotate_rows(ct, shifted, galois_key, -s);
+                    add_same_scale(ct, shifted, "sum_blocked fan-out");
+                }
             }
         }
 
@@ -661,11 +704,14 @@ namespace heongpu
                 throw std::invalid_argument("Interval must satisfy a < b");
             }
 
+            Range _r_cheb("chebyshev");
+
             Ciphertext<Scheme::CKKS> t = ct;
             if (a != -1.0 || b != 1.0)
             {
                 // T_k is defined on [-1, 1], so the argument is mapped there
                 // first. This is the one level the affine map costs.
+                Range _r("chebyshev.affine_map");
                 multiply_constant(t, 2.0 / (b - a));
                 add_constant(t, -(a + b) / (b - a));
             }
@@ -697,7 +743,10 @@ namespace heongpu
             Polynomial poly(static_cast<int>(coeffs.size()) - 1, complex_coeffs,
                             true, PolyType::CHEBYSHEV, a, b);
 
-            Range _r("chebyshev");
+            // The Paterson-Stockmeyer evaluation itself: the baby-step powers
+            // of T and the giant-step recursion over them, all inside
+            // evaluate_poly, so this is where a fit's levels are actually paid.
+            Range _r("chebyshev.evaluate");
             return evaluate_poly(t, t.scale(), poly, relin_key,
                                  ExecutionOptions());
         }
@@ -724,6 +773,8 @@ namespace heongpu
                     "1/sqrt(x) needs a strictly positive lower bound");
             }
 
+            Range _r_isqrt("inverse_sqrt");
+
             Ciphertext<Scheme::CKKS> y = evaluate_function(
                 ct, [](double x) { return 1.0 / std::sqrt(x); }, lo, hi, degree,
                 relin_key);
@@ -732,6 +783,8 @@ namespace heongpu
             {
                 return y;
             }
+
+            Range _r_newton("inverse_sqrt.newton");
 
             // y <- y (3 - x y^2) / 2. Halving x once up front turns the three
             // halvings the loop would otherwise need into none, so a step
@@ -768,11 +821,14 @@ namespace heongpu
                     "1/x needs a strictly positive lower bound");
             }
 
+            Range _r_inv("inverse");
+
             Ciphertext<Scheme::CKKS> y = evaluate_function(
                 ct, [](double x) { return 1.0 / x; }, lo, hi, degree,
                 relin_key);
 
             // y <- y (2 - x y), two levels a step.
+            Range _r_newton("inverse.newton");
             for (int iteration = 0; iteration < newton_iterations; iteration++)
             {
                 Ciphertext<Scheme::CKKS> x = ct;
@@ -792,6 +848,7 @@ namespace heongpu
         Llama3Operator::silu(Ciphertext<Scheme::CKKS>& ct, double bound,
                              int degree, Relinkey<Scheme::CKKS>& relin_key)
         {
+            Range _r("silu");
             return evaluate_function(
                 ct, [](double x) { return x / (1.0 + std::exp(-x)); }, -bound,
                 bound, degree, relin_key);
@@ -810,6 +867,8 @@ namespace heongpu
                 throw std::invalid_argument(
                     "Squaring count must not be negative");
             }
+
+            Range _r("exp_scaled");
 
             // Approximating exp(x / 2^k) rather than exp(x) folds the scaling
             // step of the SoftMax algorithm into the fit, so it is free.
@@ -1144,9 +1203,22 @@ namespace heongpu
                     "RoPE needs the cosine and sine plaintexts at one scale");
             }
 
-            Ciphertext<Scheme::CKKS> swapped(context_);
-            rotate_rows(ct, swapped, galois_key, swap_shift);
+            Range _r_rope("rope");
 
+            // The rotation that brings channel c + head_dim/2 alongside c, so
+            // the pair the rotation acts on sits in one ciphertext. A head one
+            // block wide pays this; a wider one chooses two blocks instead and
+            // never gets here.
+            Ciphertext<Scheme::CKKS> swapped(context_);
+            {
+                Range _r("rope.swap_rotation");
+                rotate_rows(ct, swapped, galois_key, swap_shift);
+            }
+
+            // x cos(theta) + swap(x) sin(theta), both plaintext products, so
+            // the whole rotation costs one level and no key switch beyond the
+            // swap above.
+            Range _r("rope.plain_multiply");
             Ciphertext<Scheme::CKKS> direct = ct;
             multiply_plaintext(direct, cos_plain);
             rescale_inplace(direct);
@@ -1442,6 +1514,9 @@ namespace heongpu
                 }
                 else
                 {
+                    // The automorphism, and the only key switch tau performs:
+                    // one per row rotation, d - 1 of them per call.
+                    Range _r("tau.automorphism");
                     rotate_rows(ct, source, galois_key, u * row);
                 }
 
@@ -1507,6 +1582,9 @@ namespace heongpu
                 }
                 else
                 {
+                    // One key switch per diagonal, 2(d - 1) per call, which is
+                    // why a transpose costs about twice a tau.
+                    Range _r("transpose.automorphism");
                     rotate_rows(ct, source, galois_key, s * step);
                 }
 
@@ -1627,7 +1705,7 @@ namespace heongpu
                         }
                         accumulate_masked(left, left_started, diagonal[t],
                                           masks[t], plain_scale,
-                                          "ccmm left operand");
+                                          "ccmm.left");
                     }
                     rescale_inplace(left);
                 }

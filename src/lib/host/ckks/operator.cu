@@ -8,8 +8,46 @@
 #include <heongpu/host/ckks/operator.cuh>
 #include <heongpu/host/ckks/cosine_approx.cuh>
 
+#include <nvtx3/nvToolsExt.h>
+
 namespace heongpu
 {
+    namespace
+    {
+        /// Scoped NVTX range for the bootstrapping stages.
+        ///
+        /// A bootstrap is a third of a Llama-3 forward pass and it appears in a
+        /// capture as one opaque range, which says nothing about whether the
+        /// linear transforms or the sine evaluation is the cost. The four
+        /// stages of the algorithm are marked here so the summary splits it.
+        struct BootRange
+        {
+            explicit BootRange(const char* name) { nvtxRangePushA(name); }
+            BootRange(const BootRange&) = delete;
+            BootRange& operator=(const BootRange&) = delete;
+
+            /// End the range before its scope does.
+            ///
+            /// The push/pop stack is per thread, so this is only correct while
+            /// nothing pushed after it is still open -- which is why the
+            /// callers below close a stage only once its own sub-ranges have
+            /// left scope.
+            void close()
+            {
+                if (open_)
+                {
+                    nvtxRangePop();
+                    open_ = false;
+                }
+            }
+
+            ~BootRange() { close(); }
+
+          private:
+            bool open_ = true;
+        };
+    } // namespace
+
     __host__
     HEOperator<Scheme::CKKS>::HEOperator(HEContext<Scheme::CKKS> context,
                                          HEEncoder<Scheme::CKKS>& encoder)
@@ -7042,81 +7080,121 @@ namespace heongpu
             .stream = options.stream_};
 
         DeviceVector<Data64> input_intt_poly(2 * context_->n, options.stream_);
-        input_storage_manager(
-            input1,
-            [&](Ciphertext<Scheme::CKKS>& input1_)
-            {
-                gpuntt::GPU_INTT(input1.data(), input_intt_poly.data(),
-                                 context_->intt_table_->data(),
-                                 context_->modulus_->data(), cfg_intt, 2, 1);
-            },
-            options, false);
-
         Ciphertext<Scheme::CKKS> c_raised =
             operator_ciphertext(scale_boot_, options_inner.stream_);
-        mod_raise_kernel<<<dim3((context_->n >> 8), context_->Q_size, 2), 256,
-                           0, options_inner.stream_>>>(
-            input_intt_poly.data(), c_raised.data(), context_->modulus_->data(),
-            context_->n_power);
-        HEONGPU_CUDA_CHECK(cudaGetLastError());
 
-        gpuntt::GPU_NTT_Inplace(c_raised.data(), context_->ntt_table_->data(),
-                                context_->modulus_->data(), cfg_ntt,
-                                2 * context_->Q_size, context_->Q_size);
-        c_raised.encoding_ = encoding::COEFFICIENT;
+        // Stage 1, ModRaise: the ciphertext goes back to the coefficient
+        // domain, is reinterpreted modulo the whole chain, and returns. Two
+        // transforms and one elementwise kernel, so it is the cheap stage and
+        // marking it is what shows that.
+        {
+            BootRange _r("boot.mod_raise");
+            input_storage_manager(
+                input1,
+                [&](Ciphertext<Scheme::CKKS>& input1_)
+                {
+                    gpuntt::GPU_INTT(input1.data(), input_intt_poly.data(),
+                                     context_->intt_table_->data(),
+                                     context_->modulus_->data(), cfg_intt, 2,
+                                     1);
+                },
+                options, false);
 
-        // Coeff to slot
-        std::vector<heongpu::Ciphertext<Scheme::CKKS>> enc_results =
-            coeff_to_slot(c_raised, galois_key, options_inner); // c_raised
+            mod_raise_kernel<<<dim3((context_->n >> 8), context_->Q_size, 2),
+                               256, 0, options_inner.stream_>>>(
+                input_intt_poly.data(), c_raised.data(),
+                context_->modulus_->data(), context_->n_power);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+            gpuntt::GPU_NTT_Inplace(
+                c_raised.data(), context_->ntt_table_->data(),
+                context_->modulus_->data(), cfg_ntt, 2 * context_->Q_size,
+                context_->Q_size);
+            c_raised.encoding_ = encoding::COEFFICIENT;
+        }
+
+        // Stage 2, CoeffToSlot: the homomorphic DFT. A linear transform over
+        // the slots, so its cost is rotations and key switches rather than
+        // multiplicative depth.
+        std::vector<heongpu::Ciphertext<Scheme::CKKS>> enc_results;
+        {
+            BootRange _r("boot.coeff_to_slot");
+            enc_results =
+                coeff_to_slot(c_raised, galois_key, options_inner); // c_raised
+        }
+
+        // Stage 3, EvalMod: the sine that approximates the modular reduction.
+        // This is the deep one -- a polynomial of the configured Taylor degree
+        // on both halves -- so it is where the levels go even when the linear
+        // transforms are where the time goes.
+        BootRange _r_evalmod("boot.eval_mod");
 
         // Exponentiate
         Ciphertext<Scheme::CKKS> ciph_neg_exp0 =
             operator_ciphertext(0, options_inner.stream_);
-        Ciphertext<Scheme::CKKS> ciph_exp0 =
-            exp_scaled(enc_results[0], relin_key, options_inner);
-
+        Ciphertext<Scheme::CKKS> ciph_exp0;
         Ciphertext<Scheme::CKKS> ciph_neg_exp1 =
             operator_ciphertext(0, options_inner.stream_);
-        Ciphertext<Scheme::CKKS> ciph_exp1 =
-            exp_scaled(enc_results[1], relin_key, options_inner);
+        Ciphertext<Scheme::CKKS> ciph_exp1;
+        {
+            BootRange _r("boot.eval_mod.exp");
+            ciph_exp0 = exp_scaled(enc_results[0], relin_key, options_inner);
+            ciph_exp1 = exp_scaled(enc_results[1], relin_key, options_inner);
+        }
 
         // Compute sine
         Ciphertext<Scheme::CKKS> ciph_sin0 =
             operator_ciphertext(0, options_inner.stream_);
-        conjugate(ciph_exp0, ciph_neg_exp0, galois_key,
-                  options_inner); // conjugate
-        sub(ciph_exp0, ciph_neg_exp0, ciph_sin0, options_inner);
-
         Ciphertext<Scheme::CKKS> ciph_sin1 =
             operator_ciphertext(0, options_inner.stream_);
-        conjugate(ciph_exp1, ciph_neg_exp1, galois_key,
-                  options_inner); // conjugate
-        sub(ciph_exp1, ciph_neg_exp1, ciph_sin1, options_inner);
+        {
+            // sin(x) = (e^{ix} - e^{-ix}) / 2i, and the conjugate is a Galois
+            // automorphism, so this pair of key switches is the whole cost.
+            BootRange _r("boot.eval_mod.conjugate");
+            conjugate(ciph_exp0, ciph_neg_exp0, galois_key,
+                      options_inner); // conjugate
+            sub(ciph_exp0, ciph_neg_exp0, ciph_sin0, options_inner);
+
+            conjugate(ciph_exp1, ciph_neg_exp1, galois_key,
+                      options_inner); // conjugate
+            sub(ciph_exp1, ciph_neg_exp1, ciph_sin1, options_inner);
+        }
 
         // Scale
-        current_decomp_count = context_->Q_size - ciph_sin0.depth_;
-        cipherplain_multiplication_kernel<<<dim3((context_->n >> 8),
-                                                 current_decomp_count, 2),
-                                            256, 0, options_inner.stream_>>>(
-            ciph_sin0.data(), encoded_complex_minus_iscale_.data(),
-            ciph_sin0.data(), context_->modulus_->data(), context_->n_power);
-        ciph_sin0.scale_ = ciph_sin0.scale_ * scale_boot_;
-        HEONGPU_CUDA_CHECK(cudaGetLastError());
-        ciph_sin0.rescale_required_ = true;
-        rescale_inplace(ciph_sin0, options_inner);
+        {
+            BootRange _r("boot.eval_mod.scale");
+            current_decomp_count = context_->Q_size - ciph_sin0.depth_;
+            cipherplain_multiplication_kernel<<<
+                dim3((context_->n >> 8), current_decomp_count, 2), 256, 0,
+                options_inner.stream_>>>(
+                ciph_sin0.data(), encoded_complex_minus_iscale_.data(),
+                ciph_sin0.data(), context_->modulus_->data(),
+                context_->n_power);
+            ciph_sin0.scale_ = ciph_sin0.scale_ * scale_boot_;
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+            ciph_sin0.rescale_required_ = true;
+            rescale_inplace(ciph_sin0, options_inner);
 
-        current_decomp_count = context_->Q_size - ciph_sin1.depth_;
-        cipherplain_multiplication_kernel<<<dim3((context_->n >> 8),
-                                                 current_decomp_count, 2),
-                                            256, 0, options_inner.stream_>>>(
-            ciph_sin1.data(), encoded_complex_minus_iscale_.data(),
-            ciph_sin1.data(), context_->modulus_->data(), context_->n_power);
-        ciph_sin1.scale_ = ciph_sin1.scale_ * scale_boot_;
-        HEONGPU_CUDA_CHECK(cudaGetLastError());
-        ciph_sin1.rescale_required_ = true;
-        rescale_inplace(ciph_sin1, options_inner);
+            current_decomp_count = context_->Q_size - ciph_sin1.depth_;
+            cipherplain_multiplication_kernel<<<
+                dim3((context_->n >> 8), current_decomp_count, 2), 256, 0,
+                options_inner.stream_>>>(
+                ciph_sin1.data(), encoded_complex_minus_iscale_.data(),
+                ciph_sin1.data(), context_->modulus_->data(),
+                context_->n_power);
+            ciph_sin1.scale_ = ciph_sin1.scale_ * scale_boot_;
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+            ciph_sin1.rescale_required_ = true;
+            rescale_inplace(ciph_sin1, options_inner);
+        }
 
-        // Slot to coeff
+        // The sine is finished, so EvalMod ends here and the second linear
+        // transform is its own stage.
+        _r_evalmod.close();
+
+        // Stage 4, SlotToCoeff: the inverse homomorphic DFT, the mirror of
+        // stage 2 and the other half of the linear-transform cost.
+        BootRange _r_stoc("boot.slot_to_coeff");
         Ciphertext<Scheme::CKKS> StoC_results =
             slot_to_coeff(ciph_sin0, ciph_sin1, galois_key, options_inner);
         StoC_results.scale_ = scale_boot_;
