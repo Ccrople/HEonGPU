@@ -362,27 +362,40 @@ int main(int argc, char* argv[])
 
     using Axis = heongpu::HEBatchMatrixOperator<S>::BlockAxis;
 
-    // The stream. On Algorithm 5 it is d ciphertexts per group of N/2
-    // channels; on Algorithm 1 it is one ciphertext per channel, and the width
-    // is capped at what the card holds -- the point of the comparison is the
-    // cost of a projection, so the Algorithm 1 side streams its output away
-    // rather than accumulating a width that does not fit.
-    const int stream_groups = groups(shape.channels);
+    // The operand pool, built once and outside the measured region.
+    //
+    // Both algorithms contract over the input channels, so both need an
+    // operand as wide as the widest projection's in_channels -- and that is
+    // exactly where they differ. Algorithm 5 spends d ciphertexts per group of
+    // N/2 channels; Algorithm 1 spends one per channel, k/2 times as many. The
+    // pool is sized from the widest projection so that no projection is
+    // measured against an operand narrower than its own contraction, which
+    // would understate its GEMM by the ratio.
+    int widest_in = 0;
+    for (const Projection& p : projs)
+        widest_in = std::max(widest_in, p.in_channels);
+
+    const int pool_groups = groups(widest_in);
     std::vector<std::vector<heongpu::Ciphertext<S>>> stream;
     if (algorithm == 5)
     {
-        for (int g = 0; g < stream_groups; ++g)
+        for (int g = 0; g < pool_groups; ++g)
             stream.push_back(encrypt_group(
                 stream_coefficients(d, half, k, scale, rng), d));
     }
     else
     {
-        // One d x d matrix encryption standing in for d channels, reused as
-        // the operand of every column block: Algorithm 1's cost depends on the
-        // shape of the operand and not on which channels it holds.
-        stream.push_back(
-            encrypt_group(stream_coefficients(d, half, k, scale, rng), d));
+        // Algorithm 1's operand is one matrix encryption per d channels; the
+        // pool is the whole width, in d-sized pieces, and a projection takes
+        // the leading in_channels/d of them.
+        for (int base = 0; base < widest_in; base += d)
+            stream.push_back(
+                encrypt_group(stream_coefficients(d, half, k, scale, rng), d));
     }
+    std::cout << "[nobatch] operand pool   : " << widest_in
+              << " channels in "
+              << (algorithm == 5 ? pool_groups * d : widest_in)
+              << " ciphertexts" << std::endl;
     ReportMemory("stream");
 
     // Warm up: the first call of each kind builds twiddle tables and pays a
@@ -440,7 +453,7 @@ int main(int argc, char* argv[])
             for (int gi = 0; gi < gin; ++gi)
             {
                 std::vector<heongpu::Ciphertext<S>*> in;
-                for (auto& c : stream[std::min(gi, stream_groups - 1)])
+                for (auto& c : stream[gi])
                     in.push_back(&c);
                 for (int go = 0; go < gout; ++go)
                 {
@@ -459,10 +472,12 @@ int main(int argc, char* argv[])
             // Algorithm 1 streams the output axis in column blocks of d, which
             // is what project() does and what keeps the twiddled plaintext to
             // a sane size. The contraction is over in_channels, so the operand
-            // count is the in_channels and the loop is over the output.
+            // is the leading in_channels ciphertexts of the pool and the loop
+            // is over the output.
             std::vector<heongpu::Ciphertext<S>*> in;
-            for (auto& c : stream.front())
-                in.push_back(&c);
+            for (int base = 0; base < p.in_channels; base += d)
+                for (auto& c : stream[base / d])
+                    in.push_back(&c);
             const int inner = static_cast<int>(in.size());
             std::uniform_real_distribution<double> pick(-1.0, 1.0);
             for (int base = 0; base < p.out_channels; base += d)
