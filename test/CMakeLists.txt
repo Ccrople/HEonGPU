@@ -40,6 +40,7 @@ set(EXECUTABLES
     ckks_batchmatrix_gpu_testcases test_ckks_batchmatrix_gpu.cpp
     ckks_batchmatrix_sweep_testcases test_ckks_batchmatrix_sweep.cpp
     ckks_llama3_testcases test_ckks_llama3.cpp
+    ckks_llama3_batch_testcases test_ckks_llama3_batch.cpp
 
     tfhe_gate_boot_testcases test_tfhe_gate_boot.cpp
 )
