@@ -1305,9 +1305,16 @@ namespace heongpu
         BmRange _r_rect("RectangularPCMM");
 
         // Step 1: the k/2 block products, in one batch PCMM.
+        //
+        // The rescale is deliberately NOT marked here even when the caller
+        // asked for one. rotate_rows refuses a ciphertext carrying an unspent
+        // rescale, and the summation below is nothing but rotations, so
+        // marking it now would make step 3 throw. The mark goes on at the end
+        // instead, which changes no arithmetic: key switching is scale
+        // agnostic, and the product sits at in_scale * plain_scale either way.
         {
             BmRange _r("RectangularPCMM.blocks");
-            pcmm(out, in, rescale);
+            pcmm(out, in, /*rescale=*/false);
         }
 
         // Lemma 1: the constant term of an R_k element is (2/k) times the sum
@@ -1342,6 +1349,12 @@ namespace heongpu
 
             cmt(out, galois_key, ops);
         }
+
+        // Step 2 of Algorithm 1, deferred to here: the result carries the
+        // plaintext scaling factor and the caller's rescale removes exactly
+        // that.
+        for (auto& c : out)
+            c.rescale_required_ = rescale;
     }
 
     std::vector<Data64*>
