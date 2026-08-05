@@ -79,7 +79,9 @@ namespace
             ops = std::make_unique<heongpu::HEArithmeticOperator<S>>(context,
                                                                     *encoder);
 
-            const std::vector<int> rot =
+            // Not const: Galoiskey takes its index list by non-const
+            // reference, which it uses to canonicalise the list in place.
+            std::vector<int> rot =
                 heongpu::get_rectangular_rotation_indices(layout);
             galois = std::make_unique<heongpu::Galoiskey<S>>(context, rot);
             keygen->generate_galois_key(*galois, *secret);
