@@ -389,7 +389,13 @@ namespace heongpu
             }
 
             const int nslots = batch_encoder_.slots();
-            const double plain_scale = default_scale_;
+            // The weight is encoded at the prime the rescale that follows will
+            // divide by, so the product comes back at exactly the activation's
+            // own scale one level down. Encoding it at the nominal scale
+            // instead leaves the result at x_scale * plain_scale / prime, which
+            // is not a scale anything downstream expects and reads as garbage
+            // rather than as a mismatch.
+            const double plain_scale = rescale_prime(x.column.front());
 
             BatchActivation out;
             out.rows = x.rows;

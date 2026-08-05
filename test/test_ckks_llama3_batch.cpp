@@ -32,7 +32,11 @@ namespace
         heongpu::HEContext<S> context =
             heongpu::GenHEContext<S>(heongpu::sec_level_type::none);
         heongpu::BatchMatrixLayout layout;
-        double scale = std::pow(2.0, 30);
+        // 55-bit primes at scale 2^35. The weight is encoded at the rescale
+        // prime, so its integer coefficients reach about 2^55, which is
+        // comfortably inside int64; 60-bit primes would leave the encoder's
+        // llround within a factor of eight of overflowing.
+        double scale = std::pow(2.0, 35);
 
         std::unique_ptr<heongpu::HEKeyGenerator<S>> keygen;
         std::unique_ptr<heongpu::Secretkey<S>> secret;
@@ -46,7 +50,7 @@ namespace
         Fixture()
         {
             context->set_poly_modulus_degree(degree);
-            context->set_coeff_modulus_bit_sizes({50, 50, 50}, {50});
+            context->set_coeff_modulus_bit_sizes({55, 55, 55}, {55});
             context->generate();
 
             layout = heongpu::BatchMatrixLayout(static_cast<int>(degree), d);
