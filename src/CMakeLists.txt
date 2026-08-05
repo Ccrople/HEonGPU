@@ -183,6 +183,7 @@ set(HEONGPU_HOST_CKKS_SOURCES
     lib/host/ckks/evaluationkey.cu
     lib/host/ckks/keygenerator.cu
     lib/host/ckks/llama3.cu
+    lib/host/ckks/llama3_batch.cu
     lib/host/ckks/mpcmanager.cu
     lib/host/ckks/operator.cu
     lib/host/ckks/plaintext.cu
