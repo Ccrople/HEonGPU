@@ -90,7 +90,9 @@
 #include <heongpu/host/ckks/batchmatrix.cuh>
 #include <heongpu/host/ckks/context.cuh>
 #include <heongpu/host/ckks/ciphertext.cuh>
+#include <heongpu/host/ckks/decryptor.cuh>
 #include <heongpu/host/ckks/encoder.cuh>
+#include <heongpu/host/ckks/encryptor.cuh>
 #include <heongpu/host/ckks/evaluationkey.cuh>
 #include <heongpu/host/ckks/llama3.cuh>
 #include <heongpu/host/ckks/operator.cuh>
