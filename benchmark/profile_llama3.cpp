@@ -142,8 +142,16 @@ constexpr int kDefaultLogN = 12;
 constexpr int kLimbs = 60;
 /// Special primes, which set the key-switching decomposition: the chain is cut
 /// into ceil(limbs / this) groups and a rotation key holds two polynomials per
-/// group at every prime. See the key-size arithmetic in main().
-constexpr int kSpecialPrimes = 3;
+/// group at every prime, so a key is
+///
+///   2 * ceil(Q / P) * (Q + P) * N * 8 bytes
+///
+/// and adding special primes makes keys *smaller*, not larger -- the group
+/// count falls faster than the prime count rises. That is the only lever on
+/// key memory that leaves the model alone, which is what makes it an
+/// environment variable here: the full shape's keys are the reason it does not
+/// fit, and this is what decides how much of it does.
+constexpr int kDefaultSpecialPrimes = 3;
 constexpr int kPrimeBits = 50;
 constexpr int kLogScale = 50;
 constexpr int kCtoSPiece = 3;
@@ -373,6 +381,8 @@ int main(int argc, char* argv[])
     }
     const int log_n = EnvInt("HEONGPU_LLAMA_LOGN", default_log_n);
     const int poly_modulus_degree = 1 << log_n;
+    const int special_primes =
+        EnvInt("HEONGPU_LLAMA_SPECIAL_PRIMES", kDefaultSpecialPrimes);
 
     // What the shape costs, before anything is allocated. A configuration that
     // will not fit or will not finish should say so here rather than after an
@@ -443,8 +453,9 @@ int main(int argc, char* argv[])
 
             const std::size_t count =
                 llama::Llama3Operator::model_rotation_indices(probe).size();
-            const int groups = (kLimbs + kSpecialPrimes - 1) / kSpecialPrimes;
-            const double key_bytes = 2.0 * groups * (kLimbs + kSpecialPrimes) *
+            const int groups =
+                (kLimbs + special_primes - 1) / special_primes;
+            const double key_bytes = 2.0 * groups * (kLimbs + special_primes) *
                                      poly_modulus_degree * 8.0;
             const double gib = 1024.0 * 1024.0 * 1024.0;
             std::cout << "[profile] rotation keys: " << count << " indices at "
@@ -464,8 +475,9 @@ int main(int argc, char* argv[])
         heongpu::GenHEContext<S>(heongpu::sec_level_type::none);
     std::vector<int> logq{60};
     logq.insert(logq.end(), kLimbs - 1, kPrimeBits);
+    std::vector<int> logp(special_primes, 60);
     context->set_poly_modulus_degree(poly_modulus_degree);
-    context->set_coeff_modulus_bit_sizes(logq, {60, 60, 60});
+    context->set_coeff_modulus_bit_sizes(logq, logp);
     context->generate();
 
     const double scale = std::pow(2.0, kLogScale);
@@ -500,6 +512,16 @@ int main(int argc, char* argv[])
         scale, boot_config,
         heongpu::arithmetic_bootstrapping_type::REGULAR_BOOTSTRAPPING);
     std::vector<int> boot_shifts = ops.bootstrapping_key_indexs();
+    {
+        const int groups = (kLimbs + special_primes - 1) / special_primes;
+        const double key_bytes = 2.0 * groups * (kLimbs + special_primes) *
+                                 poly_modulus_degree * 8.0;
+        std::cout << "[profile] bootstrapping key: " << boot_shifts.size()
+                  << " indices = "
+                  << (boot_shifts.size() * key_bytes /
+                      (1024.0 * 1024.0 * 1024.0))
+                  << " GiB" << std::endl;
+    }
     heongpu::Galoiskey<S> boot_key(context, boot_shifts);
     keygen.generate_galois_key(boot_key, secret);
     ReportMemory("bootstrapping key");
