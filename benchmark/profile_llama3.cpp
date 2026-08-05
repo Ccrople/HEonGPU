@@ -161,6 +161,10 @@ struct Shape
     int token_blocks = 1;   ///< Sequence length = token_blocks * d.
     int vocab_blocks = 2;   ///< 0 leaves the embedding and the head out.
     int blocks = 1;         ///< Transformer blocks in the stack.
+    /// RoPE on Q and K. A real Llama-3 block has it and it costs a level, so
+    /// the full preset turns it on; the older shape leaves it off, which is
+    /// what the captures already taken were measured without.
+    bool rope = false;
 };
 
 /// The published Llama-3-8B configuration, in the units this module packs in.
@@ -201,6 +205,7 @@ Shape Llama38BShape()
     shape.vocab_blocks =
         (kLlama38BVocab + kLlama38BHeadDim - 1) / kLlama38BHeadDim;
     shape.blocks = kLlama38BLayers;
+    shape.rope = true;
     return shape;
 }
 
@@ -280,7 +285,7 @@ block_config(const Shape& shape, const llama::MatrixLayout& layout)
     config.attention.kv_heads = shape.kv_heads;
     config.attention.token_blocks = shape.token_blocks;
     config.attention.causal = true;
-    config.attention.rope = false;
+    config.attention.rope = shape.rope;
     config.attention.score_shift = 0.0;
     config.attention.softmax.bound = 2.0;
     config.attention.softmax.iterations = 1;
@@ -349,6 +354,7 @@ int main(int argc, char* argv[])
         EnvInt("HEONGPU_LLAMA_TOKEN_BLOCKS", shape.token_blocks);
     shape.vocab_blocks =
         EnvInt("HEONGPU_LLAMA_VOCAB_BLOCKS", shape.vocab_blocks);
+    shape.rope = EnvInt("HEONGPU_LLAMA_ROPE", shape.rope ? 1 : 0) != 0;
 
     if (shape.blocks < 1)
     {
@@ -514,9 +520,45 @@ int main(int argc, char* argv[])
         EnvInt("HEONGPU_LLAMA_FINAL_NEWTON", 0);
     config.bootstrap_before_head = EnvInt("HEONGPU_LLAMA_BOOT_HEAD", 0) != 0;
 
+    // RoPE wants a cosine and a sine plaintext for each channel block of a
+    // head, in each token block; the channel part of the angle is shared
+    // between heads, which is why one head's pair serves them all. The values
+    // are nominal for the reason at the top of the file -- a plaintext product
+    // costs the same whatever is in the plaintext -- but they are a genuine
+    // cosine and sine so nothing about the scale is unusual.
+    std::vector<heongpu::Plaintext<S>> rope_plain;
+    if (shape.rope)
+    {
+        const int per_head = shape.channel_blocks / shape.heads;
+        const int pairs = per_head * shape.token_blocks;
+        for (int p = 0; p < pairs; p++)
+        {
+            std::vector<double> cos_values(slots);
+            std::vector<double> sin_values(slots);
+            for (int i = 0; i < slots; i++)
+            {
+                const double theta =
+                    static_cast<double>(i % shape.d) /
+                    std::pow(10000.0, 2.0 * (p + 1) / (2.0 * shape.d));
+                cos_values[i] = std::cos(theta);
+                sin_values[i] = std::sin(theta);
+            }
+            rope_plain.emplace_back(context);
+            encoder.encode(rope_plain.back(), cos_values, scale);
+            rope_plain.emplace_back(context);
+            encoder.encode(rope_plain.back(), sin_values, scale);
+        }
+        std::cout << "[profile] rope: " << rope_plain.size()
+                  << " plaintexts, " << per_head << " block(s) per head"
+                  << std::endl;
+    }
+
     llama::Llama3Operator::ModelWeights weights;
     for (int b = 0; b < shape.blocks; b++)
+    {
         weights.blocks.push_back(block_weights(shape, rng));
+        weights.blocks.back().rope = rope_plain;
+    }
     if (shape.vocab_blocks > 0)
     {
         const double amplitude = 1.0 / std::sqrt(static_cast<double>(shape.d));
