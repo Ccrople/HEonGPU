@@ -313,9 +313,12 @@ int main(int argc, char* argv[])
         const double ct = CiphertextBytes(poly_modulus_degree, limbs);
         const double key = SwitchingKeyBytes(poly_modulus_degree, limbs,
                                              special);
-        // The bridge and the CMT share one list: the d - 1 multiples of k/2
-        // and their negatives. It does not grow with the width of the model.
-        const long long key_count = 2LL * (shape.d - 1);
+        // The bridge and the CMT share one list: the d - 1 non-zero multiples
+        // of k/2. A rotation by -delta*(k/2) is the rotation by
+        // (d - delta)*(k/2), because the slot index wraps at d*(k/2) = N/2, so
+        // the negatives are already in the list and it is d - 1 long rather
+        // than twice that. It does not grow with the width of the model.
+        const long long key_count = shape.d - 1;
 
         const double host_weights =
             (2.0 * shape.in_channels *
