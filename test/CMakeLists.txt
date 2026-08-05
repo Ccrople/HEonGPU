@@ -39,6 +39,7 @@ set(EXECUTABLES
     ckks_ntt_ordering_testcases test_ckks_ntt_ordering.cpp
     ckks_batchmatrix_gpu_testcases test_ckks_batchmatrix_gpu.cpp
     ckks_batchmatrix_sweep_testcases test_ckks_batchmatrix_sweep.cpp
+    ckks_batchmatrix_rect_testcases test_ckks_batchmatrix_rect.cpp
     ckks_llama3_testcases test_ckks_llama3.cpp
     ckks_llama3_batch_testcases test_ckks_llama3_batch.cpp
 

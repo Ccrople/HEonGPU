@@ -372,9 +372,23 @@ namespace heongpu
         return res;
     }
 
+    std::vector<int>
+    get_rectangular_rotation_indices(const BatchMatrixLayout& layout)
+    {
+        std::vector<int> res = get_batch_cmt_rotation_indices(layout);
+        const BatchMatrixLayout half(layout.N, layout.N / 2);
+        const std::vector<int> other = get_batch_cmt_rotation_indices(half);
+        res.insert(res.end(), other.begin(), other.end());
+        std::sort(res.begin(), res.end());
+        res.erase(std::unique(res.begin(), res.end()), res.end());
+        return res;
+    }
+
     // -----------------------------------------------------------------------
     // Batch matrix operator
     // -----------------------------------------------------------------------
+
+    HEBatchMatrixOperator<Scheme::CKKS>::~HEBatchMatrixOperator() = default;
 
     HEBatchMatrixOperator<Scheme::CKKS>::HEBatchMatrixOperator(
         HEContext<Scheme::CKKS>& context, const BatchMatrixLayout& layout)
@@ -1221,6 +1235,112 @@ namespace heongpu
         {
             out[j].scale_ = in[0]->scale_ * plain_scale_;
             out[j].rescale_required_ = rescale;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Rectangular matrix multiplication (Algorithm 5)
+    // -----------------------------------------------------------------------
+
+    HEBatchMatrixOperator<Scheme::CKKS>&
+    HEBatchMatrixOperator<Scheme::CKKS>::half_operator()
+    {
+        if (!half_)
+        {
+            half_.reset(new HEBatchMatrixOperator<Scheme::CKKS>(
+                context_, BatchMatrixLayout(n_, n_ / 2)));
+        }
+        return *half_;
+    }
+
+    void HEBatchMatrixOperator<Scheme::CKKS>::mult_int_scalar_batch(
+        std::vector<Ciphertext<Scheme::CKKS>>& ct, uint64_t value)
+    {
+        if (ct.empty() || value == 1)
+            return;
+
+        const BatchSubringTables& t = tables_for(ct[0].depth_);
+
+        // A plain integer is the constant polynomial, so this is exact in the
+        // NTT domain and costs neither a level nor a rescale.
+        const std::vector<Modulus64> all = context_->get_key_modulus();
+        std::vector<Data64> scalar(t.num_limbs);
+        for (int l = 0; l < t.num_limbs; ++l)
+            scalar[l] = value % all[l].value;
+        DeviceVector<Data64> dscalar(scalar);
+
+        std::vector<Data64*> base(ct.size());
+        for (size_t j = 0; j < ct.size(); ++j)
+            base[j] = ct[j].data();
+        DeviceVector<Data64*> dp(base);
+
+        const int threads = 256;
+        const dim3 grid(static_cast<unsigned>((n_ + threads - 1) / threads),
+                        static_cast<unsigned>(t.num_limbs),
+                        static_cast<unsigned>(ct.size()));
+        bm_mult_scalar_batch_kernel<<<grid, threads>>>(
+            dp.data(), dscalar.data(), t.modulus.data(), context_->n_power,
+            t.num_limbs);
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+        HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    void HEBatchMatrixOperator<Scheme::CKKS>::rectangular_pcmm(
+        std::vector<Ciphertext<Scheme::CKKS>>& out,
+        const std::vector<Ciphertext<Scheme::CKKS>*>& in,
+        Galoiskey<Scheme::CKKS>& galois_key,
+        HEArithmeticOperator<Scheme::CKKS>& ops, BlockAxis axis, bool rescale)
+    {
+        const int d = layout_.d;
+        const int k = layout_.k;
+        const int half = n_ / 2;
+
+        if (static_cast<int>(in.size()) != d)
+            throw std::invalid_argument(
+                "rectangular_pcmm expects exactly d ciphertexts");
+        if (plain_rows_ != d || plain_cols_ != half)
+            throw std::invalid_argument(
+                "rectangular_pcmm expects a d x (N/2) plaintext matrix");
+
+        BmRange _r_rect("RectangularPCMM");
+
+        // Step 1: the k/2 block products, in one batch PCMM.
+        {
+            BmRange _r("RectangularPCMM.blocks");
+            pcmm(out, in, rescale);
+        }
+
+        // Lemma 1: the constant term of an R_k element is (2/k) times the sum
+        // over its k/2 evaluation points. When the block index rides on the
+        // batch axis the sum over blocks is what step 3 has to produce, so the
+        // product is scaled to carry the sum rather than the mean. When it
+        // rides on the Y axis the constant term is ALREADY the contraction
+        // over blocks and scaling it would be wrong, not merely wasteful.
+        if (axis == BlockAxis::slot)
+        {
+            BmRange _r("RectangularPCMM.lemma1_scale");
+            mult_int_scalar_batch(out, static_cast<uint64_t>(k / 2));
+        }
+
+        // Steps 2 and 3, the summation with encoding conversion of Theorem 3.
+        //
+        // The constant terms sit at coefficients 0..d-1 of each of the N/2
+        // intermediate columns, and they have to end up at coefficient
+        // i + d*t of column j, where the intermediate column was t*d + j.
+        // Reading the same N coefficients as a batch matrix at k = 2 makes
+        // that gather a transpose: a CMT at (N, N/2) moves the constant terms
+        // into the LEADING d ciphertexts, the rest are dropped outright, and a
+        // CMT at the caller's own layout restores the column-wise encryption.
+        {
+            BmRange _r("RectangularPCMM.summation");
+            half_operator().cmt(out, galois_key, ops);
+
+            // pop_back rather than resize: Ciphertext has no default
+            // constructor, so resize would not compile against the shrink.
+            while (static_cast<int>(out.size()) > d)
+                out.pop_back();
+
+            cmt(out, galois_key, ops);
         }
     }
 

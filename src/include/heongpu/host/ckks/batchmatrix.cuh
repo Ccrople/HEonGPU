@@ -7,8 +7,8 @@
 //
 // Implements Definition 1 (batch matrix encoding), Definition 2 (batch matrix
 // encryption), Algorithm 1 (batch CPMM), Algorithm 2 (TWEAK), Algorithm 3
-// (batch CMT) and Algorithm 4 (batch CCMM) of Cheon, Kang and Lee, "Fast Batch
-// Matrix Multiplication in Ciphertexts".
+// (batch CMT), Algorithm 4 (batch CCMM) and Algorithm 5 (rectangular CPMM) of
+// Cheon, Kang and Lee, "Fast Batch Matrix Multiplication in Ciphertexts".
 //
 // R_N = Z[X]/(X^N + 1) is viewed as a rank-d module over the subring
 // R_k = Z[Y]/(Y^k + 1) with Y = X^d and N = d * k. A matrix over R_k carries
@@ -29,6 +29,7 @@
 #include <complex>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <vector>
 
 namespace heongpu
@@ -147,6 +148,23 @@ namespace heongpu
     get_batch_cmt_rotation_indices(const BatchMatrixLayout& layout);
 
     /**
+     * @brief Rotation indices the rectangular algorithms require.
+     *
+     * Algorithm 5 runs two CMT stages: one at the layout (N, N/2), which is
+     * what turns the constant terms of Theorem 3 into the leading d
+     * ciphertexts, and one at @p layout, which returns the result to the
+     * caller's column-wise encryption. The key set is the union.
+     *
+     * The first stage is the expensive half and it is expensive by
+     * construction: at k = 2 the automorphisms X -> X^(2kt+1) run over the
+     * whole rotation group, so it asks for N/2 - 1 keys. That count depends on
+     * the ring degree ALONE -- not on d, not on the model width -- so N is the
+     * only lever on the key budget of this path.
+     */
+    std::vector<int>
+    get_rectangular_rotation_indices(const BatchMatrixLayout& layout);
+
+    /**
      * @brief Per-limb twiddle tables for the subring transform.
      *
      * Depends only on the subring degree and the RNS primes in play, so one set
@@ -185,6 +203,10 @@ namespace heongpu
         HEBatchMatrixOperator(HEContext<Scheme::CKKS>& context,
                               const BatchMatrixLayout& layout);
 
+        /// Out of line: half_ points at this same type, so the deleter needs
+        /// the class complete and an implicit destructor would not have it.
+        ~HEBatchMatrixOperator();
+
         /** @brief Subring layout this operator was built for. */
         const BatchMatrixLayout& layout() const noexcept { return layout_; }
 
@@ -217,6 +239,67 @@ namespace heongpu
         void pcmm(std::vector<Ciphertext<Scheme::CKKS>>& out,
                   const std::vector<Ciphertext<Scheme::CKKS>*>& in,
                   bool rescale = true);
+
+        /**
+         * @brief Where the block index of a rectangular operand is carried.
+         *
+         * A rectangular d x (N/2) matrix is k/2 blocks of d x d, and the block
+         * index has to live somewhere inside the R_k entry. There are two
+         * consistent places and Algorithm 5 does not treat them alike.
+         */
+        enum class BlockAxis
+        {
+            /// Block l sits in batch slot l, i.e. in the EVALUATION domain of
+            /// R_k: entry (i,j) evaluates to M_l[i][j] at zeta^{5^l}. This is
+            /// the encoding of Definition 1 and the one Algorithm 5 is stated
+            /// for. Theorem 3's constant term is then (2/k) times the sum over
+            /// blocks, so the product is scaled by k/2 to recover the sum.
+            slot,
+            /// Block t sits in the Y^t COEFFICIENT of entry (i,j). This is the
+            /// form Algorithm 5 hands back, and feeding it straight back in is
+            /// what makes a chain of projections possible: the constant
+            /// coefficient of an R_k product is already the contraction over
+            /// t, provided the plaintext carries its own blocks reversed and
+            /// negated (Y^k = -1). No scaling, and no conversion between
+            /// calls -- the whole cost is a host-side arrangement of the
+            /// plaintext, which is free.
+            coefficient
+        };
+
+        /**
+         * @brief Rectangular batch PCMM, Algorithm 5.
+         *
+         * Multiplies a d x (N/2) matrix encryption by the (N/2) x (N/2)
+         * plaintext matrix most recently uploaded through
+         * encode_plaintext_matrix as a d x (N/2) batch matrix. Both operands
+         * are partitioned into d x d blocks; the block products are one batch
+         * PCMM, and the k/2 partial products are then summed by extracting
+         * constant terms (Theorem 3).
+         *
+         * The summation is where the CMT enters and where the cost of this
+         * algorithm lives: Algorithm 1 needs no key switching at all, while
+         * this needs N/2 of them per call, one per intermediate column. What
+         * it buys is that the contraction runs over the batch axis, so a
+         * SINGLE input occupies the whole ring instead of k/2 independent
+         * ones, and an activation is d ciphertexts rather than N/2.
+         *
+         * @param out        Receives layout.d ciphertexts, the same shape and
+         *                   encoding as @p in when @p axis is
+         *                   BlockAxis::coefficient.
+         * @param in         Exactly layout.d ciphertexts.
+         * @param galois_key Must carry get_rectangular_rotation_indices().
+         * @param axis       Where the block index of @p in is carried; see
+         *                   BlockAxis. The OUTPUT is always
+         *                   BlockAxis::coefficient.
+         * @param rescale    Mark the result for rescaling, as Algorithm 1's
+         *                   step 2 does.
+         */
+        void rectangular_pcmm(std::vector<Ciphertext<Scheme::CKKS>>& out,
+                              const std::vector<Ciphertext<Scheme::CKKS>*>& in,
+                              Galoiskey<Scheme::CKKS>& galois_key,
+                              HEArithmeticOperator<Scheme::CKKS>& ops,
+                              BlockAxis axis = BlockAxis::slot,
+                              bool rescale = true);
 
         /**
          * @brief Transform the given ciphertexts into the R_k NTT domain and
@@ -348,6 +431,16 @@ namespace heongpu
       private:
         const BatchSubringTables& tables_for(int depth);
 
+        /// The operator at the layout (N, N/2), built on first use. Algorithm
+        /// 5's summation is a CMT read at k = 2, and cmt()/tweak()/tables_for()
+        /// are all bound to layout_, so the second reading needs its own
+        /// operator rather than an extra argument threaded through all three.
+        HEBatchMatrixOperator<Scheme::CKKS>& half_operator();
+
+        /// Multiply every ciphertext by a small non-negative integer, exactly.
+        void mult_int_scalar_batch(std::vector<Ciphertext<Scheme::CKKS>>& ct,
+                                   uint64_t value);
+
         /**
          * @brief Multiply each of @p ct by its own monomial, in one launch.
          *
@@ -379,6 +472,7 @@ namespace heongpu
         int q_size_;
 
         std::map<int, BatchSubringTables> table_cache_;
+        std::unique_ptr<HEBatchMatrixOperator<Scheme::CKKS>> half_;
 
         // Most recently uploaded plaintext matrix.
         DeviceVector<Data64> plain_;
