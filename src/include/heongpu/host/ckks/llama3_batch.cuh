@@ -371,6 +371,75 @@ namespace heongpu
                                       Galoiskey<Scheme::CKKS>& galois_key,
                                       Relinkey<Scheme::CKKS>& relin_key);
 
+            // ---------------------------------------------------------------
+            // RMSNorm and SwiGLU
+            // ---------------------------------------------------------------
+            //
+            // Both are slot-wise, so both live behind the bridge, and both
+            // reduce over the channel axis -- which a matrix encryption puts
+            // across ciphertexts, exactly as it does the SoftMax's key axis.
+            // The reduction is a slot-wise addition and costs no rotation.
+            //
+            // SwiGLU is the one place this encoding is at a disadvantage, and
+            // it is worth naming: SiLU(W_g x) * (W_u x) is a HADAMARD product,
+            // and a matrix encryption has no such operation -- multiplying two
+            // columns convolves them. So both branches cross to slot form and
+            // the result crosses back, three bridges over the hidden width
+            // rather than one. It is still the cheaper side of the trade by an
+            // order of magnitude, because the three projections it replaces
+            // were the widest key switching in the block.
+
+            /** @brief Shape and approximation settings for rms_norm. */
+            struct BatchRMSNormConfig
+            {
+                double eps = 1e-5;
+                double sum_lo = 0.0; ///< Range of the summed square.
+                double sum_hi = 0.0;
+                int degree = 31;
+                int newton_iterations = 2;
+            };
+
+            /**
+             * @brief RMSNorm over the channel axis.
+             *
+             * @param weight One learned scale per channel, or empty to leave
+             *               the scaling out. A channel is a whole ciphertext
+             *               here, so its weight is a constant and not a slot
+             *               vector.
+             */
+            BatchActivation rms_norm(BatchActivation& x,
+                                     const std::vector<double>& weight,
+                                     const BatchRMSNormConfig& config,
+                                     Galoiskey<Scheme::CKKS>& galois_key,
+                                     Relinkey<Scheme::CKKS>& relin_key);
+
+            /** @brief Plaintext weights of one SwiGLU sublayer. */
+            struct BatchFeedForwardWeights
+            {
+                /// Row-major in_channels x hidden_channels, as project() wants
+                /// them; down is hidden_channels x in_channels.
+                std::vector<double> gate;
+                std::vector<double> up;
+                std::vector<double> down;
+            };
+
+            /** @brief Shape and approximation settings for feed_forward. */
+            struct BatchFeedForwardConfig
+            {
+                int in_channels = 0;
+                int hidden_channels = 0;
+                double silu_bound = 10.8; ///< Table 2 after calibration.
+                int silu_degree = 31;     ///< Section 3.1.3.
+            };
+
+            /** @brief The SwiGLU sublayer, W_down (SiLU(W_gate x) * W_up x). */
+            BatchActivation
+            feed_forward(BatchActivation& x,
+                         const BatchFeedForwardWeights& weights,
+                         const BatchFeedForwardConfig& config,
+                         Galoiskey<Scheme::CKKS>& galois_key,
+                         Relinkey<Scheme::CKKS>& relin_key);
+
           private:
             /// The d x d Vandermonde of (*) at batch index b, and its inverse.
             /// Built once per operator: it depends only on the ring.

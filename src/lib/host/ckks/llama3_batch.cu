@@ -784,6 +784,115 @@ namespace heongpu
         }
 
         // -------------------------------------------------------------------
+        // RMSNorm and SwiGLU
+        // -------------------------------------------------------------------
+
+        BatchActivation Llama3BatchOperator::rms_norm(
+            BatchActivation& x, const std::vector<double>& weight,
+            const BatchRMSNormConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            require_uniform(x, "rms_norm");
+            const int channels = x.columns();
+            if (!weight.empty() &&
+                static_cast<int>(weight.size()) != channels)
+            {
+                throw std::invalid_argument(
+                    "RMSNorm takes one learned scale per channel, and a "
+                    "channel is a whole ciphertext here");
+            }
+
+            Range _r("rms_norm");
+
+            std::vector<Ciphertext<Scheme::CKKS>> slots =
+                to_slots(x, galois_key);
+
+            // A channel is a whole ciphertext, so the learned scale is a
+            // constant across every slot rather than a vector over them.
+            std::vector<Plaintext<Scheme::CKKS>> weights;
+            if (!weight.empty())
+            {
+                weights.reserve(channels);
+                const double plain_scale = rescale_prime(slots.front());
+                for (int j = 0; j < channels; ++j)
+                {
+                    std::vector<double> flat(slot_count_, weight[j]);
+                    Plaintext<Scheme::CKKS> plain(context_);
+                    encoder_.encode(plain, flat, plain_scale);
+                    for (int i = 0; i < slots.front().depth(); ++i)
+                    {
+                        arith_.mod_drop_inplace(plain);
+                    }
+                    weights.push_back(std::move(plain));
+                }
+            }
+
+            Llama3Operator::RMSNormConfig slot_config;
+            // The channel axis runs entirely across ciphertexts, so nothing is
+            // reduced inside one and the mean costs a slot-wise addition.
+            slot_config.stride = slot_count_;
+            slot_config.count = 1;
+            slot_config.channels = channels;
+            slot_config.token_blocks = 1;
+            slot_config.eps = config.eps;
+            slot_config.sum_lo = config.sum_lo;
+            slot_config.sum_hi = config.sum_hi;
+            slot_config.degree = config.degree;
+            slot_config.newton_iterations = config.newton_iterations;
+
+            std::vector<Ciphertext<Scheme::CKKS>> normalised = arith_.rms_norm(
+                slots, weights, slot_config, galois_key, relin_key);
+
+            return from_slots(normalised, x.rows, galois_key);
+        }
+
+        BatchActivation Llama3BatchOperator::feed_forward(
+            BatchActivation& x, const BatchFeedForwardWeights& weights,
+            const BatchFeedForwardConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            require_uniform(x, "feed_forward");
+
+            Range _r("feed_forward");
+
+            BatchActivation gate =
+                project(x, weights.gate, config.in_channels,
+                        config.hidden_channels, "ffn.gate");
+            BatchActivation up = project(x, weights.up, config.in_channels,
+                                         config.hidden_channels, "ffn.up");
+
+            // The gate meets the up projection in a Hadamard product, which
+            // the matrix encoding does not have: multiplying two columns
+            // convolves their coefficients. Both branches therefore cross to
+            // slot form, where a product is slot-wise, and the result crosses
+            // back for the down projection.
+            std::vector<Ciphertext<Scheme::CKKS>> gate_slots =
+                to_slots(gate, galois_key);
+            std::vector<Ciphertext<Scheme::CKKS>> up_slots =
+                to_slots(up, galois_key);
+
+            std::vector<Ciphertext<Scheme::CKKS>> hidden;
+            hidden.reserve(gate_slots.size());
+            {
+                Range _r_silu("ffn.silu");
+                for (size_t j = 0; j < gate_slots.size(); ++j)
+                {
+                    Ciphertext<Scheme::CKKS> activated =
+                        arith_.silu(gate_slots[j], config.silu_bound,
+                                    config.silu_degree, relin_key);
+                    hidden.push_back(arith_.multiply_and_rescale(
+                        activated, up_slots[j], relin_key));
+                }
+            }
+
+            BatchActivation h = from_slots(hidden, x.rows, galois_key);
+            return project(h, weights.down, config.hidden_channels,
+                           config.in_channels, "ffn.down");
+        }
+
+        // -------------------------------------------------------------------
         // Host-side staging
         // -------------------------------------------------------------------
 

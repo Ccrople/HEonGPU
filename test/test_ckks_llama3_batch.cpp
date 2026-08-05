@@ -446,3 +446,123 @@ TEST(HEonGPU, CKKS_Llama3Batch_AttentionMatchesHostAttention)
               << std::endl;
     EXPECT_LT(worst, 5e-2);
 }
+
+// RMSNorm behind the bridge. The channel axis runs across ciphertexts here, so
+// the mean of the squares is a slot-wise addition and the reduction that costs
+// the slot path log2(channels) rotations costs this path nothing; what is
+// being checked is that the free reduction is also the right one.
+TEST(HEonGPU, CKKS_Llama3Batch_RMSNormMatchesHostNorm)
+{
+    Fixture f(20);
+    const int d = Fixture::d;
+    const int channels = 6;
+    const double eps = 1e-5;
+
+    const auto x = f.random_batch(d, channels, 4711u);
+    const auto weight = random_weight(1, channels, 4712u, 1.5);
+
+    double sum_lo = 1e300;
+    double sum_hi = 0.0;
+    std::vector<std::vector<double>> want(f.layout.batch);
+    for (int s = 0; s < f.layout.batch; ++s)
+    {
+        want[s].resize(static_cast<size_t>(d) * channels);
+        for (int u = 0; u < d; ++u)
+        {
+            double total = 0.0;
+            for (int c = 0; c < channels; ++c)
+            {
+                const double v = x[s][static_cast<size_t>(u) * channels + c];
+                total += v * v;
+            }
+            sum_lo = std::min(sum_lo, total);
+            sum_hi = std::max(sum_hi, total);
+            const double inv =
+                1.0 / std::sqrt(total / static_cast<double>(channels) + eps);
+            for (int c = 0; c < channels; ++c)
+                want[s][static_cast<size_t>(u) * channels + c] =
+                    x[s][static_cast<size_t>(u) * channels + c] * weight[c] *
+                    inv;
+        }
+    }
+
+    heongpu::llama::Llama3BatchOperator::BatchRMSNormConfig config;
+    config.eps = eps;
+    // Calibrated, with the margin a real run would take off a calibration set
+    // rather than off the batch it is about to normalise.
+    config.sum_lo = sum_lo * 0.8;
+    config.sum_hi = sum_hi * 1.2;
+    config.degree = 31;
+    config.newton_iterations = 2;
+
+    auto ct = f.op->encrypt(x, d, channels, *f.encryptor, f.scale);
+    auto out = f.op->rms_norm(ct, weight, config, *f.galois, *f.relin);
+    ASSERT_EQ(out.columns(), channels);
+
+    const auto got =
+        f.op->decrypt(out, *f.decryptor, out.column.front().scale());
+
+    const double worst = max_abs_diff(want, got);
+    std::cout << "batch RMSNorm worst absolute error: " << worst << std::endl;
+    EXPECT_LT(worst, 1e-2);
+}
+
+// The SwiGLU sublayer. This is the one place the matrix encoding is at a
+// disadvantage -- SiLU(W_g x) * (W_u x) is a Hadamard product, which a matrix
+// encryption does not have -- so both branches cross to slot form and the
+// result crosses back. Three bridges over the hidden width, against the three
+// widest projections in the block, which is the trade this checks is sound.
+TEST(HEonGPU, CKKS_Llama3Batch_FeedForwardMatchesHostSwiGLU)
+{
+    Fixture f(20);
+    const int d = Fixture::d;
+    const int channels = d;
+    const int hidden = 12;
+
+    const auto x = f.random_batch(d, channels, 1234u);
+    const double amp = 1.0 / std::sqrt(static_cast<double>(channels));
+    const auto wg = random_weight(channels, hidden, 91u, amp);
+    const auto wu = random_weight(channels, hidden, 92u, amp);
+    const auto wd = random_weight(hidden, channels, 93u, amp);
+
+    auto silu = [](double z) { return z / (1.0 + std::exp(-z)); };
+
+    double gate_bound = 0.0;
+    std::vector<std::vector<double>> want(f.layout.batch);
+    for (int s = 0; s < f.layout.batch; ++s)
+    {
+        const auto g = host_product(x[s], wg, d, channels, hidden);
+        const auto u = host_product(x[s], wu, d, channels, hidden);
+        std::vector<double> h(g.size());
+        for (size_t e = 0; e < g.size(); ++e)
+        {
+            gate_bound = std::max(gate_bound, std::abs(g[e]));
+            h[e] = silu(g[e]) * u[e];
+        }
+        want[s] = host_product(h, wd, d, hidden, channels);
+    }
+
+    heongpu::llama::Llama3BatchOperator::BatchFeedForwardConfig config;
+    config.in_channels = channels;
+    config.hidden_channels = hidden;
+    // Calibrated, as Table 2 is, with a margin: a Chebyshev fit is worth
+    // nothing outside the interval it was fitted on.
+    config.silu_bound = gate_bound * 1.25;
+    config.silu_degree = 31;
+
+    heongpu::llama::Llama3BatchOperator::BatchFeedForwardWeights weights;
+    weights.gate = wg;
+    weights.up = wu;
+    weights.down = wd;
+
+    auto ct = f.op->encrypt(x, d, channels, *f.encryptor, f.scale);
+    auto out = f.op->feed_forward(ct, weights, config, *f.galois, *f.relin);
+    ASSERT_EQ(out.columns(), channels);
+
+    const auto got =
+        f.op->decrypt(out, *f.decryptor, out.column.front().scale());
+
+    const double worst = max_abs_diff(want, got);
+    std::cout << "batch SwiGLU worst absolute error: " << worst << std::endl;
+    EXPECT_LT(worst, 1e-2);
+}
