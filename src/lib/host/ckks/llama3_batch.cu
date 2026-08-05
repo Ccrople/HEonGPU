@@ -445,8 +445,15 @@ namespace heongpu
                     matrix_.pcmm(piece, in, /*rescale=*/true);
                 }
 
+                // Algorithm 1 marks the rescale rather than performing it: it
+                // leaves the result at x_scale * plain_scale and sets
+                // rescale_required_. Left unspent that is not merely an
+                // untidy scale, it is a plaintext whose coefficients have
+                // outgrown int64, so the caller pays it here and the column
+                // comes back at the activation's own scale one level down.
                 for (auto& c : piece)
                 {
+                    arith_.rescale_inplace(c);
                     out.column.push_back(std::move(c));
                 }
             }
