@@ -64,7 +64,9 @@ namespace
             op = std::make_unique<heongpu::llama::Llama3BatchOperator>(
                 context, *encoder, layout, scale);
 
-            const std::vector<int> shifts = op->bridge_rotation_indices();
+            // Not const: the Galoiskey constructor takes its shift list by
+            // non-const reference.
+            std::vector<int> shifts = op->bridge_rotation_indices();
             galois = std::make_unique<heongpu::Galoiskey<S>>(context, shifts);
             keygen->generate_galois_key(*galois, *secret);
         }
