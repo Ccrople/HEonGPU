@@ -1025,12 +1025,13 @@ namespace heongpu
 
         Ciphertext<Scheme::CKKS>
         Llama3Operator::silu(Ciphertext<Scheme::CKKS>& ct, double bound,
-                             int degree, Relinkey<Scheme::CKKS>& relin_key)
+                             int degree, Relinkey<Scheme::CKKS>& relin_key,
+                             bool pre_scaled)
         {
             Range _r("silu");
             return evaluate_function(
                 ct, [](double x) { return x / (1.0 + std::exp(-x)); }, -bound,
-                bound, degree, relin_key);
+                bound, degree, relin_key, pre_scaled);
         }
 
         Ciphertext<Scheme::CKKS> Llama3Operator::exp_scaled_negative(
@@ -1065,11 +1066,25 @@ namespace heongpu
             std::vector<Ciphertext<Scheme::CKKS>>& in,
             std::vector<Plaintext<Scheme::CKKS>>& weights,
             const RMSNormConfig& config, Galoiskey<Scheme::CKKS>& galois_key,
-            Relinkey<Scheme::CKKS>& relin_key)
+            Relinkey<Scheme::CKKS>& relin_key,
+            Galoiskey<Scheme::CKKS>* boot_key)
         {
             if (in.empty())
             {
                 throw std::invalid_argument("RMSNorm needs at least one input");
+            }
+            const bool aux_refresh = config.refresh_sum;
+            if (aux_refresh && boot_key == nullptr)
+            {
+                throw std::invalid_argument(
+                    "Refreshing the RMSNorm sum needs the boot Galois key");
+            }
+            if (aux_refresh && config.newton_iterations > 0)
+            {
+                throw std::invalid_argument(
+                    "A Newton step refines against the unmapped argument, "
+                    "and the refreshed sum arrives mapped: raise the fit "
+                    "degree instead, which the auxiliary track makes free");
             }
             if (!weights.empty() && weights.size() != in.size())
             {
@@ -1243,7 +1258,48 @@ namespace heongpu
                 Ciphertext<Scheme::CKKS> scale_factor;
                 {
                     Range _r("rms_norm.inverse_sqrt");
-                    if (fold_mean)
+                    if (aux_refresh)
+                    {
+                        // The same narrow-track refresh the SoftMax
+                        // denominator takes: the sum is one ciphertext per
+                        // token block however many channel blocks feed it, so
+                        // it is refreshed alone and the fit's levels are paid
+                        // above the wide track. Completing the fit's domain
+                        // map is the whole preparation, and it is what puts
+                        // the values in the [-1, 1] a refresh assumes.
+                        const double gain = config.output_scale;
+                        if (!fold_affine)
+                        {
+                            multiply_constant(total,
+                                              Llama3Operator::domain_scale(
+                                                  fit_lo, fit_hi));
+                        }
+                        add_constant(total, Llama3Operator::domain_shift(
+                                                fit_lo, fit_hi));
+                        total = bootstrap(total, *boot_key, relin_key);
+
+                        std::function<double(double)> f;
+                        if (fold_mean)
+                        {
+                            const double channels =
+                                static_cast<double>(config.channels);
+                            const double eps = config.eps;
+                            f = [channels, eps, gain](double s) {
+                                return gain / std::sqrt(s / channels + eps);
+                            };
+                        }
+                        else
+                        {
+                            f = [gain](double x)
+                            { return gain / std::sqrt(x); };
+                        }
+                        scale_factor = evaluate_chebyshev(
+                            total,
+                            chebyshev_coefficients(f, fit_lo, fit_hi,
+                                                   config.degree),
+                            -1.0, 1.0, relin_key);
+                    }
+                    else if (fold_mean)
                     {
                         // The same value of the same ciphertext, fitted over
                         // the summed square instead of over the mean. One
@@ -1342,12 +1398,31 @@ namespace heongpu
             const SoftmaxConfig& config,
             const std::vector<std::vector<double>>& masks,
             Galoiskey<Scheme::CKKS>& galois_key,
-            Relinkey<Scheme::CKKS>& relin_key)
+            Relinkey<Scheme::CKKS>& relin_key,
+            Galoiskey<Scheme::CKKS>* boot_key)
         {
             if (parts.empty())
             {
                 throw std::invalid_argument(
                     "SoftMax needs at least one ciphertext to reduce over");
+            }
+            const bool aux_refresh = config.refresh_denominator;
+            if (aux_refresh && boot_key == nullptr)
+            {
+                // Falling back silently would put the fit's levels back on
+                // the wide track and change the schedule the caller sized
+                // the chain for.
+                throw std::invalid_argument(
+                    "Refreshing the SoftMax denominator needs the boot "
+                    "Galois key");
+            }
+            if (aux_refresh && config.inverse_newton > 0)
+            {
+                throw std::invalid_argument(
+                    "A Newton step refines against the unmapped argument, "
+                    "and the refreshed denominator arrives mapped: raise the "
+                    "fit degree instead, which the auxiliary track makes "
+                    "free");
             }
             if (!masks.empty() && masks.size() != parts.size())
             {
@@ -1575,9 +1650,47 @@ namespace heongpu
                 Ciphertext<Scheme::CKKS> reciprocal;
                 {
                     Range _r("softmax.inverse");
-                    reciprocal = inverse(total, lo, hi, config.inverse_degree,
-                                         config.inverse_newton, relin_key,
-                                         fold_affine, gain);
+                    if (aux_refresh)
+                    {
+                        // The paper's auxiliary track, Figure 2's orange
+                        // triangle: the denominator is one ciphertext however
+                        // wide the axis is, so it alone is refreshed and the
+                        // fit is paid above the wide track. A refresh assumes
+                        // values in [-1, 1], which is exactly where the fit's
+                        // domain map puts them, so completing that map is the
+                        // whole preparation -- the multiplier is already
+                        // riding on the mask or is applied here on the narrow
+                        // side, and the shift is an addition either way.
+                        if (!fold_affine)
+                        {
+                            multiply_constant(
+                                total, Llama3Operator::domain_scale(lo, hi));
+                        }
+                        add_constant(total,
+                                     Llama3Operator::domain_shift(lo, hi));
+                        total = bootstrap(total, *boot_key, relin_key);
+
+                        // The argument arrives mapped, so the series is
+                        // evaluated on [-1, 1] directly, with the
+                        // coefficients of the fit on [lo, hi] -- the same
+                        // series, met one step later. The gain keeps its job:
+                        // it divides out the factor the numerator still
+                        // carries and hands the next round the factor its
+                        // own fit wants.
+                        reciprocal = evaluate_chebyshev(
+                            total,
+                            chebyshev_coefficients(
+                                [gain](double x) { return gain / x; }, lo,
+                                hi, config.inverse_degree),
+                            -1.0, 1.0, relin_key);
+                    }
+                    else
+                    {
+                        reciprocal =
+                            inverse(total, lo, hi, config.inverse_degree,
+                                    config.inverse_newton, relin_key,
+                                    fold_affine, gain);
+                    }
                 }
 
                 for (std::size_t p = 0; p < y.size(); p++)

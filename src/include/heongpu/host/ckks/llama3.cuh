@@ -444,7 +444,8 @@ namespace heongpu
              */
             Ciphertext<Scheme::CKKS> silu(Ciphertext<Scheme::CKKS>& ct,
                                           double bound, int degree,
-                                          Relinkey<Scheme::CKKS>& relin_key);
+                                          Relinkey<Scheme::CKKS>& relin_key,
+                                          bool pre_scaled = false);
 
             /**
              * @brief exp(x / 2^k) for x in [-bound, 0], the y^(0) of the
@@ -538,6 +539,15 @@ namespace heongpu
                 /// undo the gain, so any value but one needs
                 /// @c newton_iterations = 0 and throws otherwise.
                 double output_scale = 1.0;
+
+                /// Refresh the summed square before fitting 1/sqrt over it --
+                /// the same narrow-track bootstrap softmax's
+                /// refresh_denominator takes, for the same reason. The sum is
+                /// one ciphertext per token block however many channel blocks
+                /// feed it, so the fit's levels move above the wide track and
+                /// the norm costs the stream the square, the reduction and
+                /// the two products. Needs the boot key and no Newton step.
+                bool refresh_sum = false;
             };
 
             /**
@@ -563,7 +573,8 @@ namespace heongpu
                      std::vector<Plaintext<Scheme::CKKS>>& weights,
                      const RMSNormConfig& config,
                      Galoiskey<Scheme::CKKS>& galois_key,
-                     Relinkey<Scheme::CKKS>& relin_key);
+                     Relinkey<Scheme::CKKS>& relin_key,
+                     Galoiskey<Scheme::CKKS>* boot_key = nullptr);
 
             /** @brief Shape and approximation settings for softmax. */
             struct SoftmaxConfig
@@ -640,6 +651,28 @@ namespace heongpu
                 /// shift it subtracts, since what it hands over is no longer
                 /// a score.
                 bool pre_scaled_input = false;
+
+                /// Refresh the denominator before fitting its reciprocal --
+                /// the orange triangle of the paper's Figure 2, which
+                /// bootstraps only in the narrow auxiliary track.
+                ///
+                /// The denominator is ONE ciphertext however many parts the
+                /// axis is cut into, so refreshing it costs one bootstrap
+                /// while the wide track holds a ciphertext per key position.
+                /// The fit's levels are then paid above the wide track
+                /// instead of inside it: a round costs the square and the
+                /// product, two levels, and the reciprocal at any degree
+                /// costs the wide track nothing. What the refresh assumes --
+                /// values in [-1, 1] -- is exactly what the fit's own domain
+                /// map produces, so completing that map is the whole
+                /// preparation and the shift half of it is free.
+                ///
+                /// The price is one bootstrap's noise inside the denominator,
+                /// the same noise the surrounding seams already inject into
+                /// the wide track itself. Needs the boot Galois key at the
+                /// call and no Newton step, which would want the argument
+                /// back unmapped.
+                bool refresh_denominator = false;
             };
 
             /**
@@ -724,7 +757,8 @@ namespace heongpu
                     const SoftmaxConfig& config,
                     const std::vector<std::vector<double>>& masks,
                     Galoiskey<Scheme::CKKS>& galois_key,
-                    Relinkey<Scheme::CKKS>& relin_key);
+                    Relinkey<Scheme::CKKS>& relin_key,
+                    Galoiskey<Scheme::CKKS>* boot_key = nullptr);
 
             /**
              * @brief RoPE as one plaintext-ciphertext product pair.

@@ -842,7 +842,8 @@ namespace heongpu
                                      const std::vector<double>& weight,
                                      const RectRMSNormConfig& config,
                                      Galoiskey<Scheme::CKKS>& galois_key,
-                                     Relinkey<Scheme::CKKS>& relin_key)
+                                     Relinkey<Scheme::CKKS>& relin_key,
+                                     Galoiskey<Scheme::CKKS>* boot_key)
         {
             require_uniform(x, "rms_norm");
             const int channels = x.channels;
@@ -924,10 +925,11 @@ namespace heongpu
             slot_config.fold_mean_into_fit = config.fold_mean_into_fit;
             slot_config.fold_affine_into_mask = config.fold_affine_into_mask;
             slot_config.output_scale = config.output_scale;
+            slot_config.refresh_sum = config.refresh_sum;
 
             std::vector<Ciphertext<Scheme::CKKS>> normalised =
                 batch_.arith().rms_norm(slots, weights, slot_config, galois_key,
-                                        relin_key);
+                                        relin_key, boot_key);
 
             Range _r_out("rms_norm.from_slots");
             return from_slots(normalised, channels, galois_key);
@@ -1174,7 +1176,8 @@ namespace heongpu
                 {
                     Range _r("attention.softmax");
                     p_slots = batch_.arith().softmax(
-                        slots, softmax, masks, galois_key, relin_key);
+                        slots, softmax, masks, galois_key, relin_key,
+                        boot_key);
                 }
                 slots.clear();
                 note_depth("attention.softmaxed", p_slots);
@@ -1300,6 +1303,17 @@ namespace heongpu
                 // a chunk of the hidden axis is a set of columns and has to be
                 // gathered. The down weight is hidden_channels x in_channels, so
                 // the same chunk is a contiguous span of rows.
+                // The SiLU's domain map rides on the gate weight when asked
+                // to: the gate feeds the fit and nothing else, so the factor
+                // never has to come back out, and a host scaling is free
+                // where the map is otherwise a plaintext product and a level.
+                const bool fold_silu = config.fold_silu_domain_into_gate &&
+                                       config.silu_bound > 0.0;
+                const double silu_domain =
+                    fold_silu ? Llama3Operator::domain_scale(
+                                    -config.silu_bound, config.silu_bound)
+                              : 1.0;
+
                 std::vector<double> gate_w(
                     static_cast<size_t>(in_channels) * cols);
                 std::vector<double> up_w(gate_w.size());
@@ -1310,7 +1324,7 @@ namespace heongpu
                     const size_t dst = static_cast<size_t>(i) * cols;
                     for (int j = 0; j < cols; ++j)
                     {
-                        gate_w[dst + j] = weights.gate[src + j];
+                        gate_w[dst + j] = weights.gate[src + j] * silu_domain;
                         up_w[dst + j] = weights.up[src + j];
                     }
                 }
@@ -1343,7 +1357,8 @@ namespace heongpu
                         Ciphertext<Scheme::CKKS> activated =
                             batch_.arith().silu(gate_slots[j],
                                                 config.silu_bound,
-                                                config.silu_degree, relin_key);
+                                                config.silu_degree, relin_key,
+                                                fold_silu);
                         hidden.push_back(batch_.arith().multiply_and_rescale(
                             activated, up_slots[j], relin_key));
                     }
@@ -1474,7 +1489,7 @@ namespace heongpu
                 Range _r_half("transformer_block.attention_half");
                 RectActivation normed =
                     rms_norm(stream, attention_gain, config.attention_norm,
-                             galois_key, relin_key);
+                             galois_key, relin_key, boot_key);
                 note_depth("block.attention_norm", normed.column);
 
                 // RMSNorm is the deepest single stretch on this path and it
@@ -1509,7 +1524,8 @@ namespace heongpu
                 Range _r_half("transformer_block.feed_forward_half");
                 RectActivation normed =
                     rms_norm(stream, feed_forward_gain,
-                             config.feed_forward_norm, galois_key, relin_key);
+                             config.feed_forward_norm, galois_key, relin_key,
+                             boot_key);
                 note_depth("block.feed_forward_norm", normed.column);
 
                 if (boot_key != nullptr && refresh.after_feed_forward_norm)

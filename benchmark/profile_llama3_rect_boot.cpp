@@ -675,6 +675,10 @@ int main(int argc, char* argv[])
         c.attention_norm.degree = EnvInt("HEONGPU_BOOT_NORM_DEGREE", 7);
         c.attention_norm.newton_iterations =
             EnvInt("HEONGPU_BOOT_NORM_NEWTON", 0);
+        // The narrow-track refresh of the summed square, which moves the
+        // 1/sqrt fit's levels above the wide track. Off by default so a run
+        // stays comparable with the recorded ones.
+        c.attention_norm.refresh_sum = EnvFlag("HEONGPU_BOOT_NORM_AUX", false);
         c.feed_forward_norm = c.attention_norm;
 
         c.attention.in_channels = channels;
@@ -689,6 +693,10 @@ int main(int argc, char* argv[])
             EnvInt("HEONGPU_BOOT_INVERSE_DEGREE", 15);
         c.attention.softmax.inverse_newton =
             EnvInt("HEONGPU_BOOT_INVERSE_NEWTON", 0);
+        // The paper's auxiliary track: refresh the one-ciphertext denominator
+        // and pay the reciprocal above the wide track.
+        c.attention.softmax.refresh_denominator =
+            EnvFlag("HEONGPU_BOOT_SOFTMAX_AUX", false);
 
         // Section 4.3, the calibrated range of the SoftMax denominator.
         //
@@ -719,6 +727,10 @@ int main(int argc, char* argv[])
         c.feed_forward.in_channels = channels;
         c.feed_forward.hidden_channels = hidden;
         c.feed_forward.silu_degree = EnvInt("HEONGPU_BOOT_SILU_DEGREE", 31);
+        // The gate-weight fold of the SiLU's domain map, the SwiGLU half's
+        // copy of the query fold. Off by default for comparability.
+        c.feed_forward.fold_silu_domain_into_gate =
+            EnvFlag("HEONGPU_BOOT_SILU_FOLD", false);
         c.feed_forward.hidden_block_groups =
             EnvInt("HEONGPU_BOOT_HIDDEN_BLOCK_GROUPS", 1);
 

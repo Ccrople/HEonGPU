@@ -652,6 +652,11 @@ namespace heongpu
                 /// normalised stream carry B back in, on the host. Needs
                 /// @c newton_iterations = 0 when not one.
                 double output_scale = 1.0;
+                /// Refresh the summed square before its 1/sqrt fit -- the
+                /// narrow-track bootstrap of the paper's Figure 2, which
+                /// moves the fit's levels above the wide track. Needs the
+                /// boot key at the call and no Newton step.
+                bool refresh_sum = false;
             };
 
             /**
@@ -671,7 +676,8 @@ namespace heongpu
                                     const std::vector<double>& weight,
                                     const RectRMSNormConfig& config,
                                     Galoiskey<Scheme::CKKS>& galois_key,
-                                    Relinkey<Scheme::CKKS>& relin_key);
+                                    Relinkey<Scheme::CKKS>& relin_key,
+                                    Galoiskey<Scheme::CKKS>* boot_key = nullptr);
 
             // ---------------------------------------------------------------
             // Attention
@@ -790,6 +796,13 @@ namespace heongpu
                 int hidden_channels = 0;
                 double silu_bound = 10.8; ///< Table 2 after calibration.
                 int silu_degree = 31;     ///< Section 3.1.3.
+                /// Carry the domain map of the SiLU fit, 1/silu_bound, on the
+                /// gate weight -- the SwiGLU half's own copy of the query-
+                /// weight fold. The gate projection feeds the SiLU and
+                /// nothing else, so the factor needs no undoing, and a host
+                /// scaling is free where the map is otherwise the one
+                /// plaintext product the fit pays before its series.
+                bool fold_silu_domain_into_gate = false;
                 /// Hidden GROUPS held at once; 0 takes the whole width.
                 ///
                 /// The Hadamard product needs both branches in both encodings at

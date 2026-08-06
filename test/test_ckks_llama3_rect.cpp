@@ -36,6 +36,7 @@
 #include <cmath>
 #include <complex>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <random>
 #include <vector>
@@ -838,6 +839,206 @@ TEST(HEonGPU, CKKS_Llama3Rect_RefreshPreservesTheMatrixEncoding)
               << ", bridge with a refresh in it " << worst_diff(x, refreshed)
               << std::endl;
     EXPECT_LT(worst_diff(x, refreshed), 5e-2);
+}
+
+// The paper's auxiliary track (Figure 2, the orange triangle): the SoftMax
+// denominator is ONE ciphertext however many parts the key axis is cut into,
+// so refreshing it alone moves the reciprocal's levels off the wide track. The
+// wide track then pays the square and the product -- two levels a round -- and
+// the saving is the fit's whole cost. Both paths run on the same scores from
+// the same depth, so the difference in the output depth IS the saving, and the
+// oracle check is what says the refreshed denominator still divides correctly.
+TEST(HEonGPU, CKKS_Llama3Rect_RefreshedSoftmaxDenominatorSavesTheFitLevels)
+{
+    BootFixture fx(37);
+    const int slots = fx.half();
+    const int parts_n = 8;
+    // The scores span the calibrated spread of two the schedule is fitted
+    // for, not the worst case: a reciprocal at degree 15 covers a
+    // denominator ratio of e^2, and the wider band is exactly the interval
+    // Section 4.3 says never to fit across.
+    const double bound = 2.0;
+
+    std::mt19937 rng(64601u);
+    std::uniform_real_distribution<double> dist(-bound, 0.0);
+    std::vector<std::vector<double>> scores(parts_n,
+                                            std::vector<double>(slots));
+    for (auto& part : scores)
+    {
+        for (auto& v : part)
+        {
+            v = dist(rng);
+        }
+    }
+
+    // The denominator's range is a measurement, here taken exactly and padded,
+    // which is the calibration the paper says to feed these fits.
+    double den_lo = std::numeric_limits<double>::max();
+    double den_hi = 0.0;
+    std::vector<std::vector<double>> want(parts_n,
+                                          std::vector<double>(slots));
+    for (int s = 0; s < slots; ++s)
+    {
+        double den = 0.0;
+        for (int p = 0; p < parts_n; ++p)
+        {
+            den += std::exp(scores[p][s]);
+        }
+        den_lo = std::min(den_lo, den);
+        den_hi = std::max(den_hi, den);
+        for (int p = 0; p < parts_n; ++p)
+        {
+            want[p][s] = std::exp(scores[p][s]) / den;
+        }
+    }
+
+    heongpu::llama::Llama3Operator::SoftmaxConfig config;
+    config.strided = true;
+    config.stride = slots;
+    config.count = 1;
+    config.bound = bound;
+    config.iterations = 1;
+    config.exp_degree = 15;
+    config.inverse_degree = 15;
+    config.inverse_newton = 0;
+    config.sum_lo = den_lo * 0.9;
+    config.sum_hi = den_hi * 1.1;
+
+    // Both runs start near where the schedule would put them, just after a
+    // wide refresh -- two levels higher, because this test runs without the
+    // query-weight and mask folds, so the INLINE comparison pays both domain
+    // maps on the chain and needs twelve levels where the block's own SoftMax
+    // needs eleven.
+    auto encrypt_parts = [&]()
+    {
+        std::vector<heongpu::Ciphertext<S>> parts;
+        parts.reserve(parts_n);
+        for (int p = 0; p < parts_n; ++p)
+        {
+            heongpu::Plaintext<S> plain(fx.context);
+            fx.encoder->encode(plain, scores[p], fx.scale);
+            heongpu::Ciphertext<S> ct(fx.context);
+            fx.encryptor->encrypt(ct, plain);
+            fx.op->arith().drop_to_depth(ct, 23);
+            parts.push_back(std::move(ct));
+        }
+        return parts;
+    };
+
+    const std::vector<std::vector<double>> no_masks;
+    auto run = [&](bool refresh)
+    {
+        heongpu::llama::Llama3Operator::SoftmaxConfig c = config;
+        c.refresh_denominator = refresh;
+        std::vector<heongpu::Ciphertext<S>> parts = encrypt_parts();
+        std::vector<heongpu::Ciphertext<S>> out = fx.op->arith().softmax(
+            parts, c, no_masks, *fx.galois, *fx.relin,
+            refresh ? &*fx.galois : nullptr);
+
+        double worst = 0.0;
+        for (int p = 0; p < parts_n; ++p)
+        {
+            heongpu::Plaintext<S> plain(fx.context);
+            fx.decryptor->decrypt(plain, out[p]);
+            std::vector<double> got;
+            fx.encoder->decode(got, plain);
+            for (int s = 0; s < slots; ++s)
+            {
+                worst = std::max(worst, std::abs(got[s] - want[p][s]));
+            }
+        }
+        return std::make_pair(worst, out.front().depth());
+    };
+
+    const auto inline_path = run(false);
+    const auto aux_path = run(true);
+
+    std::cout << "softmax denominator: inline depth " << inline_path.second
+              << " error " << inline_path.first << ", refreshed depth "
+              << aux_path.second << " error " << aux_path.first << std::endl;
+
+    // The saving is the fit's four levels, and it is the point.
+    EXPECT_GE(inline_path.second - aux_path.second, 3);
+    // Section 3.1.2's requirement is 12 bits, 2.4e-4. The inline path meets it
+    // outright; the refreshed one adds one bootstrap's noise to the
+    // denominator, the same noise the wide track's own seams inject, so the
+    // bound here is the block's working precision rather than the fit's.
+    EXPECT_LT(inline_path.first, 2.5e-4);
+    EXPECT_LT(aux_path.first, 5e-3);
+}
+
+// The same narrow-track refresh on RMSNorm's summed square, which is one
+// ciphertext per token block however many channel blocks feed it.
+TEST(HEonGPU, CKKS_Llama3Rect_RefreshedNormSumSavesTheFitLevels)
+{
+    BootFixture fx(37);
+    const int d = BootFixture::d;
+    const int channels = fx.half();
+    const double eps = 1e-5;
+
+    const std::vector<double> x = random_matrix(d, channels, 65601u);
+
+    std::vector<double> want(x.size(), 0.0);
+    for (int u = 0; u < d; ++u)
+    {
+        double sum = 0.0;
+        for (int c = 0; c < channels; ++c)
+        {
+            const double v = x[static_cast<size_t>(u) * channels + c];
+            sum += v * v;
+        }
+        const double inv =
+            1.0 / std::sqrt(sum / static_cast<double>(channels) + eps);
+        for (int c = 0; c < channels; ++c)
+        {
+            want[static_cast<size_t>(u) * channels + c] =
+                x[static_cast<size_t>(u) * channels + c] * inv;
+        }
+    }
+
+    Rect::RectRMSNormConfig config;
+    config.eps = eps;
+    config.sum_lo = channels * 0.20;
+    config.sum_hi = channels * 0.50;
+    config.degree = 7;
+    config.newton_iterations = 0;
+    config.fold_mean_into_fit = true;
+    config.fold_affine_into_mask = true;
+
+    const std::vector<double> none;
+    auto run = [&](bool refresh)
+    {
+        Rect::RectRMSNormConfig c = config;
+        c.refresh_sum = refresh;
+        heongpu::llama::RectActivation ct =
+            fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+        for (auto& column : ct.column)
+        {
+            fx.op->arith().drop_to_depth(column, 25);
+        }
+        heongpu::llama::RectActivation out =
+            fx.op->rms_norm(ct, none, c, *fx.galois, *fx.relin,
+                            refresh ? &*fx.galois : nullptr);
+        const int depth = out.column.front().depth();
+        return std::make_pair(
+            worst_diff(want, fx.op->decrypt(out, *fx.decryptor,
+                                            out.column.front().scale())),
+            depth);
+    };
+
+    const auto inline_path = run(false);
+    const auto aux_path = run(true);
+
+    std::cout << "rms_norm sum: inline depth " << inline_path.second
+              << " error " << inline_path.first << ", refreshed depth "
+              << aux_path.second << " error " << aux_path.first << std::endl;
+
+    EXPECT_GE(inline_path.second - aux_path.second, 3);
+    // The rect crossings on either side of the norm cost more accuracy than
+    // either fit does, so the bound is theirs, and the paired run is what
+    // shows the refresh added at most a bootstrap's noise to it.
+    EXPECT_LT(aux_path.first, 5e-2);
+    EXPECT_LT(std::abs(aux_path.first - inline_path.first), 2e-2);
 }
 
 // The other level the norm gives up. Fitting 1/sqrt over the summed square
