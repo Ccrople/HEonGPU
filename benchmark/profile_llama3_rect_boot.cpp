@@ -567,15 +567,19 @@ int main(int argc, char* argv[])
             const double norm_hi = c.attention_norm.sum_hi;
             const double eps = c.attention_norm.eps;
             const double cw = static_cast<double>(channels);
+            // An absolute error is only readable against the scale of the
+            // thing it is an error IN, so a fit measured absolutely is given
+            // 12 bits of its own signal rather than 12 bits of one.
             const auto report = [&](const char* what,
                                     const std::function<double(double)>& f,
                                     double lo, double hi, int degree,
-                                    bool relative)
+                                    bool relative, double signal = 1.0)
             {
+                const double want_err = relative ? target : target * signal;
                 const double e = heongpu::llama::chebyshev_max_error(
                     f, lo, hi, degree, relative);
                 const int want = heongpu::llama::chebyshev_degree_for(
-                    f, lo, hi, target, relative);
+                    f, lo, hi, want_err, relative);
                 std::cout << "[boot] fit " << what << ": degree " << degree
                           << " over [" << lo << ", " << hi << "] -> "
                           << (relative ? "rel" : "abs") << " err " << e
@@ -590,7 +594,8 @@ int main(int argc, char* argv[])
                               << heongpu::llama::chebyshev_levels(want)
                               << " levels)";
                 }
-                std::cout << (e <= target ? "" : "   <-- MISSES") << std::endl;
+                std::cout << (e <= want_err ? "" : "   <-- MISSES")
+                          << std::endl;
             };
 
             report("rms_norm 1/sqrt",
@@ -611,7 +616,8 @@ int main(int argc, char* argv[])
             report("swiglu silu",
                    [](double x) { return x / (1.0 + std::exp(-x)); },
                    -c.feed_forward.silu_bound, c.feed_forward.silu_bound,
-                   c.feed_forward.silu_degree, false);
+                   c.feed_forward.silu_degree, false,
+                   c.feed_forward.silu_bound);
         }
 
         const bool refreshed = EnvFlag("HEONGPU_BOOT_REFRESHED", true);

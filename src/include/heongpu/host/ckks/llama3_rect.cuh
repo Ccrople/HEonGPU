@@ -180,21 +180,30 @@
 // 1/sqrt(head_dim) already rides. This is the fusion discipline of Section 3.2
 // applied to the non-linear layers rather than to the format conversions.
 //
-// What that removes, level by level:
+// Measured again at the same shape, the same six seams, the same 38 limbs:
 //
-//   RMSNorm      degree 15 -> 7, and the domain map onto the reduction mask
-//   SoftMax      the exp's map onto W_q and the reciprocal's onto the causal
-//                mask, against one level back for degree 7 -> 15
-//   SwiGLU       nothing: it was already at Table 2's bound and its degree
+//   RMSNorm ................. 12 -> 10   degree 7, domain map on the mask
+//   Q, K, V projections ...... 1 ->  1
+//   to_batch, K^T, Q K^T ..... 5 ->  5
+//   SoftMax ................. 12 -> 11   exp map on W_q, 1/x map on the mask,
+//                                        reciprocal 7 -> 15 and now correct
+//   P V, W_o, the residual ... 7 ->  7
+//   RMSNorm again ........... 12 -> 10
+//   SwiGLU .................. 10 -> 10   already at Table 2's bound and degree
+//   W_down, the residual ..... 4 ->  4
 //
-// The worst stretch is what the chain is sized on, and the SoftMax is the worst
-// stretch, so what the chain saves is what the SoftMax saves. At dnum = 1 the
-// mod-down that dominates this path is O(L^2), so a limb is worth more than it
-// looks. The accuracy is the real result either way: this path was previously
-// measured with a reciprocal that was not an approximation of one.
+//   worst stretch 12 -> 11, at the SoftMax rather than the RMSNorm
+//   a block 563.3 s -> 477.4 s, 15% at an unchanged chain
 //
-// The measured table follows once it is measured, and until then this section
-// says what was changed and not what it cost.
+// The chain is sized on the worst stretch, so 11 wants 37 limbs and not 38, and
+// at dnum = 1 the mod-down that dominates this path is O(L^2). Two of those
+// three lines are worth having; the third is the one that matters, because this
+// path was previously measured with a reciprocal that was not an approximation
+// of one.
+//
+// The SoftMax is now the worst stretch and the RMSNorm is not, which says where
+// to look next: 11 is the exponential's four levels, the reciprocal's four, the
+// squaring, the mask and the product. None of those is slack.
 //
 // THE REAL SHAPE, MEASURED
 // ------------------------
