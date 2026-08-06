@@ -300,7 +300,7 @@ def main():
         f.write(f"kv_channels {KV_HEADS * HEAD_DIM}\n")
         f.write(f"head_dim {HEAD_DIM}\n")
         f.write(f"hidden {HIDDEN}\n")
-        f.write(f"sink_tokens {len(ids) - len(tokenize(args.cache, CALIBRATION_TEXT))}\n")
+        f.write(f"sink_tokens {1 + len(tokenize(args.cache, SINK_TEXT))}\n")
         f.write(f"mirror {args.mirror}\n")
         f.write("prompt " + " ".join(map(str, ids)) + "\n")
         f.write("prompt_nosink " + " ".join(map(str, ids_nosink)) + "\n")

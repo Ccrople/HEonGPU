@@ -369,6 +369,18 @@ int main(int argc, char* argv[])
                       << "], silu " << cal.silu_in_abs << ", hidden "
                       << cal.hidden_abs << ", value " << cal.value_abs
                       << std::endl;
+            // The SoftMax denominator spread is what decides whether the
+            // reciprocal is fittable at all, so it earns its own line: the
+            // round-zero range per squaring count, as a ratio.
+            std::cout << "[boot]        " << std::setw(24) << ' '
+                      << " softmax D spread: k=1 "
+                      << (cal.softmax_sum_hi[0] / cal.softmax_sum_lo[0])
+                      << " [" << cal.softmax_sum_lo[0] << ", "
+                      << cal.softmax_sum_hi[0] << "], k=2 "
+                      << (cal.softmax_sum_hi[1] / cal.softmax_sum_lo[1])
+                      << " [" << cal.softmax_sum_lo[1] << ", "
+                      << cal.softmax_sum_hi[1] << "], prob_sq "
+                      << cal.prob_sq_hi << std::endl;
         };
         dump("mitigated (sink, rotated)", real->raw);
         dump("without the sink prefix", real->raw_nosink);
