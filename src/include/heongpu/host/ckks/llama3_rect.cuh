@@ -128,6 +128,24 @@
 // proportion to L^2 at dnum = 1, for levels the circuit throws away at the next
 // refresh.
 //
+// Measured, with the defaults this file carries -- RMSNorm at degree 15 with no
+// Newton step, the SoftMax at exp degree 15 and reciprocal degree 7, the SiLU at
+// the paper's degree 31:
+//
+//   RMSNorm .......................................... 12
+//   Q, K, V projections ............................... 1
+//   to_batch, the K transpose, Q K^T, to_slots ........ 5
+//   SoftMax .......................................... 12
+//   from_slots, P V, from_batch, W_o, the residual ..... 7
+//   RMSNorm again .................................... 12
+//   gate and up, to_slots, SiLU, the gate product ..... 10
+//   from_slots, W_down, the residual ................... 4
+//
+// Two things in that table are worth reading twice. Algorithm 4's product is ONE
+// level and the CMT transpose is FREE, so the levels go where the time goes: the
+// encoding crossings. And nothing here is 25, which is why the refresh is worth
+// what it costs -- 6 seams of it a block, at 12 levels apiece.
+//
 // ORIENTATION AND SHAPE CONSTRAINTS
 // ---------------------------------
 // Kang's products put the encrypted operand on the LEFT, while a Llama
