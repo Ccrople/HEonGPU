@@ -202,6 +202,46 @@ namespace heongpu
                 }
                 return s;
             }
+
+            /// The token-wise mitigation: rows whose summed square exceeds
+            /// ratio times the median are scaled onto the median. RMSNorm is
+            /// row-wise scale invariant, so the normalised stream -- the only
+            /// thing another row ever reads -- does not move.
+            std::vector<double> scale_outlier_rows(std::vector<double>& x,
+                                                   int rows, int cols,
+                                                   double ratio)
+            {
+                std::vector<double> sums(rows, 0.0);
+                for (int i = 0; i < rows; i++)
+                {
+                    const double* row =
+                        x.data() + static_cast<std::size_t>(i) * cols;
+                    for (int j = 0; j < cols; j++)
+                    {
+                        sums[i] += row[j] * row[j];
+                    }
+                }
+                std::vector<double> sorted = sums;
+                std::nth_element(sorted.begin(),
+                                 sorted.begin() + rows / 2, sorted.end());
+                const double median = sorted[rows / 2];
+
+                std::vector<double> lambda(rows, 1.0);
+                for (int i = 0; i < rows; i++)
+                {
+                    if (sums[i] > ratio * median && median > 0.0)
+                    {
+                        lambda[i] = std::sqrt(median / sums[i]);
+                        double* row =
+                            x.data() + static_cast<std::size_t>(i) * cols;
+                        for (int j = 0; j < cols; j++)
+                        {
+                            row[j] *= lambda[i];
+                        }
+                    }
+                }
+                return lambda;
+            }
         } // namespace
 
         void fwht_normalised(double* v, std::size_t n)
@@ -656,6 +696,20 @@ namespace heongpu
                 // head blocks -- commutes with it.
                 hadamard_cols(w.attention.value, c, kv, hd, head_sign);
                 hadamard_rows(w.attention.output, c, c, hd, head_sign);
+            }
+
+            // Token-wise mitigation before anything is measured: the flagged
+            // rows would otherwise own every bound this function chooses.
+            out.row_scale.assign(bundle.tokens, 1.0);
+            out.row_scale_nosink.assign(bundle.tokens, 1.0);
+            if (config.scale_rows)
+            {
+                out.row_scale =
+                    scale_outlier_rows(out.input, bundle.tokens, c,
+                                       config.row_outlier_ratio);
+                out.row_scale_nosink =
+                    scale_outlier_rows(out.input_nosink, bundle.tokens, c,
+                                       config.row_outlier_ratio);
             }
 
             out.eps = config.eps;

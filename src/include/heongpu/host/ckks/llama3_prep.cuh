@@ -198,6 +198,25 @@ namespace heongpu
         {
             /// Section 3.1.1's rotations, fused into the weights.
             bool rotate = true;
+            /// Section 3.1.1's token-wise mitigation: rows whose summed
+            /// square sits far outside the typical band -- the BOS and
+            /// delimiter positions where the massive activations live, at
+            /// sums 10^5 times a text token's -- are scaled to the band at
+            /// encryption, by a public per-position factor.
+            ///
+            /// RMSNorm is scale-invariant row by row, so the normalised
+            /// stream is EXACTLY unchanged; attention is the only cross-row
+            /// operation and reads nothing but that normalised stream, so
+            /// every private row's output is exactly the true model's. The
+            /// scaled rows' own outputs leave the block as a known per-row
+            /// mixture -- the price of computing rows the paper precomputes
+            /// offline as its public KV cache. Without this, the norm's fit
+            /// interval spans five orders of magnitude and no degree at or
+            /// below 511 is an approximation of 1/sqrt over it at all.
+            bool scale_rows = true;
+            /// A row is flagged when its summed square exceeds this multiple
+            /// of the median row's.
+            double row_outlier_ratio = 16.0;
             /// Section 3.1.3's 1/B folds, fused into the weights and the
             /// norm gains.
             bool prescale = true;
@@ -236,6 +255,11 @@ namespace heongpu
             Llama3RectOperator::RectTransformerBlockWeights weights;
             std::vector<double> input;
             std::vector<double> input_nosink;
+            /// The per-row factors of the token-wise mitigation, one per
+            /// token per input; all one when scale_rows is off or the row is
+            /// ordinary.
+            std::vector<double> row_scale;
+            std::vector<double> row_scale_nosink;
             BlockShape shape;
             SylphScales scales;
             /// config.eps / B_s^2: the same norm on the scaled stream.

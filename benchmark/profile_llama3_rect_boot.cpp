@@ -351,6 +351,24 @@ int main(int argc, char* argv[])
         real = std::make_unique<heongpu::llama::PreparedBlock>(
             heongpu::llama::prepare_block(bundle, prep));
 
+        {
+            // The token-wise half of Section 3.1.1: which positions carry
+            // the massive activations, and what they were scaled by.
+            std::cout << "[boot] token rows scaled:";
+            int flagged = 0;
+            for (int u = 0; u < static_cast<int>(real->row_scale.size());
+                 u++)
+            {
+                if (real->row_scale[u] != 1.0)
+                {
+                    std::cout << " " << u << " (x" << std::setprecision(3)
+                              << real->row_scale[u] << ")";
+                    flagged++;
+                }
+            }
+            std::cout << (flagged == 0 ? " none" : "") << std::endl;
+        }
+
         // Section 3.1.1's worth, measured rather than asserted: the same
         // exact circuit on the same real stream, with each mitigation
         // removed in turn. Everything here is in TRUE units -- the folds
