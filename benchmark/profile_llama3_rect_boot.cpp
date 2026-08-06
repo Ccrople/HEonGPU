@@ -51,6 +51,23 @@
 // key set fits on one card. It also makes the mod-down O(L^2), which is why the
 // chain here is as short as the schedule allows.
 //
+// THE REAL LLAMA-3 8B SHAPE
+// -------------------------
+// The defaults are a half-width block that runs in ten minutes. The model's own
+// numbers are one command, and they need no rounding: 8B's head dim is exactly
+// 128, which is the one dimension this encoding fixes.
+//
+//   HEONGPU_BOOT_D=128 HEONGPU_BOOT_CHANNEL_GROUPS=2
+//   HEONGPU_BOOT_HIDDEN_GROUPS=7 HEONGPU_BOOT_KV_HEADS=8
+//   HEONGPU_BOOT_HIDDEN_BLOCK_GROUPS=1 HEONGPU_BOOT_LIMBS=38
+//
+// -> d_model 4096, hidden 14336, 32 heads of 128 over 8 kv heads, 128 tokens.
+// Measured on one A6000: worst stretch 12 -- the same as at half the width,
+// since levels belong to the circuit and not to the model -- 14 refreshes and
+// 3326.8 s. HIDDEN_BLOCK_GROUPS = 1 is what holds the SwiGLU inside the card:
+// it forms, activates, refreshes and projects down one group of 2048 hidden
+// channels at a time, so the 14336 never exists at once.
+//
 // As in the sibling targets the plaintext values are random and the fitted
 // intervals are nominal: nothing about the cost of a CKKS circuit depends on the
 // numbers in it. The probe stage is the exception and says so.

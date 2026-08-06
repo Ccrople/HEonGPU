@@ -146,6 +146,27 @@
 // encoding crossings. And nothing here is 25, which is why the refresh is worth
 // what it costs -- 6 seams of it a block, at 12 levels apiece.
 //
+// THE REAL SHAPE, MEASURED
+// ------------------------
+// That table is one block at d = 64 and half the width. Llama-3 8B's own
+// numbers need no rounding to fit here, and the reason is the constraint below:
+// head_dim must be exactly d, and 8B's head dim IS 128. So d = 128, 32 heads x
+// 128 = 4096 = two channel groups at N = 4096, and 14336 = seven. Grouped-query
+// attention at 8 kv heads is the host expansion RectAttentionConfig describes.
+//
+//   d_model 4096, hidden 14336, 32 heads of 128 over 8 kv heads, 128 tokens
+//   38 limbs, 2048 Galois keys at 9.5 GiB, one A6000
+//   worst stretch 12, at the RMSNorm -- the same schedule as at half the width
+//   14 refreshes: the attention seams once per head group (32 heads is two
+//   Algorithm 4 calls of k/2 = 16), the SwiGLU once per hidden group
+//   3326.8 s for one block, against 563.3 s at half the width
+//
+// The first of those is the useful one: a level schedule is a property of the
+// CIRCUIT and not of the model, so a chain sized on a shape that fits in an
+// afternoon holds at the real one. The cost is not -- 5.9x for a model 2x as
+// wide, because a projection is one Algorithm 5 call per (input group, output
+// group) pair and that count went from 10 to 54.
+//
 // ORIENTATION AND SHAPE CONSTRAINTS
 // ---------------------------------
 // Kang's products put the encrypted operand on the LEFT, while a Llama
