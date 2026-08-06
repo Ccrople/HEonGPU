@@ -839,6 +839,74 @@ TEST(HEonGPU, CKKS_Llama3Rect_RefreshPreservesTheMatrixEncoding)
     EXPECT_LT(worst_diff(x, refreshed), 5e-2);
 }
 
+// The other level the norm gives up. Fitting 1/sqrt over the summed square
+// instead of over the mean skips the plaintext product that forms the mean, and
+// it is only free if the two really are the same function of the same
+// ciphertext -- a misread interval would scale every output by a constant and
+// nothing in the library would complain.
+TEST(HEonGPU, CKKS_Llama3Rect_FoldedMeanMatchesTheDividedOne)
+{
+    Fixture fx(20, 10);
+    const int d = Fixture::d;
+    const int channels = fx.half();
+    const double eps = 1e-5;
+
+    const std::vector<double> x = random_matrix(d, channels, 63601u);
+
+    std::vector<double> want(x.size(), 0.0);
+    for (int u = 0; u < d; ++u)
+    {
+        double sum = 0.0;
+        for (int c = 0; c < channels; ++c)
+        {
+            const double v = x[static_cast<size_t>(u) * channels + c];
+            sum += v * v;
+        }
+        const double inv =
+            1.0 / std::sqrt(sum / static_cast<double>(channels) + eps);
+        for (int c = 0; c < channels; ++c)
+            want[static_cast<size_t>(u) * channels + c] =
+                x[static_cast<size_t>(u) * channels + c] * inv;
+    }
+
+    Rect::RectRMSNormConfig config;
+    config.eps = eps;
+    config.sum_lo = channels * 0.20;
+    config.sum_hi = channels * 0.50;
+    config.degree = 15;
+    // The fold is only available without a Newton step, which refines against
+    // the mean itself.
+    config.newton_iterations = 0;
+
+    const std::vector<double> none;
+    auto run = [&](bool fold)
+    {
+        Rect::RectRMSNormConfig c = config;
+        c.fold_mean_into_fit = fold;
+        heongpu::llama::RectActivation ct =
+            fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+        heongpu::llama::RectActivation out =
+            fx.op->rms_norm(ct, none, c, *fx.galois, *fx.relin);
+        const int spent = out.column.front().depth();
+        return std::make_pair(
+            fx.op->decrypt(out, *fx.decryptor, out.column.front().scale()),
+            spent);
+    };
+
+    const auto divided = run(false);
+    const auto folded = run(true);
+
+    std::cout << "rms_norm mean: divided " << divided.second << " levels, "
+              << "folded " << folded.second << " levels; worst error against "
+              << "the host " << worst_diff(want, divided.first) << " and "
+              << worst_diff(want, folded.first) << std::endl;
+
+    // The saving is the whole point, so it is asserted and not merely printed.
+    EXPECT_EQ(folded.second, divided.second - 1);
+    EXPECT_LT(worst_diff(want, folded.first), 5e-2);
+    EXPECT_LT(worst_diff(divided.first, folded.first), 5e-2);
+}
+
 // The level the fold saves is only saved if the fold is right. Scaling the rows
 // of a projection by the learned gain has to be the same as scaling the
 // channels of the activation by it, which is what the homomorphic RMSNorm does.
