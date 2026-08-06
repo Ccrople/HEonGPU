@@ -81,6 +81,38 @@
 // checks accordingly: this module is correct at any width, and it FITS only at
 // short chains.
 //
+// THE REFRESH, AND WHY IT NEEDS NO CROSSING
+// -----------------------------------------
+// A whole block on this path spends far more levels than a chain that also has
+// to hold N/2 - 1 rotation keys can carry, so it does not run without a refresh
+// in the middle of it. The refresh is CKKS bootstrapping, and the useful fact is
+// that HEonGPU's REGULAR bootstrapping is an identity on the plaintext
+// POLYNOMIAL and not on any particular reading of it:
+//
+//     m(x) --ModRaise--> m(x) + q I(x) --CtoS--> Encode(m + qI)
+//          --EvalMod--> Encode(m) --StoC--> m(x)
+//
+// CoeffToSlot puts the COEFFICIENTS in slots, EvalMod removes the multiples of
+// q from them, and SlotToCoeff puts them back. Nothing in that sequence asks
+// what the coefficients mean. So it refreshes a RECT column and a BATCH matrix
+// encryption exactly as it refreshes an ordinary slot ciphertext, and a refresh
+// costs no encoding crossing at all -- which matters here, because a crossing is
+// 86% of an unrefreshed block. This is asserted by test, not by argument:
+// test_ckks_llama3_rect.cpp bootstraps in all three encodings and checks the
+// matrix that comes back.
+//
+// The coefficient bound is the one condition, and the rect encoding meets it
+// more easily than the slot encoding does: a rect coefficient IS one data entry
+// times the scale, where a slot coefficient is a transform of N/2 of them.
+//
+// WHERE THE REFRESHES GO
+// ----------------------
+// Six seams per block, chosen so that no stretch between two of them spends more
+// levels than one bootstrap hands back. RectRefreshConfig names them and any of
+// them can be switched off; Llama3RectOperator::block_level_schedule() reports
+// what each stretch costs, which is the number that decides whether a chain is
+// long enough and which appears in no timing report.
+//
 // ORIENTATION AND SHAPE CONSTRAINTS
 // ---------------------------------
 // Kang's products put the encrypted operand on the LEFT, while a Llama
@@ -114,6 +146,7 @@
 
 #include <complex>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace heongpu
@@ -189,6 +222,109 @@ namespace heongpu
             int groups_for(int channels) const;
 
             double default_scale() const noexcept { return default_scale_; }
+
+            /**
+             * @brief The slot-form operator this one is built on.
+             *
+             * Exposed for one reason: the bootstrapping context is per
+             * HEArithmeticOperator instance, so generate_bootstrapping_params
+             * has to be called on THIS operator's arithmetic half and not on a
+             * second one the caller happens to own. Everything else it offers
+             * is reachable through the sublayers above.
+             */
+            Llama3Operator& arith() noexcept { return batch_.arith(); }
+
+            // ---------------------------------------------------------------
+            // The refresh
+            // ---------------------------------------------------------------
+
+            /**
+             * @brief Refresh one ciphertext, whatever encoding it carries.
+             *
+             * Regular bootstrapping is an identity on the plaintext polynomial,
+             * so this is correct on a RECT column, on a BATCH matrix
+             * encryption and on an ordinary slot ciphertext alike, and it needs
+             * no crossing to reach a form that can be refreshed. See the note
+             * at the top of this file.
+             *
+             * generate_bootstrapping_params must have run on arith() first,
+             * and @p boot_key must hold the union of this operator's
+             * rotation_indices() and arith().bootstrapping_key_indexs(). A
+             * shift-vector Galois key asked for an index it does not hold is
+             * undefined behaviour rather than an error, so build the union.
+             *
+             * Whatever levels were left are dropped: the procedure starts from
+             * a ciphertext with one prime remaining.
+             */
+            Ciphertext<Scheme::CKKS>
+            bootstrap(Ciphertext<Scheme::CKKS>& ct,
+                      Galoiskey<Scheme::CKKS>& boot_key,
+                      Relinkey<Scheme::CKKS>& relin_key);
+
+            /** @brief Refresh every ciphertext, in place. */
+            void bootstrap(std::vector<Ciphertext<Scheme::CKKS>>& ct,
+                           const char* name,
+                           Galoiskey<Scheme::CKKS>& boot_key,
+                           Relinkey<Scheme::CKKS>& relin_key);
+
+            /** @brief Refresh a rectangular activation, in place. */
+            void bootstrap(RectActivation& x, const char* name,
+                           Galoiskey<Scheme::CKKS>& boot_key,
+                           Relinkey<Scheme::CKKS>& relin_key);
+
+            /** @brief Refresh a matrix encryption, in place. */
+            void bootstrap(BatchActivation& x, const char* name,
+                           Galoiskey<Scheme::CKKS>& boot_key,
+                           Relinkey<Scheme::CKKS>& relin_key);
+
+            /**
+             * @brief Which seams of a block take a refresh.
+             *
+             * A stretch between two refreshes has to fit in what one
+             * bootstrap hands back, and these are the points at which the
+             * budget runs out on this path. Switching one off is what shows
+             * that it was needed.
+             */
+            struct RectRefreshConfig
+            {
+                /// The residual stream on the way in. False for the first
+                /// block of a stack, whose input is already fresh; true is
+                /// what joins one block to the next.
+                bool entry = false;
+                /// The normalised stream, before the projections that read it.
+                /// RMSNorm is the deepest single stretch on this path and it
+                /// leaves nothing for the Q, K and V projections behind it.
+                bool after_attention_norm = true;
+                /// The scores in slot form, before the SoftMax. This is the
+                /// image's post-QK refresh, and it is the one the SoftMax's
+                /// depth forces.
+                bool post_qk = true;
+                /// The SoftMax output, together with V. The two meet in the
+                /// value product, so refreshing one without the other only
+                /// moves the problem: V would then sit above P with no way
+                /// down to it.
+                bool post_softmax = true;
+                /// The residual stream between the two halves.
+                bool mid = true;
+                /// The normalised stream, before the gate and up projections.
+                bool after_feed_forward_norm = true;
+                /// Left off by default: the SwiGLU half fits in one stretch.
+                bool feed_forward_hidden = false;
+
+                /// Refreshes one block takes with these flags.
+                int count() const;
+            };
+
+            /**
+             * @brief Report the depth at every seam of the next block.
+             *
+             * Set to a sink to record the level schedule; the default is empty
+             * and costs nothing. It is called with the seam's name and the
+             * stream's depth at that point, which is the only place the
+             * schedule is visible -- an Nsight report has the times and not
+             * the levels.
+             */
+            std::function<void(const char* name, int depth)> depth_trace;
 
             // ---------------------------------------------------------------
             // Rotation keys
@@ -420,12 +556,19 @@ namespace heongpu
              * through Algorithm 4, and the SoftMax in slot form behind the
              * bridge. A group carries k/2 heads and one Algorithm 4 call does
              * all of them, which is the batch CCMM used for what it is for.
+             *
+             * @param boot_key Non-null with @p refresh to take the post-QK and
+             *                 post-SoftMax refreshes; null runs the sublayer in
+             *                 one stretch, which is the deepest thing on this
+             *                 path and the reason the refresh exists.
              */
             RectActivation attention(RectActivation& x,
                                      const RectAttentionWeights& weights,
                                      const RectAttentionConfig& config,
                                      Galoiskey<Scheme::CKKS>& galois_key,
-                                     Relinkey<Scheme::CKKS>& relin_key);
+                                     Relinkey<Scheme::CKKS>& relin_key,
+                                     Galoiskey<Scheme::CKKS>* boot_key = nullptr,
+                                     const RectRefreshConfig* refresh = nullptr);
 
             // ---------------------------------------------------------------
             // SwiGLU
@@ -459,11 +602,14 @@ namespace heongpu
             };
 
             /** @brief W_down (SiLU(W_gate x) * W_up x). */
-            RectActivation feed_forward(RectActivation& x,
-                                        const RectFeedForwardWeights& weights,
-                                        const RectFeedForwardConfig& config,
-                                        Galoiskey<Scheme::CKKS>& galois_key,
-                                        Relinkey<Scheme::CKKS>& relin_key);
+            RectActivation
+            feed_forward(RectActivation& x,
+                         const RectFeedForwardWeights& weights,
+                         const RectFeedForwardConfig& config,
+                         Galoiskey<Scheme::CKKS>& galois_key,
+                         Relinkey<Scheme::CKKS>& relin_key,
+                         Galoiskey<Scheme::CKKS>* boot_key = nullptr,
+                         const RectRefreshConfig* refresh = nullptr);
 
             // ---------------------------------------------------------------
             // The whole block
@@ -485,7 +631,34 @@ namespace heongpu
                 RectAttentionConfig attention;
                 RectRMSNormConfig feed_forward_norm;
                 RectFeedForwardConfig feed_forward;
+                RectRefreshConfig refresh;
+
+                /// Multiply the learned RMSNorm scale into the rows of the
+                /// projections that read the normalised stream, instead of
+                /// applying it homomorphically.
+                ///
+                /// A pre-norm block feeds its norm output to nothing but a
+                /// projection, and the scale is diagonal, so
+                /// W^T diag(g) y = (diag(g) W)^T y exactly. On the host that
+                /// is a scaling of a plaintext and free; homomorphically it is
+                /// a plaintext product and a rescale, once per norm. Two levels
+                /// a block for a host multiply, and the only cost is that the
+                /// folded weights are a second copy.
+                bool fold_norm_scale = true;
             };
+
+            /**
+             * @brief Fold a per-row scale into a projection weight, on the
+             *        host.
+             *
+             * @param weight Row major @p in_channels x @p out_channels, as
+             *               project() takes it. Row i is scaled by
+             *               @p scale[i], which is the channel the learned
+             *               RMSNorm gain belongs to.
+             */
+            static void fold_scale(std::vector<double>& weight,
+                                   const std::vector<double>& scale,
+                                   int in_channels, int out_channels);
 
             /**
              * @brief One pre-norm transformer block.
@@ -499,18 +672,19 @@ namespace heongpu
              * the block to the other and the only crossings are the ones the
              * non-linearities force.
              *
-             * There is no refresh here. Whether CKKS bootstrapping carries a
-             * rectangular encoding unchanged is untested -- it is the identity
-             * on the plaintext polynomial, so it should, but "should" is not
-             * "does" -- and a chain long enough to run a whole block on this
-             * path does not fit alongside N/2 - 1 rotation keys anyway.
+             * The refreshes are the seams named in config.refresh, and they are
+             * why the block runs at all: unrefreshed it spends more levels than
+             * a chain that also has to hold N/2 - 1 rotation keys can carry.
+             * Passing a null @p boot_key runs the block in one stretch, which
+             * is the measurement the refreshed one is compared against.
              */
             RectActivation
             transformer_block(RectActivation& x,
                               const RectTransformerBlockWeights& weights,
                               const RectTransformerBlockConfig& config,
                               Galoiskey<Scheme::CKKS>& galois_key,
-                              Relinkey<Scheme::CKKS>& relin_key);
+                              Relinkey<Scheme::CKKS>& relin_key,
+                              Galoiskey<Scheme::CKKS>* boot_key = nullptr);
 
           private:
             /// F and its inverse, as blocked slot diagonals: entry
@@ -534,6 +708,13 @@ namespace heongpu
             /// Refuse columns that have drifted apart in level or scale.
             void require_uniform(const RectActivation& in,
                                  const char* name) const;
+
+            /// Hand the seam's name and the stream's depth to depth_trace, if
+            /// one is set. Empty by default, so an unmeasured run pays a null
+            /// check per seam and nothing else.
+            void note_depth(const char* name,
+                            const std::vector<Ciphertext<Scheme::CKKS>>& ct)
+                const;
 
             /// The prime the next rescale of @p ct will divide by.
             double rescale_prime(const Ciphertext<Scheme::CKKS>& ct) const;

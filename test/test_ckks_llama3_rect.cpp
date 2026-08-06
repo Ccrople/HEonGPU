@@ -674,3 +674,217 @@ TEST(HEonGPU, CKKS_Llama3Rect_AttentionMatchesHostReference)
               << std::endl;
     EXPECT_LT(worst, 0.30 * signal);
 }
+
+// ---------------------------------------------------------------------------
+// The refresh
+// ---------------------------------------------------------------------------
+//
+// A whole block on this path spends more levels than a chain that also holds
+// 2047 rotation keys can carry, so it does not run without a refresh. The
+// refresh is CKKS bootstrapping applied to a RECT column and to a BATCH matrix
+// encryption -- neither of which is what bootstrapping is usually asked to do.
+//
+// The argument that it works is that regular bootstrapping is an identity on the
+// plaintext POLYNOMIAL: CoeffToSlot puts the coefficients in slots, EvalMod
+// takes the multiples of q out of them, SlotToCoeff puts them back, and nothing
+// in that sequence asks what the coefficients mean. The tests below are the
+// reason the argument is not simply believed.
+
+namespace
+{
+    /// A fixture shaped for bootstrapping rather than for depth.
+    ///
+    /// Three things differ from Fixture and each is required, not stylistic:
+    /// the working primes are 50 bits under a 60-bit bottom so that q0 / scale
+    /// is near 2^10, which is the ratio HEonGPU's EvalMod is fitted around; the
+    /// secret is sparse, because EvalMod's range is set by the Hamming weight;
+    /// and the Galois key is the UNION of Algorithm 5's indices and
+    /// bootstrapping's, since a shift-vector key asked for an index it does not
+    /// hold is undefined behaviour rather than an error.
+    struct BootFixture
+    {
+        static constexpr int degree = 4096;
+        static constexpr int d = 128;
+
+        heongpu::HEContext<S> context =
+            heongpu::GenHEContext<S>(heongpu::sec_level_type::none);
+        heongpu::BatchMatrixLayout layout;
+        double scale = std::pow(2.0, 50);
+
+        std::unique_ptr<heongpu::HEKeyGenerator<S>> keygen;
+        std::unique_ptr<heongpu::Secretkey<S>> secret;
+        std::unique_ptr<heongpu::Publickey<S>> pub;
+        std::unique_ptr<heongpu::HEEncryptor<S>> encryptor;
+        std::unique_ptr<heongpu::HEDecryptor<S>> decryptor;
+        std::unique_ptr<heongpu::HEEncoder<S>> encoder;
+        std::unique_ptr<Rect> op;
+        std::unique_ptr<heongpu::Galoiskey<S>> galois;
+        std::unique_ptr<heongpu::Relinkey<S>> relin;
+        int limbs = 0;
+
+        explicit BootFixture(int chain_limbs) : limbs(chain_limbs)
+        {
+            std::vector<int> logq{60};
+            logq.insert(logq.end(), limbs - 1, 50);
+            // dnum = 1: 2047 switching keys fit at no other decomposition.
+            std::vector<int> logp(limbs, 60);
+
+            context->set_poly_modulus_degree(static_cast<size_t>(degree));
+            context->set_coeff_modulus_bit_sizes(logq, logp);
+            context->generate();
+
+            layout = heongpu::BatchMatrixLayout(degree, d);
+
+            keygen = std::make_unique<heongpu::HEKeyGenerator<S>>(context);
+            secret = std::make_unique<heongpu::Secretkey<S>>(context, 16);
+            keygen->generate_secret_key(*secret);
+            pub = std::make_unique<heongpu::Publickey<S>>(context);
+            keygen->generate_public_key(*pub, *secret);
+            encryptor =
+                std::make_unique<heongpu::HEEncryptor<S>>(context, *pub);
+            decryptor =
+                std::make_unique<heongpu::HEDecryptor<S>>(context, *secret);
+            encoder = std::make_unique<heongpu::HEEncoder<S>>(context);
+            op = std::make_unique<Rect>(context, *encoder, layout, scale);
+
+            heongpu::BootstrappingConfig boot_config(3, 3, 11, true);
+            op->arith().generate_bootstrapping_params(
+                scale, boot_config,
+                heongpu::arithmetic_bootstrapping_type::
+                    REGULAR_BOOTSTRAPPING);
+
+            std::vector<int> shifts = op->rotation_indices();
+            const std::vector<int> boot =
+                op->arith().bootstrapping_key_indexs();
+            shifts.insert(shifts.end(), boot.begin(), boot.end());
+            std::sort(shifts.begin(), shifts.end());
+            shifts.erase(std::unique(shifts.begin(), shifts.end()),
+                         shifts.end());
+
+            galois = std::make_unique<heongpu::Galoiskey<S>>(context, shifts);
+            keygen->generate_galois_key(*galois, *secret);
+            relin = std::make_unique<heongpu::Relinkey<S>>(context);
+            keygen->generate_relin_key(*relin, *secret);
+        }
+
+        int half() const { return degree / 2; }
+    };
+} // namespace
+
+// The claim, on the encoding the stream actually lives in. A rect column holds
+// one data entry per COEFFICIENT, so if bootstrapping were a slot-domain
+// operation rather than a polynomial one this would come back as noise.
+TEST(HEonGPU, CKKS_Llama3Rect_RefreshPreservesTheRectangularEncoding)
+{
+    BootFixture fx(31);
+    const int channels = fx.half();
+
+    const std::vector<double> x =
+        random_matrix(BootFixture::d, channels, 60601u);
+
+    heongpu::llama::RectActivation ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+    const int before = ct.column.front().depth();
+
+    fx.op->bootstrap(ct, "test.refresh", *fx.galois, *fx.relin);
+    const int after = ct.column.front().depth();
+
+    const std::vector<double> got =
+        fx.op->decrypt(ct, *fx.decryptor, ct.column.front().scale());
+
+    const double worst = worst_diff(x, got);
+    std::cout << "rect refresh: depth " << before << " -> " << after << " ("
+              << (fx.limbs - after) << " limbs left of " << fx.limbs
+              << "), worst error " << worst << std::endl;
+    // A refresh has to hand back levels to be worth taking at all.
+    EXPECT_LT(after, fx.limbs - 1);
+    EXPECT_LT(worst, 5e-2);
+}
+
+// The same claim for the encoding Algorithm 4 consumes. The crossing on either
+// side of the refresh is itself lossy, so this is checked against a run of the
+// same crossings WITHOUT a refresh between them: what is being measured is the
+// refresh, not the bridge.
+TEST(HEonGPU, CKKS_Llama3Rect_RefreshPreservesTheMatrixEncoding)
+{
+    BootFixture fx(31);
+    const int channels = fx.half();
+
+    const std::vector<double> x =
+        random_matrix(BootFixture::d, channels, 61601u);
+
+    auto round_trip = [&](bool refresh)
+    {
+        heongpu::llama::RectActivation ct =
+            fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+        std::vector<heongpu::llama::BatchActivation> one;
+        one.push_back(fx.op->to_batch(ct, 0, *fx.galois));
+        if (refresh)
+        {
+            fx.op->bootstrap(one.front(), "test.refresh_batch", *fx.galois,
+                             *fx.relin);
+        }
+        heongpu::llama::RectActivation back =
+            fx.op->from_batch(one, channels, *fx.galois);
+        return fx.op->decrypt(back, *fx.decryptor,
+                              back.column.front().scale());
+    };
+
+    const std::vector<double> plain = round_trip(false);
+    const std::vector<double> refreshed = round_trip(true);
+
+    std::cout << "batch refresh: bridge alone " << worst_diff(x, plain)
+              << ", bridge with a refresh in it " << worst_diff(x, refreshed)
+              << std::endl;
+    EXPECT_LT(worst_diff(x, refreshed), 5e-2);
+}
+
+// The level the fold saves is only saved if the fold is right. Scaling the rows
+// of a projection by the learned gain has to be the same as scaling the
+// channels of the activation by it, which is what the homomorphic RMSNorm does.
+TEST(HEonGPU, CKKS_Llama3Rect_FoldedNormScaleMatchesTheScaledActivation)
+{
+    Fixture fx(4, 2);
+    const int d = Fixture::d;
+    const int channels = fx.half();
+    const double amp = 1.0 / std::sqrt(static_cast<double>(channels));
+
+    const std::vector<double> x = random_matrix(d, channels, 62601u);
+    const std::vector<double> gain = random_matrix(1, channels, 62701u, 0.5);
+    const std::vector<double> weight =
+        random_matrix(channels, channels, 62801u, amp);
+
+    // The activation with the gain already in it, which is what RMSNorm hands
+    // to the projection when the gain is applied homomorphically.
+    std::vector<double> scaled(x.size());
+    for (int i = 0; i < d; ++i)
+        for (int c = 0; c < channels; ++c)
+            scaled[static_cast<size_t>(i) * channels + c] =
+                x[static_cast<size_t>(i) * channels + c] * gain[c];
+
+    std::vector<double> folded = weight;
+    Rect::fold_scale(folded, gain, channels, channels);
+
+    heongpu::llama::RectActivation a =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+    heongpu::llama::RectActivation b =
+        fx.op->encrypt(scaled, channels, *fx.encryptor, fx.scale);
+
+    heongpu::llama::RectActivation with_fold =
+        fx.op->project(a, folded, channels, channels, "folded", *fx.galois);
+    heongpu::llama::RectActivation without =
+        fx.op->project(b, weight, channels, channels, "plain", *fx.galois);
+
+    const std::vector<double> got_folded = fx.op->decrypt(
+        with_fold, *fx.decryptor, with_fold.column.front().scale());
+    const std::vector<double> got_plain = fx.op->decrypt(
+        without, *fx.decryptor, without.column.front().scale());
+
+    double signal = 0.0;
+    for (double v : got_plain)
+        signal = std::max(signal, std::abs(v));
+    const double worst = worst_diff(got_folded, got_plain);
+    std::cout << "folded gain worst error: " << worst << " against a signal of "
+              << signal << std::endl;
+    EXPECT_LT(worst, 1e-3 * std::max(signal, 1.0));
+}

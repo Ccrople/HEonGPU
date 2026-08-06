@@ -552,6 +552,106 @@ namespace heongpu
         }
 
         // -------------------------------------------------------------------
+        // The refresh
+        // -------------------------------------------------------------------
+
+        int Llama3RectOperator::RectRefreshConfig::count() const
+        {
+            return static_cast<int>(entry) +
+                   static_cast<int>(after_attention_norm) +
+                   static_cast<int>(post_qk) + static_cast<int>(post_softmax) +
+                   static_cast<int>(mid) +
+                   static_cast<int>(after_feed_forward_norm) +
+                   static_cast<int>(feed_forward_hidden);
+        }
+
+        Ciphertext<Scheme::CKKS>
+        Llama3RectOperator::bootstrap(Ciphertext<Scheme::CKKS>& ct,
+                                      Galoiskey<Scheme::CKKS>& boot_key,
+                                      Relinkey<Scheme::CKKS>& relin_key)
+        {
+            // Nothing here reads the encoding, and that is the point: the
+            // procedure is an identity on the plaintext polynomial, so the
+            // rectangular and the matrix encodings are refreshed where they
+            // stand rather than crossed into slot form and back.
+            return batch_.arith().bootstrap(ct, boot_key, relin_key);
+        }
+
+        void Llama3RectOperator::bootstrap(
+            std::vector<Ciphertext<Scheme::CKKS>>& ct, const char* name,
+            Galoiskey<Scheme::CKKS>& boot_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            if (ct.empty())
+            {
+                return;
+            }
+
+            Range _r(name);
+            // One at a time. A bootstrap fills the slots on its own, so there
+            // is nothing for two of them to share, and holding a second full
+            // ciphertext at the raised modulus is exactly what a card this
+            // full does not have.
+            for (auto& c : ct)
+            {
+                c = bootstrap(c, boot_key, relin_key);
+            }
+        }
+
+        void Llama3RectOperator::bootstrap(RectActivation& x, const char* name,
+                                           Galoiskey<Scheme::CKKS>& boot_key,
+                                           Relinkey<Scheme::CKKS>& relin_key)
+        {
+            bootstrap(x.column, name, boot_key, relin_key);
+        }
+
+        void Llama3RectOperator::bootstrap(BatchActivation& x, const char* name,
+                                           Galoiskey<Scheme::CKKS>& boot_key,
+                                           Relinkey<Scheme::CKKS>& relin_key)
+        {
+            bootstrap(x.column, name, boot_key, relin_key);
+        }
+
+        void Llama3RectOperator::note_depth(
+            const char* name,
+            const std::vector<Ciphertext<Scheme::CKKS>>& ct) const
+        {
+            if (depth_trace && !ct.empty())
+            {
+                depth_trace(name, ct.front().depth());
+            }
+        }
+
+        void Llama3RectOperator::fold_scale(std::vector<double>& weight,
+                                            const std::vector<double>& scale,
+                                            int in_channels, int out_channels)
+        {
+            if (scale.empty())
+            {
+                return;
+            }
+            if (static_cast<int>(scale.size()) != in_channels ||
+                weight.size() != static_cast<size_t>(in_channels) *
+                                     static_cast<size_t>(out_channels))
+            {
+                throw std::invalid_argument(
+                    "A folded scale is one entry per input channel of a row "
+                    "major in_channels x out_channels weight");
+            }
+
+            for (int i = 0; i < in_channels; ++i)
+            {
+                const double g = scale[i];
+                double* row =
+                    weight.data() + static_cast<size_t>(i) * out_channels;
+                for (int j = 0; j < out_channels; ++j)
+                {
+                    row[j] *= g;
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------
         // The products
         // -------------------------------------------------------------------
 
@@ -839,8 +939,15 @@ namespace heongpu
                                       const RectAttentionWeights& weights,
                                       const RectAttentionConfig& config,
                                       Galoiskey<Scheme::CKKS>& galois_key,
-                                      Relinkey<Scheme::CKKS>& relin_key)
+                                      Relinkey<Scheme::CKKS>& relin_key,
+                                      Galoiskey<Scheme::CKKS>* boot_key,
+                                      const RectRefreshConfig* refresh)
         {
+            const bool refresh_qk =
+                boot_key != nullptr && refresh != nullptr && refresh->post_qk;
+            const bool refresh_pv = boot_key != nullptr && refresh != nullptr &&
+                                    refresh->post_softmax;
+
             const int d = layout_.d;
             const int half = layout_.N / 2;
             const int heads = config.heads;
@@ -928,6 +1035,7 @@ namespace heongpu
             RectActivation v =
                 project(x, expand(weights.value), config.in_channels,
                         q_channels, "attention.v", galois_key);
+            note_depth("attention.projected", q.column);
 
             const int q_groups = q.groups;
             std::vector<BatchActivation> out_groups;
@@ -970,6 +1078,17 @@ namespace heongpu
                     slots = batch_.to_slots(scores, galois_key);
                 }
                 scores.column.clear();
+                note_depth("attention.scored", slots);
+
+                // The post-QK refresh. The SoftMax is the deepest stretch of
+                // the sublayer and there is nothing left for it by here, so
+                // this seam is the one the schedule is built around.
+                if (refresh_qk)
+                {
+                    bootstrap(slots, "attention.refresh_post_qk", *boot_key,
+                              relin_key);
+                    note_depth("attention.refresh_post_qk", slots);
+                }
 
                 if (config.score_shift != 0.0)
                 {
@@ -1004,6 +1123,20 @@ namespace heongpu
                         slots, softmax, masks, galois_key, relin_key);
                 }
                 slots.clear();
+                note_depth("attention.softmaxed", p_slots);
+
+                // The post-SoftMax refresh, taken on P and on V together. They
+                // meet in the value product below, and the only way down
+                // between two levels is a drop: refreshing P alone would put it
+                // ABOVE V, which is a direction no ciphertext travels.
+                if (refresh_pv)
+                {
+                    bootstrap(p_slots, "attention.refresh_post_softmax",
+                              *boot_key, relin_key);
+                    bootstrap(vb, "attention.refresh_value", *boot_key,
+                              relin_key);
+                    note_depth("attention.refresh_post_softmax", p_slots);
+                }
 
                 BatchActivation p;
                 {
@@ -1041,10 +1174,14 @@ namespace heongpu
 
             if (weights.output.empty())
             {
+                note_depth("attention.out", out.column);
                 return out;
             }
-            return project(out, weights.output, q_channels, config.in_channels,
-                           "attention.o", galois_key);
+            RectActivation projected =
+                project(out, weights.output, q_channels, config.in_channels,
+                        "attention.o", galois_key);
+            note_depth("attention.out", projected.column);
+            return projected;
         }
 
         // -------------------------------------------------------------------
@@ -1056,9 +1193,15 @@ namespace heongpu
                                          const RectFeedForwardWeights& weights,
                                          const RectFeedForwardConfig& config,
                                          Galoiskey<Scheme::CKKS>& galois_key,
-                                         Relinkey<Scheme::CKKS>& relin_key)
+                                         Relinkey<Scheme::CKKS>& relin_key,
+                                         Galoiskey<Scheme::CKKS>* boot_key,
+                                         const RectRefreshConfig* refresh)
         {
             require_uniform(x, "feed_forward");
+
+            const bool refresh_hidden = boot_key != nullptr &&
+                                        refresh != nullptr &&
+                                        refresh->feed_forward_hidden;
 
             Range _r("feed_forward");
 
@@ -1153,6 +1296,18 @@ namespace heongpu
                 }
                 gate_slots.clear();
                 up_slots.clear();
+                note_depth("ffn.activated", hidden);
+
+                // The SwiGLU half fits between two refreshes without this one,
+                // so it is off by default; it is here because the SiLU degree
+                // is the knob most likely to be turned back up, and this is the
+                // seam that pays for it when it is.
+                if (refresh_hidden)
+                {
+                    bootstrap(hidden, "ffn.refresh_hidden", *boot_key,
+                              relin_key);
+                    note_depth("ffn.refresh_hidden", hidden);
+                }
 
                 RectActivation h;
                 {
@@ -1198,11 +1353,16 @@ namespace heongpu
             RectActivation& x, const RectTransformerBlockWeights& weights,
             const RectTransformerBlockConfig& config,
             Galoiskey<Scheme::CKKS>& galois_key,
-            Relinkey<Scheme::CKKS>& relin_key)
+            Relinkey<Scheme::CKKS>& relin_key,
+            Galoiskey<Scheme::CKKS>* boot_key)
         {
             require_uniform(x, "transformer_block");
 
             Range _r("transformer_block");
+
+            const RectRefreshConfig& refresh = config.refresh;
+            const RectRefreshConfig* plan =
+                boot_key != nullptr ? &refresh : nullptr;
 
             RectActivation stream;
             stream.rows = x.rows;
@@ -1210,33 +1370,109 @@ namespace heongpu
             stream.channels = x.channels;
             stream.column = x.column;
 
+            // The learned gains, folded into the projections that read them
+            // rather than applied homomorphically. Row i of a projection is
+            // the input channel the gain belongs to, so this is exact, and it
+            // is the one level a pre-norm block gives up for nothing.
+            // Only the projections that read the NORMALISED stream take the
+            // gain. W_o reads the attention output and W_down the hidden, so
+            // neither of them does.
+            RectAttentionWeights folded_attention;
+            RectFeedForwardWeights folded_feed_forward;
+            const RectAttentionWeights* attention_weights = &weights.attention;
+            const RectFeedForwardWeights* feed_forward_weights =
+                &weights.feed_forward;
+            std::vector<double> attention_gain = weights.attention_norm;
+            std::vector<double> feed_forward_gain = weights.feed_forward_norm;
+            if (config.fold_norm_scale)
+            {
+                const int in = config.attention.in_channels;
+                const int kv = (config.attention.kv_heads > 0
+                                    ? config.attention.kv_heads
+                                    : config.attention.heads) *
+                               layout_.d;
+                folded_attention = weights.attention;
+                folded_feed_forward = weights.feed_forward;
+                fold_scale(folded_attention.query, attention_gain, in,
+                           config.attention.heads * layout_.d);
+                fold_scale(folded_attention.key, attention_gain, in, kv);
+                fold_scale(folded_attention.value, attention_gain, in, kv);
+                fold_scale(folded_feed_forward.gate, feed_forward_gain,
+                           config.feed_forward.in_channels,
+                           config.feed_forward.hidden_channels);
+                fold_scale(folded_feed_forward.up, feed_forward_gain,
+                           config.feed_forward.in_channels,
+                           config.feed_forward.hidden_channels);
+                attention_weights = &folded_attention;
+                feed_forward_weights = &folded_feed_forward;
+                attention_gain.clear();
+                feed_forward_gain.clear();
+            }
+
+            note_depth("block.entry", stream.column);
+            if (boot_key != nullptr && refresh.entry)
+            {
+                bootstrap(stream, "block.refresh_entry", *boot_key, relin_key);
+                note_depth("block.refresh_entry", stream.column);
+            }
+
             {
                 Range _r_half("transformer_block.attention_half");
                 RectActivation normed =
-                    rms_norm(stream, weights.attention_norm,
-                             config.attention_norm, galois_key, relin_key);
+                    rms_norm(stream, attention_gain, config.attention_norm,
+                             galois_key, relin_key);
+                note_depth("block.attention_norm", normed.column);
+
+                // RMSNorm is the deepest single stretch on this path and it
+                // ends with nothing to spend, so the projections behind it
+                // need the stream back at the top of the chain.
+                if (boot_key != nullptr && refresh.after_attention_norm)
+                {
+                    bootstrap(normed, "block.refresh_attention_norm", *boot_key,
+                              relin_key);
+                    note_depth("block.refresh_attention_norm", normed.column);
+                }
+
                 RectActivation sublayer =
-                    attention(normed, weights.attention, config.attention,
-                              galois_key, relin_key);
+                    attention(normed, *attention_weights, config.attention,
+                              galois_key, relin_key, boot_key, plan);
                 normed.column.clear();
                 // The two operands have been through completely different
                 // circuits, so neither the level nor the scale lines up; this
                 // is the one level a pre-norm residual pays.
                 stream.column = batch_.arith().residual_add(stream.column,
                                                             sublayer.column);
+                note_depth("block.attention_residual", stream.column);
+            }
+
+            if (boot_key != nullptr && refresh.mid)
+            {
+                bootstrap(stream, "block.refresh_mid", *boot_key, relin_key);
+                note_depth("block.refresh_mid", stream.column);
             }
 
             {
                 Range _r_half("transformer_block.feed_forward_half");
                 RectActivation normed =
-                    rms_norm(stream, weights.feed_forward_norm,
+                    rms_norm(stream, feed_forward_gain,
                              config.feed_forward_norm, galois_key, relin_key);
-                RectActivation sublayer =
-                    feed_forward(normed, weights.feed_forward,
-                                 config.feed_forward, galois_key, relin_key);
+                note_depth("block.feed_forward_norm", normed.column);
+
+                if (boot_key != nullptr && refresh.after_feed_forward_norm)
+                {
+                    bootstrap(normed, "block.refresh_feed_forward_norm",
+                              *boot_key, relin_key);
+                    note_depth("block.refresh_feed_forward_norm",
+                               normed.column);
+                }
+
+                RectActivation sublayer = feed_forward(
+                    normed, *feed_forward_weights, config.feed_forward,
+                    galois_key, relin_key, boot_key, plan);
                 normed.column.clear();
                 stream.column = batch_.arith().residual_add(stream.column,
                                                             sublayer.column);
+                note_depth("block.feed_forward_residual", stream.column);
             }
 
             return stream;
