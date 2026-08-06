@@ -914,8 +914,23 @@ namespace heongpu
             // wrong scales every output by a constant and nothing else
             // complains.
             const int reduced = config.count * channel_blocks;
-            if (config.channels <= reduced - config.count ||
-                config.channels > reduced)
+            if (config.blocked_span > 0)
+            {
+                // A blocked reduction spreads the padding across every
+                // ciphertext rather than confining it to the last one, so the
+                // tight window below does not apply. A padded coordinate is
+                // zero and contributes nothing to the sum of squares, so all
+                // that is needed is that the mean divides by no more channels
+                // than the reduction actually covers.
+                if (config.channels <= 0 || config.channels > reduced)
+                {
+                    throw std::invalid_argument(
+                        "RMSNorm's channel count must be positive and at most "
+                        "the number of channels the blocked reduction covers");
+                }
+            }
+            else if (config.channels <= reduced - config.count ||
+                     config.channels > reduced)
             {
                 throw std::invalid_argument(
                     "RMSNorm's channel count must lie in (count * (channel "
@@ -973,7 +988,19 @@ namespace heongpu
                         add_same_scale(total, term, "rms_norm channel sum");
                     }
 
-                    sum_strided(total, config.stride, config.count, galois_key);
+                    // The channels of one ciphertext are either the slow slot
+                    // axis, where the reduction is free, or the fast one, where
+                    // it costs a mask. Which of the two is a property of the
+                    // encoding and not of RMSNorm.
+                    if (config.blocked_span > 0)
+                    {
+                        sum_blocked(total, config.blocked_span, galois_key);
+                    }
+                    else
+                    {
+                        sum_strided(total, config.stride, config.count,
+                                    galois_key);
+                    }
 
                     // mean + eps. Both are one cheap step on an already reduced
                     // value.

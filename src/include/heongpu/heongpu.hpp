@@ -35,6 +35,7 @@
 #include <heongpu/host/ckks/batchmatrix.cuh>
 #include <heongpu/host/ckks/llama3.cuh>
 #include <heongpu/host/ckks/llama3_batch.cuh>
+#include <heongpu/host/ckks/llama3_rect.cuh>
 
 #include <heongpu/host/tfhe/context.cuh>
 #include <heongpu/host/tfhe/secretkey.cuh>

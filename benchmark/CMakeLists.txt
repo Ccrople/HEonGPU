@@ -13,6 +13,7 @@ set(EXECUTABLES
     llama3_profile profile_llama3.cpp
     llama3_batch_profile profile_llama3_batch.cpp
     llama3_nobatch_profile profile_llama3_nobatch.cpp
+    llama3_rect_profile profile_llama3_rect.cpp
 )
 
 function(add_benchmark exe source)

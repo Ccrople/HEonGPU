@@ -382,6 +382,19 @@ namespace heongpu
                 double sum_hi = 0.0;
                 int degree = 31;
                 int newton_iterations = 2;
+                /// Span of a BLOCKED reduction over the channels held in one
+                /// ciphertext, or 0 for the strided reduction above.
+                ///
+                /// The strided form is free and is what Section 3.2's layout
+                /// buys; it needs the channel axis to be the SLOW slot axis. An
+                /// encoding that puts several channels on the FAST axis instead
+                /// -- which is what the rectangular packing of Algorithm 5
+                /// leaves behind -- cannot use it, because a rotation there
+                /// mixes neighbouring tokens. Setting this reduces each aligned
+                /// run of @c blocked_span slots instead, at the one level a mask
+                /// costs. @c count must still be the number of channels being
+                /// reduced, since that is what the mean divides by.
+                int blocked_span = 0;
             };
 
             /**

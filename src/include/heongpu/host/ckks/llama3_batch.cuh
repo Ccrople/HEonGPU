@@ -285,6 +285,22 @@ namespace heongpu
             /** @brief Every rotation index this operator can ask for. */
             std::vector<int> rotation_indices() const;
 
+            /**
+             * @brief The batch matrix operator behind this one.
+             *
+             * Exposed so a caller running a different algorithm of the same
+             * paper -- Algorithm 5, say -- can reuse this operator's twiddle
+             * caches and its bridge rather than construct a second copy of
+             * everything. It is the same object the products below use.
+             */
+            HEBatchMatrixOperator<Scheme::CKKS>& matrix() noexcept
+            {
+                return matrix_;
+            }
+
+            /** @brief The slot-form operator the non-linearities run on. */
+            Llama3Operator& arith() noexcept { return arith_; }
+
             // ---------------------------------------------------------------
             // Attention
             // ---------------------------------------------------------------

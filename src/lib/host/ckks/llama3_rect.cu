@@ -1,0 +1,1393 @@
+// Copyright 2026
+// Licensed under the Apache License, Version 2.0, see LICENSE for details.
+// SPDX-License-Identifier: Apache-2.0
+
+#include <heongpu/host/ckks/llama3_rect.cuh>
+
+#include <nvtx3/nvToolsExt.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
+namespace heongpu
+{
+    namespace llama
+    {
+        namespace
+        {
+            /// Scoped NVTX range, matching the taxonomy llama3.cu and
+            /// llama3_batch.cu publish so a capture can put the three matrix
+            /// paths side by side.
+            struct Range
+            {
+                explicit Range(const char* name) { nvtxRangePushA(name); }
+                Range(const Range&) = delete;
+                Range& operator=(const Range&) = delete;
+                ~Range() { nvtxRangePop(); }
+            };
+
+            /// The same, for a step inside a helper several callers share.
+            struct SuffixRange
+            {
+                SuffixRange(const char* prefix, const char* suffix)
+                {
+                    char name[80];
+                    std::snprintf(name, sizeof(name), "%s.%s", prefix, suffix);
+                    nvtxRangePushA(name);
+                }
+                SuffixRange(const SuffixRange&) = delete;
+                SuffixRange& operator=(const SuffixRange&) = delete;
+                ~SuffixRange() { nvtxRangePop(); }
+            };
+
+            using cd = std::complex<double>;
+
+            /// Gauss-Jordan with partial pivoting on a dense complex matrix.
+            ///
+            /// The matrix inverted here is F[b][t] = zeta^{5^b t}, a Vandermonde
+            /// in k/2 distinct 2k-th roots of unity, so it is a scaled DFT and
+            /// about as well conditioned as a dense inverse ever is. This runs
+            /// once per operator.
+            std::vector<cd> invert(std::vector<cd> a, int n)
+            {
+                std::vector<cd> inv(static_cast<size_t>(n) * n, cd(0.0, 0.0));
+                for (int i = 0; i < n; ++i)
+                {
+                    inv[static_cast<size_t>(i) * n + i] = cd(1.0, 0.0);
+                }
+
+                for (int col = 0; col < n; ++col)
+                {
+                    int pivot = col;
+                    double best =
+                        std::abs(a[static_cast<size_t>(col) * n + col]);
+                    for (int r = col + 1; r < n; ++r)
+                    {
+                        const double m =
+                            std::abs(a[static_cast<size_t>(r) * n + col]);
+                        if (m > best)
+                        {
+                            best = m;
+                            pivot = r;
+                        }
+                    }
+                    if (best < 1e-12)
+                    {
+                        throw std::runtime_error(
+                            "the block transform is singular, which means the "
+                            "layout's k/2 evaluation points are not distinct");
+                    }
+                    if (pivot != col)
+                    {
+                        for (int c = 0; c < n; ++c)
+                        {
+                            std::swap(a[static_cast<size_t>(col) * n + c],
+                                      a[static_cast<size_t>(pivot) * n + c]);
+                            std::swap(inv[static_cast<size_t>(col) * n + c],
+                                      inv[static_cast<size_t>(pivot) * n + c]);
+                        }
+                    }
+
+                    const cd piv = a[static_cast<size_t>(col) * n + col];
+                    for (int c = 0; c < n; ++c)
+                    {
+                        a[static_cast<size_t>(col) * n + c] /= piv;
+                        inv[static_cast<size_t>(col) * n + c] /= piv;
+                    }
+
+                    for (int r = 0; r < n; ++r)
+                    {
+                        if (r == col)
+                        {
+                            continue;
+                        }
+                        const cd f = a[static_cast<size_t>(r) * n + col];
+                        if (f == cd(0.0, 0.0))
+                        {
+                            continue;
+                        }
+                        for (int c = 0; c < n; ++c)
+                        {
+                            a[static_cast<size_t>(r) * n + c] -=
+                                f * a[static_cast<size_t>(col) * n + c];
+                            inv[static_cast<size_t>(r) * n + c] -=
+                                f * inv[static_cast<size_t>(col) * n + c];
+                        }
+                    }
+                }
+                return inv;
+            }
+
+            inline int64_t quantise(double v, double scale)
+            {
+                return static_cast<int64_t>(std::llround(v * scale));
+            }
+        } // namespace
+
+        // -------------------------------------------------------------------
+        // Construction
+        // -------------------------------------------------------------------
+
+        Llama3RectOperator::Llama3RectOperator(
+            HEContext<Scheme::CKKS> context, HEEncoder<Scheme::CKKS>& encoder,
+            const BatchMatrixLayout& layout, double scale)
+            : context_(context), encoder_(encoder),
+              batch_(context, encoder, layout, scale), layout_(layout),
+              primes_(context->get_key_modulus()),
+              slot_count_(encoder.slot_count()), default_scale_(scale)
+        {
+            if (layout_.N != slot_count_ * 2)
+            {
+                throw std::invalid_argument(
+                    "The batch matrix layout must be built for this context's "
+                    "ring: layout.N has to be twice the slot count");
+            }
+            build_block_tables();
+        }
+
+        int Llama3RectOperator::groups_for(int channels) const
+        {
+            if (channels <= 0)
+            {
+                throw std::invalid_argument(
+                    "An activation with no channels is not an activation");
+            }
+            const int half = channels_per_group();
+            return (channels + half - 1) / half;
+        }
+
+        // -------------------------------------------------------------------
+        // The block transform
+        // -------------------------------------------------------------------
+
+        void Llama3RectOperator::build_block_tables()
+        {
+            const int d = layout_.d;
+            const int N = layout_.N;
+            const int step = layout_.batch; // k/2
+            const double pi = std::acos(-1.0);
+            const uint64_t mod = 2ull * static_cast<uint64_t>(N);
+
+            forward_block_.clear();
+            inverse_block_.clear();
+            if (step == 1)
+            {
+                // One block per group: the transform is the identity on a
+                // single value and there is nothing to build.
+                return;
+            }
+
+            auto psi_pow = [&](uint64_t e)
+            {
+                return std::polar(1.0, pi * static_cast<double>(e % mod) /
+                                           static_cast<double>(N));
+            };
+
+            // exponent[b] = 5^b mod 2N, the Galois element rotation index b
+            // names. Slot s evaluates at psi^{5^s}, and 5 has order k/2 modulo
+            // 2k, so the SUBRING point psi^{5^s d} depends only on s mod (k/2)
+            // -- which is exactly why the block index rides the fast slot axis.
+            std::vector<uint64_t> exponent(step);
+            {
+                uint64_t g = 1;
+                for (int b = 0; b < step; ++b)
+                {
+                    exponent[b] = g;
+                    g = (g * 5ull) % mod;
+                }
+            }
+
+            // F[b][t] = zeta^{5^b t} with zeta = psi^d, the primitive 2k-th
+            // root the subring transform induces.
+            std::vector<cd> F(static_cast<size_t>(step) * step);
+            for (int b = 0; b < step; ++b)
+            {
+                for (int t = 0; t < step; ++t)
+                {
+                    const uint64_t e = (exponent[b] * static_cast<uint64_t>(d) *
+                                        static_cast<uint64_t>(t)) %
+                                       mod;
+                    F[static_cast<size_t>(b) * step + t] = psi_pow(e);
+                }
+            }
+            const std::vector<cd> Finv = invert(F, step);
+
+            // Blocked diagonals. The block index is the FAST slot axis with
+            // span k/2, so a rotation by eps takes b to b + eps and spills into
+            // the neighbouring token when it leaves the block; the diagonal is
+            // zero exactly where it spills, which is what confines the map to
+            // one token.
+            const int count = 2 * step - 1;
+            forward_block_.assign(
+                count, std::vector<Complex64>(slot_count_, Complex64(0.0, 0.0)));
+            inverse_block_.assign(
+                count, std::vector<Complex64>(slot_count_, Complex64(0.0, 0.0)));
+
+            for (int e = 0; e < count; ++e)
+            {
+                const int eps = e - (step - 1);
+                for (int b = 0; b < step; ++b)
+                {
+                    const int bp = b + eps;
+                    if (bp < 0 || bp >= step)
+                    {
+                        continue;
+                    }
+                    const cd& f = F[static_cast<size_t>(b) * step + bp];
+                    const cd& g = Finv[static_cast<size_t>(b) * step + bp];
+                    for (int u = 0; u < d; ++u)
+                    {
+                        const int slot = b + u * step;
+                        forward_block_[e][slot] = Complex64(f.real(), f.imag());
+                        inverse_block_[e][slot] = Complex64(g.real(), g.imag());
+                    }
+                }
+            }
+        }
+
+        std::vector<int> Llama3RectOperator::block_rotation_indices() const
+        {
+            const int step = layout_.batch;
+            std::vector<int> indices;
+            if (step == 1)
+            {
+                return indices;
+            }
+            indices.reserve(2 * step - 2);
+            for (int eps = -(step - 1); eps <= step - 1; ++eps)
+            {
+                if (eps == 0)
+                {
+                    continue;
+                }
+                indices.push_back(eps > 0 ? eps : slot_count_ + eps);
+            }
+            return indices;
+        }
+
+        std::vector<int> Llama3RectOperator::rotation_indices() const
+        {
+            std::vector<int> all = get_rectangular_rotation_indices(layout_);
+
+            const std::vector<int> bridge = batch_.rotation_indices();
+            all.insert(all.end(), bridge.begin(), bridge.end());
+
+            const std::vector<int> block = block_rotation_indices();
+            all.insert(all.end(), block.begin(), block.end());
+
+            // RMSNorm reduces the channels held inside one ciphertext, and they
+            // are the fast axis here, so it is the masked reduction rather than
+            // the free one.
+            const std::vector<int> reduce =
+                Llama3Operator::blocked_rotation_indices(layout_.batch);
+            for (int r : reduce)
+            {
+                all.push_back(r >= 0 ? r : slot_count_ + r);
+            }
+
+            std::sort(all.begin(), all.end());
+            all.erase(std::unique(all.begin(), all.end()), all.end());
+            return all;
+        }
+
+        void Llama3RectOperator::block_map(
+            std::vector<Ciphertext<Scheme::CKKS>>& ct, bool inverse,
+            const char* name, Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            const int step = layout_.batch;
+            if (ct.empty() || step == 1)
+            {
+                return;
+            }
+
+            const std::vector<std::vector<Complex64>>& diagonal =
+                inverse ? inverse_block_ : forward_block_;
+
+            Range _r_block(name);
+
+            const int depth = ct.front().depth();
+            const double plain_scale = rescale_prime(ct.front());
+            for (const auto& c : ct)
+            {
+                if (c.depth() != depth)
+                {
+                    throw std::invalid_argument(
+                        "The block transform adds its diagonals together, so "
+                        "every ciphertext in one call has to share a level");
+                }
+            }
+
+            // Every ciphertext in the call meets the same diagonals at the same
+            // level, so they are encoded once rather than once per column. The
+            // row bridge does not do this, and plaintext encoding is the single
+            // largest kernel in every profile of that path.
+            std::vector<Plaintext<Scheme::CKKS>> plain;
+            std::vector<int> shift;
+            {
+                SuffixRange _r(name, "encode_diagonals");
+                plain.reserve(diagonal.size());
+                shift.reserve(diagonal.size());
+                for (size_t e = 0; e < diagonal.size(); ++e)
+                {
+                    const int eps = static_cast<int>(e) - (step - 1);
+                    plain.push_back(encode(diagonal[e], plain_scale, depth));
+                    shift.push_back(eps);
+                }
+            }
+
+            for (auto& source : ct)
+            {
+                Ciphertext<Scheme::CKKS> acc(context_);
+                bool started = false;
+
+                SuffixRange _r(name, "diagonals");
+                for (size_t e = 0; e < plain.size(); ++e)
+                {
+                    const int eps = shift[e];
+
+                    Ciphertext<Scheme::CKKS> rotated(context_);
+                    if (eps == 0)
+                    {
+                        rotated = source;
+                    }
+                    else
+                    {
+                        batch_.arith().rotate_rows(
+                            source, rotated, galois_key,
+                            eps > 0 ? eps : slot_count_ + eps);
+                    }
+
+                    Ciphertext<Scheme::CKKS> term(context_);
+                    batch_.arith().multiply_plain(rotated, plain[e], term);
+
+                    if (!started)
+                    {
+                        acc = std::move(term);
+                        started = true;
+                    }
+                    else
+                    {
+                        batch_.arith().add_inplace(acc, term);
+                    }
+                }
+                batch_.arith().rescale_inplace(acc);
+                source = std::move(acc);
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Moving between the three encodings
+        // -------------------------------------------------------------------
+
+        BatchActivation Llama3RectOperator::borrow_group(RectActivation& x,
+                                                         int group)
+        {
+            const int d = layout_.d;
+            BatchActivation borrowed;
+            borrowed.rows = d;
+            borrowed.column.reserve(d);
+            for (int j = 0; j < d; ++j)
+            {
+                borrowed.column.push_back(
+                    std::move(x.column[static_cast<size_t>(group) * d + j]));
+            }
+            return borrowed;
+        }
+
+        void Llama3RectOperator::return_group(RectActivation& x, int group,
+                                              BatchActivation& borrowed)
+        {
+            const int d = layout_.d;
+            for (int j = 0; j < d; ++j)
+            {
+                x.column[static_cast<size_t>(group) * d + j] =
+                    std::move(borrowed.column[j]);
+            }
+            borrowed.column.clear();
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>>
+        Llama3RectOperator::to_slots(RectActivation& in,
+                                     Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            require_uniform(in, "to_slots");
+
+            Range _r("bridge.rect_to_slots");
+
+            std::vector<Ciphertext<Scheme::CKKS>> out;
+            out.reserve(in.column.size());
+            for (int g = 0; g < in.groups; ++g)
+            {
+                BatchActivation borrowed = borrow_group(in, g);
+                std::vector<Ciphertext<Scheme::CKKS>> slots =
+                    batch_.to_slots(borrowed, galois_key);
+                return_group(in, g, borrowed);
+
+                block_map(slots, /*inverse=*/true, "bridge.block_inverse",
+                          galois_key);
+                for (auto& c : slots)
+                {
+                    out.push_back(std::move(c));
+                }
+            }
+            return out;
+        }
+
+        RectActivation
+        Llama3RectOperator::from_slots(std::vector<Ciphertext<Scheme::CKKS>>& in,
+                                       int channels,
+                                       Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            const int d = layout_.d;
+            if (in.empty() || in.size() % static_cast<size_t>(d) != 0)
+            {
+                throw std::invalid_argument(
+                    "A rectangular group is exactly layout.d slot ciphertexts, "
+                    "because d is the rank of the module and not a free "
+                    "parameter");
+            }
+            const int groups = static_cast<int>(in.size()) / d;
+            if (groups != groups_for(channels))
+            {
+                throw std::invalid_argument(
+                    "The slot ciphertexts do not cover the channel count they "
+                    "are said to carry");
+            }
+
+            Range _r("bridge.rect_from_slots");
+
+            RectActivation out;
+            out.rows = d;
+            out.groups = groups;
+            out.channels = channels;
+            out.column.reserve(in.size());
+
+            for (int g = 0; g < groups; ++g)
+            {
+                std::vector<Ciphertext<Scheme::CKKS>> slots;
+                slots.reserve(d);
+                for (int j = 0; j < d; ++j)
+                {
+                    slots.push_back(
+                        std::move(in[static_cast<size_t>(g) * d + j]));
+                }
+
+                block_map(slots, /*inverse=*/false, "bridge.block_forward",
+                          galois_key);
+                BatchActivation group = batch_.from_slots(slots, d, galois_key);
+                for (auto& c : group.column)
+                {
+                    out.column.push_back(std::move(c));
+                }
+            }
+            return out;
+        }
+
+        BatchActivation
+        Llama3RectOperator::to_batch(RectActivation& in, int group,
+                                     Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            if (group < 0 || group >= in.groups)
+            {
+                throw std::invalid_argument(
+                    "No such channel group in this activation");
+            }
+
+            Range _r("bridge.to_batch");
+
+            BatchActivation borrowed = borrow_group(in, group);
+            std::vector<Ciphertext<Scheme::CKKS>> slots =
+                batch_.to_slots(borrowed, galois_key);
+            return_group(in, group, borrowed);
+
+            block_map(slots, /*inverse=*/true, "bridge.block_inverse",
+                      galois_key);
+            return batch_.from_slots(slots, layout_.d, galois_key);
+        }
+
+        RectActivation
+        Llama3RectOperator::from_batch(std::vector<BatchActivation>& groups,
+                                       int channels,
+                                       Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            const int d = layout_.d;
+            if (static_cast<int>(groups.size()) != groups_for(channels))
+            {
+                throw std::invalid_argument(
+                    "The matrix encryptions do not cover the channel count they "
+                    "are said to carry");
+            }
+
+            Range _r("bridge.from_batch");
+
+            RectActivation out;
+            out.rows = d;
+            out.groups = static_cast<int>(groups.size());
+            out.channels = channels;
+            out.column.reserve(groups.size() * static_cast<size_t>(d));
+
+            for (auto& group : groups)
+            {
+                if (group.columns() != d || group.rows != d)
+                {
+                    throw std::invalid_argument(
+                        "A rectangular group comes from a matrix encryption "
+                        "square at layout.d");
+                }
+                std::vector<Ciphertext<Scheme::CKKS>> slots =
+                    batch_.to_slots(group, galois_key);
+                block_map(slots, /*inverse=*/false, "bridge.block_forward",
+                          galois_key);
+                BatchActivation rect = batch_.from_slots(slots, d, galois_key);
+                for (auto& c : rect.column)
+                {
+                    out.column.push_back(std::move(c));
+                }
+            }
+            return out;
+        }
+
+        // -------------------------------------------------------------------
+        // The products
+        // -------------------------------------------------------------------
+
+        std::vector<int64_t> Llama3RectOperator::rectangular_weight(
+            const std::vector<double>& weight, int in_channels,
+            int out_channels, int in_group, int out_group, double scale) const
+        {
+            const int d = layout_.d;
+            const int k = layout_.k;
+            const int step = layout_.batch;
+            const int half = layout_.N / 2;
+
+            // Algorithm 5's plaintext is always d x (N/2) whatever the weight
+            // actually is, so a narrow projection uploads as much as a wide
+            // one. Block row t sits at Y^{k-t} with a minus sign, which is what
+            // makes the constant coefficient of the R_k product the contraction
+            // over t: (ab)_0 = a_0 b_0 - sum_{t>0} a_t b_{k-t}, and Y^k = -1.
+            std::vector<int64_t> coeffs(
+                static_cast<size_t>(d) * half * k, 0);
+
+            for (int j = 0; j < d; ++j)
+            {
+                for (int c = 0; c < half; ++c)
+                {
+                    const int out_c = out_group * half + c;
+                    if (out_c >= out_channels)
+                    {
+                        continue;
+                    }
+                    int64_t* e =
+                        coeffs.data() + (static_cast<size_t>(j) * half + c) * k;
+                    for (int t = 0; t < step; ++t)
+                    {
+                        const int in_c = in_group * half + t * d + j;
+                        if (in_c >= in_channels)
+                        {
+                            continue;
+                        }
+                        const int64_t v = quantise(
+                            weight[static_cast<size_t>(in_c) * out_channels +
+                                   out_c],
+                            scale);
+                        if (t == 0)
+                        {
+                            e[0] = v;
+                        }
+                        else
+                        {
+                            e[k - t] = -v;
+                        }
+                    }
+                }
+            }
+            return coeffs;
+        }
+
+        RectActivation
+        Llama3RectOperator::project(RectActivation& x,
+                                    const std::vector<double>& weight,
+                                    int in_channels, int out_channels,
+                                    const char* name,
+                                    Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            require_uniform(x, name);
+            if (x.channels != in_channels)
+            {
+                throw std::invalid_argument(
+                    std::string("The ") + name +
+                    " weight expects a different number of input channels than "
+                    "the activation carries");
+            }
+            if (weight.size() != static_cast<size_t>(in_channels) *
+                                     static_cast<size_t>(out_channels))
+            {
+                throw std::invalid_argument(
+                    std::string("The ") + name +
+                    " weight must be in_channels by out_channels, row major, "
+                    "which is the transpose of the mathematical weight");
+            }
+
+            const int d = layout_.d;
+            const int half = layout_.N / 2;
+            const int gin = x.groups;
+            const int gout = groups_for(out_channels);
+
+            char range_name[64];
+            std::snprintf(range_name, sizeof(range_name), "project.%s", name);
+            Range _r_project(range_name);
+
+            // The weight is encoded at the prime the rescale that follows will
+            // divide by, so the product comes back at exactly the activation's
+            // own scale one level down. Encoding it at the nominal scale
+            // instead leaves the result at x_scale * plain_scale / prime, which
+            // is not a scale anything downstream expects and reads as garbage
+            // rather than as a mismatch.
+            const double plain_scale = rescale_prime(x.column.front());
+            const int depth = x.column.front().depth();
+
+            RectActivation out;
+            out.rows = d;
+            out.groups = gout;
+            out.channels = out_channels;
+            out.column.reserve(static_cast<size_t>(gout) * d);
+
+            for (int go = 0; go < gout; ++go)
+            {
+                std::vector<Ciphertext<Scheme::CKKS>> acc;
+
+                for (int gi = 0; gi < gin; ++gi)
+                {
+                    {
+                        SuffixRange _r(range_name, "weight_encode");
+                        const std::vector<int64_t> w = rectangular_weight(
+                            weight, in_channels, out_channels, gi, go,
+                            plain_scale);
+                        batch_.matrix().encode_plaintext_matrix(
+                            w, d, half, depth, plain_scale);
+                    }
+
+                    std::vector<Ciphertext<Scheme::CKKS>*> in;
+                    in.reserve(d);
+                    for (int j = 0; j < d; ++j)
+                    {
+                        in.push_back(
+                            &x.column[static_cast<size_t>(gi) * d + j]);
+                    }
+
+                    std::vector<Ciphertext<Scheme::CKKS>> piece;
+                    {
+                        SuffixRange _r(range_name, "rectangular_pcmm");
+                        batch_.matrix().rectangular_pcmm(
+                            piece, in, galois_key, batch_.arith(),
+                            HEBatchMatrixOperator<Scheme::CKKS>::BlockAxis::
+                                coefficient,
+                            /*rescale=*/true);
+                    }
+
+                    // Algorithm 5, like Algorithm 1, only MARKS the rescale.
+                    // Left unspent that is not merely an untidy scale: the
+                    // plaintext's centered coefficients have outgrown int64 and
+                    // the next call cannot read them back.
+                    for (auto& c : piece)
+                    {
+                        batch_.arith().rescale_inplace(c);
+                    }
+
+                    if (acc.empty())
+                    {
+                        acc = std::move(piece);
+                    }
+                    else
+                    {
+                        // Every input group's partial product leaves the same
+                        // sequence of operations behind it, so they meet at one
+                        // level and one scale and the sum is a plain addition.
+                        SuffixRange _r(range_name, "accumulate");
+                        for (int j = 0; j < d; ++j)
+                        {
+                            batch_.arith().add_inplace(acc[j], piece[j]);
+                        }
+                    }
+                }
+
+                for (auto& c : acc)
+                {
+                    out.column.push_back(std::move(c));
+                }
+            }
+
+            return out;
+        }
+
+        BatchActivation
+        Llama3RectOperator::matmul(BatchActivation& a, BatchActivation& b,
+                                   const char* name,
+                                   Galoiskey<Scheme::CKKS>& galois_key,
+                                   Relinkey<Scheme::CKKS>& relin_key)
+        {
+            return batch_.matmul(a, b, name, galois_key, relin_key);
+        }
+
+        // -------------------------------------------------------------------
+        // RMSNorm
+        // -------------------------------------------------------------------
+
+        RectActivation
+        Llama3RectOperator::rms_norm(RectActivation& x,
+                                     const std::vector<double>& weight,
+                                     const RectRMSNormConfig& config,
+                                     Galoiskey<Scheme::CKKS>& galois_key,
+                                     Relinkey<Scheme::CKKS>& relin_key)
+        {
+            require_uniform(x, "rms_norm");
+            const int channels = x.channels;
+            if (!weight.empty() &&
+                static_cast<int>(weight.size()) != channels)
+            {
+                throw std::invalid_argument(
+                    "RMSNorm takes one learned scale per channel");
+            }
+
+            Range _r("rms_norm");
+
+            const int d = layout_.d;
+            const int step = layout_.batch;
+            const int half = layout_.N / 2;
+            const int groups = x.groups;
+
+            std::vector<Ciphertext<Scheme::CKKS>> slots =
+                to_slots(x, galois_key);
+
+            // A channel is (ciphertext, fast slot index), so the learned scale
+            // is a slot vector over the block axis and constant along the token
+            // axis -- not a constant, as it is when a channel is a whole
+            // ciphertext.
+            std::vector<Plaintext<Scheme::CKKS>> weights;
+            if (!weight.empty())
+            {
+                SuffixRange _r_w("rms_norm", "weight_encode");
+                const double plain_scale = rescale_prime(slots.front());
+                const int depth = slots.front().depth();
+                weights.reserve(slots.size());
+                for (int g = 0; g < groups; ++g)
+                {
+                    for (int j = 0; j < d; ++j)
+                    {
+                        std::vector<double> flat(slot_count_, 0.0);
+                        for (int b = 0; b < step; ++b)
+                        {
+                            const int c = g * half + b * d + j;
+                            const double w =
+                                (c < channels) ? weight[c] : 0.0;
+                            for (int u = 0; u < d; ++u)
+                            {
+                                flat[b + u * step] = w;
+                            }
+                        }
+                        Plaintext<Scheme::CKKS> plain(context_);
+                        encoder_.encode(plain, flat, plain_scale);
+                        for (int i = 0; i < depth; ++i)
+                        {
+                            batch_.arith().mod_drop_inplace(plain);
+                        }
+                        weights.push_back(std::move(plain));
+                    }
+                }
+            }
+
+            Llama3Operator::RMSNormConfig slot_config;
+            // The channel axis runs partly across ciphertexts, where the sum is
+            // free, and partly along the fast slot axis, where it is the one
+            // masked reduction this encoding pays for.
+            slot_config.stride = slot_count_;
+            slot_config.count = step;
+            slot_config.blocked_span = step;
+            slot_config.channels = channels;
+            slot_config.token_blocks = 1;
+            slot_config.eps = config.eps;
+            slot_config.sum_lo = config.sum_lo;
+            slot_config.sum_hi = config.sum_hi;
+            slot_config.degree = config.degree;
+            slot_config.newton_iterations = config.newton_iterations;
+
+            std::vector<Ciphertext<Scheme::CKKS>> normalised =
+                batch_.arith().rms_norm(slots, weights, slot_config, galois_key,
+                                        relin_key);
+
+            return from_slots(normalised, channels, galois_key);
+        }
+
+        // -------------------------------------------------------------------
+        // Attention
+        // -------------------------------------------------------------------
+
+        RectActivation
+        Llama3RectOperator::attention(RectActivation& x,
+                                      const RectAttentionWeights& weights,
+                                      const RectAttentionConfig& config,
+                                      Galoiskey<Scheme::CKKS>& galois_key,
+                                      Relinkey<Scheme::CKKS>& relin_key)
+        {
+            const int d = layout_.d;
+            const int half = layout_.N / 2;
+            const int heads = config.heads;
+            const int kv_heads =
+                config.kv_heads > 0 ? config.kv_heads : config.heads;
+
+            if (heads < 1 || kv_heads < 1 || heads % kv_heads != 0)
+            {
+                throw std::invalid_argument(
+                    "Grouped-query attention needs kv_heads to divide heads");
+            }
+
+            const int q_channels = heads * d;
+            const int kv_channels = kv_heads * d;
+            if (q_channels % half != 0)
+            {
+                throw std::invalid_argument(
+                    "heads * d must be a whole number of N/2 channel groups: a "
+                    "group is what one Algorithm 4 call covers, and a partly "
+                    "filled one would carry heads that do not exist");
+            }
+            if (weights.query.size() != static_cast<size_t>(config.in_channels) *
+                                            static_cast<size_t>(q_channels) ||
+                weights.key.size() != static_cast<size_t>(config.in_channels) *
+                                          static_cast<size_t>(kv_channels) ||
+                weights.value.size() != weights.key.size())
+            {
+                throw std::invalid_argument(
+                    "The attention weights must be in_channels by heads * d, "
+                    "with the key and value narrower by heads / kv_heads");
+            }
+
+            Range _r_attention("attention");
+
+            // 1/sqrt(head_dim) rides on the query weight, and head_dim is d
+            // here. A scaling is free on the host and one homomorphic level
+            // anywhere else.
+            const double head_scale =
+                config.head_scale != 0.0
+                    ? config.head_scale
+                    : 1.0 / std::sqrt(static_cast<double>(d));
+            std::vector<double> query_weight = weights.query;
+            for (auto& w : query_weight)
+            {
+                w *= head_scale;
+            }
+
+            // Grouped-query attention, expanded on the host. A kv head has to
+            // appear in every batch slot that reads it, and the batch slots of
+            // a matrix encryption never talk to each other, so there is nowhere
+            // else to do this. It costs projection work in the ratio
+            // heads / kv_heads.
+            const int group_size = heads / kv_heads;
+            auto expand = [&](const std::vector<double>& src)
+            {
+                if (group_size == 1)
+                {
+                    return src;
+                }
+                std::vector<double> dst(
+                    static_cast<size_t>(config.in_channels) * q_channels);
+                for (int i = 0; i < config.in_channels; ++i)
+                {
+                    for (int h = 0; h < heads; ++h)
+                    {
+                        const int src_head = h / group_size;
+                        for (int c = 0; c < d; ++c)
+                        {
+                            dst[static_cast<size_t>(i) * q_channels + h * d +
+                                c] =
+                                src[static_cast<size_t>(i) * kv_channels +
+                                    src_head * d + c];
+                        }
+                    }
+                }
+                return dst;
+            };
+
+            RectActivation q =
+                project(x, query_weight, config.in_channels, q_channels,
+                        "attention.q", galois_key);
+            RectActivation k =
+                project(x, expand(weights.key), config.in_channels, q_channels,
+                        "attention.k", galois_key);
+            RectActivation v =
+                project(x, expand(weights.value), config.in_channels,
+                        q_channels, "attention.v", galois_key);
+
+            const int q_groups = q.groups;
+            std::vector<BatchActivation> out_groups;
+            out_groups.reserve(q_groups);
+
+            for (int g = 0; g < q_groups; ++g)
+            {
+                // Batch slot b of a group is channel block b, and with
+                // head_dim = d that is head g * (k/2) + b. So one Algorithm 4
+                // call below covers k/2 heads.
+                BatchActivation qb, kb, vb;
+                {
+                    Range _r("attention.to_batch");
+                    qb = to_batch(q, g, galois_key);
+                    kb = to_batch(k, g, galois_key);
+                    vb = to_batch(v, g, galois_key);
+                }
+
+                // K^T, one CMT. This is the only transpose the sublayer pays
+                // for: the value product P V already reads V with the key on
+                // its rows, which is where the projection left it.
+                BatchActivation kt =
+                    batch_.transpose(kb, "attention.key", galois_key);
+                kb.column.clear();
+
+                BatchActivation scores;
+                {
+                    Range _r("attention.scores");
+                    scores = matmul(qb, kt, "attention.score", galois_key,
+                                    relin_key);
+                }
+                qb.column.clear();
+                kt.column.clear();
+
+                // The SoftMax is slot-wise, so this is where the sublayer
+                // leaves the matrix encoding -- and the only place it does.
+                std::vector<Ciphertext<Scheme::CKKS>> slots =
+                    batch_.to_slots(scores, galois_key);
+                scores.column.clear();
+
+                if (config.score_shift != 0.0)
+                {
+                    for (auto& c : slots)
+                    {
+                        batch_.arith().add_constant(c, -config.score_shift);
+                    }
+                }
+
+                Llama3Operator::SoftmaxConfig softmax = config.softmax;
+                // The key axis is entirely across ciphertexts: one coordinate
+                // per part, so nothing is reduced inside a ciphertext and the
+                // denominator costs a slot-wise addition and no rotation.
+                softmax.strided = true;
+                softmax.stride = slot_count_;
+                softmax.count = 1;
+
+                std::vector<std::vector<double>> masks;
+                if (config.causal)
+                {
+                    masks.reserve(d);
+                    for (int j = 0; j < d; ++j)
+                    {
+                        masks.push_back(batch_.causal_column_mask(j));
+                    }
+                }
+
+                std::vector<Ciphertext<Scheme::CKKS>> p_slots =
+                    batch_.arith().softmax(slots, softmax, masks, galois_key,
+                                           relin_key);
+                slots.clear();
+
+                BatchActivation p =
+                    batch_.from_slots(p_slots, d, galois_key);
+                p_slots.clear();
+
+                // V is still where the projection left it, several levels
+                // above P, so it comes down to meet it. The drop is free and
+                // what it discards was unreachable anyway.
+                {
+                    Range _r("attention.value_product");
+                    const int depth = p.column.front().depth();
+                    for (auto& c : vb.column)
+                    {
+                        batch_.arith().drop_to_depth(c, depth);
+                    }
+                    out_groups.push_back(
+                        matmul(p, vb, "attention.value", galois_key,
+                               relin_key));
+                }
+            }
+
+            q.column.clear();
+            k.column.clear();
+            v.column.clear();
+
+            RectActivation out =
+                from_batch(out_groups, q_channels, galois_key);
+            out_groups.clear();
+
+            if (weights.output.empty())
+            {
+                return out;
+            }
+            return project(out, weights.output, q_channels, config.in_channels,
+                           "attention.o", galois_key);
+        }
+
+        // -------------------------------------------------------------------
+        // SwiGLU
+        // -------------------------------------------------------------------
+
+        RectActivation
+        Llama3RectOperator::feed_forward(RectActivation& x,
+                                         const RectFeedForwardWeights& weights,
+                                         const RectFeedForwardConfig& config,
+                                         Galoiskey<Scheme::CKKS>& galois_key,
+                                         Relinkey<Scheme::CKKS>& relin_key)
+        {
+            require_uniform(x, "feed_forward");
+
+            Range _r("feed_forward");
+
+            const int in_channels = config.in_channels;
+            const int hidden_channels = config.hidden_channels;
+            const int half = layout_.N / 2;
+
+            if (weights.gate.size() !=
+                    static_cast<size_t>(in_channels) *
+                        static_cast<size_t>(hidden_channels) ||
+                weights.up.size() != weights.gate.size() ||
+                weights.down.size() != weights.gate.size())
+            {
+                throw std::invalid_argument(
+                    "The SwiGLU weights must be in_channels by "
+                    "hidden_channels, and down its transpose shape");
+            }
+            if (hidden_channels % half != 0)
+            {
+                throw std::invalid_argument(
+                    "The hidden width must be a whole number of N/2 channel "
+                    "groups, since the chunks are projected down and summed");
+            }
+
+            const int hidden_groups = hidden_channels / half;
+            int block = config.hidden_block_groups > 0
+                            ? config.hidden_block_groups
+                            : hidden_groups;
+            block = std::min(block, hidden_groups);
+
+            RectActivation out;
+            out.rows = layout_.d;
+            out.groups = groups_for(in_channels);
+            out.channels = in_channels;
+
+            for (int base = 0; base < hidden_channels; base += block * half)
+            {
+                const int cols =
+                    std::min(block * half, hidden_channels - base);
+
+                // The gate and up weights are in_channels x hidden_channels, so
+                // a chunk of the hidden axis is a set of columns and has to be
+                // gathered. The down weight is hidden_channels x in_channels, so
+                // the same chunk is a contiguous span of rows.
+                std::vector<double> gate_w(
+                    static_cast<size_t>(in_channels) * cols);
+                std::vector<double> up_w(gate_w.size());
+                for (int i = 0; i < in_channels; ++i)
+                {
+                    const size_t src =
+                        static_cast<size_t>(i) * hidden_channels + base;
+                    const size_t dst = static_cast<size_t>(i) * cols;
+                    for (int j = 0; j < cols; ++j)
+                    {
+                        gate_w[dst + j] = weights.gate[src + j];
+                        up_w[dst + j] = weights.up[src + j];
+                    }
+                }
+
+                RectActivation gate = project(x, gate_w, in_channels, cols,
+                                              "ffn.gate", galois_key);
+                RectActivation up =
+                    project(x, up_w, in_channels, cols, "ffn.up", galois_key);
+
+                // The gate meets the up projection in a Hadamard product, which
+                // this encoding does not have: multiplying two columns
+                // convolves their coefficients. Both branches therefore cross
+                // to slot form, where a product is slot-wise, and the result
+                // crosses back for the down projection.
+                std::vector<Ciphertext<Scheme::CKKS>> gate_slots =
+                    to_slots(gate, galois_key);
+                std::vector<Ciphertext<Scheme::CKKS>> up_slots =
+                    to_slots(up, galois_key);
+                gate.column.clear();
+                up.column.clear();
+
+                std::vector<Ciphertext<Scheme::CKKS>> hidden;
+                hidden.reserve(gate_slots.size());
+                {
+                    Range _r_silu("ffn.silu");
+                    for (size_t j = 0; j < gate_slots.size(); ++j)
+                    {
+                        Ciphertext<Scheme::CKKS> activated =
+                            batch_.arith().silu(gate_slots[j],
+                                                config.silu_bound,
+                                                config.silu_degree, relin_key);
+                        hidden.push_back(batch_.arith().multiply_and_rescale(
+                            activated, up_slots[j], relin_key));
+                    }
+                }
+                gate_slots.clear();
+                up_slots.clear();
+
+                RectActivation h = from_slots(hidden, cols, galois_key);
+                hidden.clear();
+
+                const std::vector<double> down_w(
+                    weights.down.begin() +
+                        static_cast<size_t>(base) * in_channels,
+                    weights.down.begin() +
+                        static_cast<size_t>(base + cols) * in_channels);
+                RectActivation part = project(h, down_w, cols, in_channels,
+                                              "ffn.down", galois_key);
+
+                if (out.column.empty())
+                {
+                    out.column = std::move(part.column);
+                }
+                else
+                {
+                    // Every chunk's partial product leaves the same sequence of
+                    // operations behind it, so they meet at one level and one
+                    // scale and the sum is a plain addition.
+                    Range _r_acc("ffn.accumulate");
+                    for (size_t j = 0; j < out.column.size(); ++j)
+                    {
+                        batch_.arith().add_inplace(out.column[j],
+                                                   part.column[j]);
+                    }
+                }
+            }
+
+            return out;
+        }
+
+        // -------------------------------------------------------------------
+        // The whole block
+        // -------------------------------------------------------------------
+
+        RectActivation Llama3RectOperator::transformer_block(
+            RectActivation& x, const RectTransformerBlockWeights& weights,
+            const RectTransformerBlockConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            require_uniform(x, "transformer_block");
+
+            Range _r("transformer_block");
+
+            RectActivation stream;
+            stream.rows = x.rows;
+            stream.groups = x.groups;
+            stream.channels = x.channels;
+            stream.column = x.column;
+
+            {
+                Range _r_half("transformer_block.attention_half");
+                RectActivation normed =
+                    rms_norm(stream, weights.attention_norm,
+                             config.attention_norm, galois_key, relin_key);
+                RectActivation sublayer =
+                    attention(normed, weights.attention, config.attention,
+                              galois_key, relin_key);
+                normed.column.clear();
+                // The two operands have been through completely different
+                // circuits, so neither the level nor the scale lines up; this
+                // is the one level a pre-norm residual pays.
+                stream.column = batch_.arith().residual_add(stream.column,
+                                                            sublayer.column);
+            }
+
+            {
+                Range _r_half("transformer_block.feed_forward_half");
+                RectActivation normed =
+                    rms_norm(stream, weights.feed_forward_norm,
+                             config.feed_forward_norm, galois_key, relin_key);
+                RectActivation sublayer =
+                    feed_forward(normed, weights.feed_forward,
+                                 config.feed_forward, galois_key, relin_key);
+                normed.column.clear();
+                stream.column = batch_.arith().residual_add(stream.column,
+                                                            sublayer.column);
+            }
+
+            return stream;
+        }
+
+        // -------------------------------------------------------------------
+        // Host-side staging
+        // -------------------------------------------------------------------
+
+        RectActivation
+        Llama3RectOperator::encrypt(const std::vector<double>& x, int channels,
+                                    HEEncryptor<Scheme::CKKS>& encryptor,
+                                    double scale)
+        {
+            const int d = layout_.d;
+            const int k = layout_.k;
+            const int step = layout_.batch;
+            const int half = layout_.N / 2;
+
+            if (x.size() != static_cast<size_t>(d) *
+                                static_cast<size_t>(channels))
+            {
+                throw std::invalid_argument(
+                    "A rectangular activation is layout.d rows by channels "
+                    "columns, row major");
+            }
+
+            const int groups = groups_for(channels);
+
+            RectActivation out;
+            out.rows = d;
+            out.groups = groups;
+            out.channels = channels;
+            out.column.reserve(static_cast<size_t>(groups) * d);
+
+            for (int g = 0; g < groups; ++g)
+            {
+                std::vector<int64_t> coeffs(
+                    static_cast<size_t>(d) * d * k, 0);
+                for (int i = 0; i < d; ++i)
+                {
+                    for (int j = 0; j < d; ++j)
+                    {
+                        int64_t* e =
+                            coeffs.data() +
+                            (static_cast<size_t>(i) * d + j) * k;
+                        for (int t = 0; t < step; ++t)
+                        {
+                            const int c = g * half + t * d + j;
+                            if (c >= channels)
+                            {
+                                continue;
+                            }
+                            e[t] = quantise(
+                                x[static_cast<size_t>(i) * channels + c],
+                                scale);
+                        }
+                    }
+                }
+
+                std::vector<std::vector<int64_t>> columns;
+                build_matrix_encryption_coefficients(coeffs, layout_, d, d,
+                                                     columns);
+                for (int j = 0; j < d; ++j)
+                {
+                    Plaintext<Scheme::CKKS> plain(context_);
+                    batch_.matrix().load_coefficients(plain, columns[j], scale);
+                    Ciphertext<Scheme::CKKS> c(context_);
+                    encryptor.encrypt(c, plain);
+                    out.column.push_back(std::move(c));
+                }
+            }
+            return out;
+        }
+
+        std::vector<double>
+        Llama3RectOperator::decrypt(RectActivation& in,
+                                    HEDecryptor<Scheme::CKKS>& decryptor,
+                                    double scale)
+        {
+            const int d = layout_.d;
+            const int step = layout_.batch;
+            const int half = layout_.N / 2;
+            const int channels = in.channels;
+
+            std::vector<double> out(
+                static_cast<size_t>(d) * channels, 0.0);
+
+            for (int g = 0; g < in.groups; ++g)
+            {
+                for (int j = 0; j < d; ++j)
+                {
+                    Plaintext<Scheme::CKKS> plain(context_);
+                    decryptor.decrypt(
+                        plain, in.column[static_cast<size_t>(g) * d + j]);
+                    std::vector<int64_t> coeffs;
+                    batch_.matrix().extract_coefficients(coeffs, plain);
+
+                    for (int t = 0; t < step; ++t)
+                    {
+                        const int c = g * half + t * d + j;
+                        if (c >= channels)
+                        {
+                            continue;
+                        }
+                        for (int i = 0; i < d; ++i)
+                        {
+                            out[static_cast<size_t>(i) * channels + c] =
+                                static_cast<double>(
+                                    coeffs[static_cast<size_t>(i) + d * t]) /
+                                scale;
+                        }
+                    }
+                }
+            }
+            return out;
+        }
+
+        // -------------------------------------------------------------------
+        // Small helpers
+        // -------------------------------------------------------------------
+
+        double Llama3RectOperator::rescale_prime(
+            const Ciphertext<Scheme::CKKS>& ct) const
+        {
+            const int level = ct.level();
+            if (level < 0 || level >= static_cast<int>(primes_.size()))
+            {
+                throw std::invalid_argument(
+                    "Ciphertext has no level left to rescale");
+            }
+            return static_cast<double>(primes_[level].value);
+        }
+
+        Plaintext<Scheme::CKKS>
+        Llama3RectOperator::encode(const std::vector<Complex64>& values,
+                                   double scale, int depth)
+        {
+            Plaintext<Scheme::CKKS> plain(context_);
+            encoder_.encode(plain, values, scale);
+            for (int i = 0; i < depth; i++)
+            {
+                batch_.arith().mod_drop_inplace(plain);
+            }
+            return plain;
+        }
+
+        void Llama3RectOperator::require_uniform(const RectActivation& in,
+                                                 const char* name) const
+        {
+            if (in.empty())
+            {
+                throw std::invalid_argument(
+                    std::string("The ") + name +
+                    " operand has no columns, so there is no such activation");
+            }
+            if (in.column.size() !=
+                static_cast<size_t>(in.groups) *
+                    static_cast<size_t>(layout_.d))
+            {
+                throw std::invalid_argument(
+                    std::string("The ") + name +
+                    " operand does not hold layout.d ciphertexts per group");
+            }
+            const int depth = in.column.front().depth();
+            const double scale = in.column.front().scale();
+            for (const auto& c : in.column)
+            {
+                if (c.depth() != depth || c.scale() != scale)
+                {
+                    throw std::invalid_argument(
+                        std::string("The columns of the ") + name +
+                        " operand have drifted apart in level or scale, and "
+                        "the products below add them");
+                }
+            }
+        }
+
+    } // namespace llama
+} // namespace heongpu
