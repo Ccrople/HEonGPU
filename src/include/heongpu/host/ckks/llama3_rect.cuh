@@ -146,6 +146,56 @@
 // encoding crossings. And nothing here is 25, which is why the refresh is worth
 // what it costs -- 6 seams of it a block, at 12 levels apiece.
 //
+// WHERE THE NON-LINEAR LEVELS WENT
+// --------------------------------
+// That table was measured before Section 3.1.3 was taken seriously, and it paid
+// for two things it did not need and one it did.
+//
+// A DEGREE IS NOT A FREE PARAMETER. It is what the operating range and the
+// required precision leave, and 12 bits is the requirement -- Section 3.1.2,
+// where that is what matches the perplexity of plaintext FP16. The RMSNorm fit
+// spans a factor of 2.5 and reaches 3.2e-06 at degree 7; at 15 it reached
+// 1.5e-11, which is nine orders of magnitude nothing downstream can read, for a
+// level. chebyshev_degree_for() settles this by measurement rather than by
+// argument, and the profile target now prints what every fit in the block
+// achieves over its own configured range.
+//
+// The reciprocal went the OTHER way, and this is the one that mattered. Fitted
+// over the worst case -- every score at the bottom of [-bound, 0] or every one
+// at the top, a factor of exp(8) -- degree 7 is wrong by 98.6%, and reaching 12
+// bits there takes degree 255 and eight levels. Section 4.3 does not raise the
+// degree, it narrows the interval: "rather than relying on worst-case bounds as
+// [25], we use the distributional data computed during calibration to obtain
+// sharp estimates". Over a calibrated range degree 15 meets 12 bits in four
+// levels. SoftmaxConfig::sum_lo/sum_hi are that estimate, and they are inputs
+// because a range is a measurement of the model and not a property of the
+// algorithm.
+//
+// THE DOMAIN MAP IS FREE IF SOMETHING ELSE IS ALREADY PAYING. A fit on [a, b]
+// carries its argument onto [-1, 1] first; the shift is an addition and free,
+// the multiplier is a plaintext product and a level. Every one of these fits
+// has a plaintext product just upstream of it that can carry the multiplier
+// instead -- the mask of the blocked reduction for RMSNorm, the causal mask for
+// the reciprocal, and for the exponential the query weight itself, where
+// 1/sqrt(head_dim) already rides. This is the fusion discipline of Section 3.2
+// applied to the non-linear layers rather than to the format conversions.
+//
+// What that removes, level by level:
+//
+//   RMSNorm      degree 15 -> 7, and the domain map onto the reduction mask
+//   SoftMax      the exp's map onto W_q and the reciprocal's onto the causal
+//                mask, against one level back for degree 7 -> 15
+//   SwiGLU       nothing: it was already at Table 2's bound and its degree
+//
+// The worst stretch is what the chain is sized on, and the SoftMax is the worst
+// stretch, so what the chain saves is what the SoftMax saves. At dnum = 1 the
+// mod-down that dominates this path is O(L^2), so a limb is worth more than it
+// looks. The accuracy is the real result either way: this path was previously
+// measured with a reciprocal that was not an approximation of one.
+//
+// The measured table follows once it is measured, and until then this section
+// says what was changed and not what it cost.
+//
 // THE REAL SHAPE, MEASURED
 // ------------------------
 // That table is one block at d = 64 and half the width. Llama-3 8B's own
@@ -546,6 +596,12 @@ namespace heongpu
                 /// encoding under level pressure. Ignored when
                 /// @c newton_iterations is above zero.
                 bool fold_mean_into_fit = true;
+                /// Carry the domain map of the fit on the mask of the blocked
+                /// reduction. On here for the same reason, and available here
+                /// for the same reason: this encoding is the one that pays for
+                /// a masked reduction, so it is the one with a plaintext
+                /// product to fold into.
+                bool fold_affine_into_mask = true;
             };
 
             /**
@@ -608,6 +664,19 @@ namespace heongpu
                 /// Subtracted from the scores so they land in [-bound, 0].
                 /// Calibrated, as in the paper, not computed homomorphically.
                 double score_shift = 0.0;
+                /// Carry the domain map of the exponential, 2/bound, on the
+                /// query weight -- where 1/sqrt(head_dim) already rides and
+                /// where a scaling costs nothing. The shift above is scaled to
+                /// match, and the SoftMax is told its input arrives mapped.
+                ///
+                /// Worth one level of the deepest stretch on this path, and it
+                /// is available only because the scores are formed from a
+                /// plaintext weight this operator owns.
+                bool fold_softmax_domain_into_query = true;
+                /// Carry the domain map of the reciprocal on the causal mask,
+                /// the SoftMax's own half of the same trick. Needs a mask, so
+                /// it needs @c causal.
+                bool fold_softmax_affine_into_mask = true;
                 /// bound, iterations and the degrees are the caller's; stride
                 /// and count are fixed by this encoding and overwritten, because
                 /// the key axis is entirely across ciphertexts.

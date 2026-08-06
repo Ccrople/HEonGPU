@@ -877,6 +877,11 @@ TEST(HEonGPU, CKKS_Llama3Rect_FoldedMeanMatchesTheDividedOne)
     // The fold is only available without a Newton step, which refines against
     // the mean itself.
     config.newton_iterations = 0;
+    // Isolated from the other fold. Carrying the domain map on the reduction
+    // mask absorbs the division by the channel count as well, so with that on
+    // there is nothing left for this one to save and the two runs below would
+    // come out at the same depth -- see FoldedAffineMapMatchesTheMappedFit.
+    config.fold_affine_into_mask = false;
 
     const std::vector<double> none;
     auto run = [&](bool fold)
@@ -955,4 +960,289 @@ TEST(HEonGPU, CKKS_Llama3Rect_FoldedNormScaleMatchesTheScaledActivation)
     std::cout << "folded gain worst error: " << worst << " against a signal of "
               << signal << std::endl;
     EXPECT_LT(worst, 1e-3 * std::max(signal, 1.0));
+}
+
+// ---------------------------------------------------------------------------
+// Section 3.1.3: the degree follows from the range and the precision
+// ---------------------------------------------------------------------------
+
+// The paper's claim about non-linear layers, checked on the host where it costs
+// nothing: reducing the operating range lowers the degree, and the degree is
+// what levels are spent on. This runs no GPU work and is the test that would
+// have caught a reciprocal fitted over a range three thousand wide.
+TEST(HEonGPU, CKKS_Llama3Rect_FitDegreesFollowFromTheirRanges)
+{
+    using heongpu::llama::chebyshev_degree_for;
+    using heongpu::llama::chebyshev_levels;
+    using heongpu::llama::chebyshev_max_error;
+
+    // Section 3.1.2: 12 bits of precision matches the perplexity of plaintext
+    // FP16, so this is the requirement and anything beyond it is a level spent
+    // on nothing.
+    const double target = std::pow(2.0, -12);
+    const auto reciprocal = [](double x) { return 1.0 / x; };
+
+    // Paterson-Stockmeyer costs ceil(log2(degree + 1)), so the degrees one
+    // below a power of two are the only ones worth asking for.
+    EXPECT_EQ(chebyshev_levels(7), 3);
+    EXPECT_EQ(chebyshev_levels(15), 4);
+    EXPECT_EQ(chebyshev_levels(16), 5);
+    EXPECT_EQ(heongpu::llama::chebyshev_round_degree(16), 31);
+
+    // The SoftMax denominator, bounded rather than measured: every score at
+    // the bottom of [-8, 0] or every one at the top. The interval spans a
+    // factor of exp(8) and no affordable degree fits across it.
+    const int axis = 128;
+    const double worst_lo = axis * std::exp(-8.0);
+    const double worst_hi = axis * 1.5;
+    const int worst_degree =
+        chebyshev_degree_for(reciprocal, worst_lo, worst_hi, target);
+    EXPECT_GE(chebyshev_levels(worst_degree), 8);
+    // Which is why the degree this path used to carry was not an
+    // approximation of anything: over its own stated range it was wrong by
+    // most of the answer.
+    EXPECT_GT(chebyshev_max_error(reciprocal, worst_lo, worst_hi, 7), 0.9);
+
+    // The same reciprocal over the range calibration actually reports, which
+    // is what Section 4.3 replaces the bound with. Four levels, not eight, and
+    // this time it is accurate.
+    const double lo = axis * std::exp(-2.0);
+    const double hi = static_cast<double>(axis);
+    const int degree = chebyshev_degree_for(reciprocal, lo, hi, target);
+    EXPECT_EQ(degree, 15);
+    EXPECT_EQ(chebyshev_levels(degree), 4);
+    EXPECT_LT(chebyshev_max_error(reciprocal, lo, hi, 15), target);
+    EXPECT_GE(chebyshev_levels(worst_degree) - chebyshev_levels(degree), 4);
+
+    // RMSNorm, whose summed square spans a factor of 2.5 and therefore needs
+    // seven rather than the fifteen this path used to carry -- a level, for
+    // nine orders of magnitude of accuracy nothing downstream can read.
+    const double channels = 2048.0;
+    const auto norm = [channels](double s)
+    { return 1.0 / std::sqrt(s / channels + 1e-5); };
+    EXPECT_EQ(chebyshev_degree_for(norm, channels * 0.20, channels * 0.50,
+                                   target),
+              7);
+    EXPECT_LT(chebyshev_max_error(norm, channels * 0.20, channels * 0.50, 7),
+              target);
+
+    // SiLU at Table 2's calibrated bound of 10.8 against the uncalibrated
+    // 23.0. This is the paper's own worked example -- degree 31 after
+    // calibration -- and it reproduces.
+    const auto silu = [](double x) { return x / (1.0 + std::exp(-x)); };
+    EXPECT_EQ(chebyshev_degree_for(silu, -10.8, 10.8, target * 10.8, false),
+              31);
+    EXPECT_GT(chebyshev_degree_for(silu, -23.0, 23.0, target * 23.0, false),
+              31);
+}
+
+// ---------------------------------------------------------------------------
+// The level the domain map gives up
+// ---------------------------------------------------------------------------
+
+// A fit on [a, b] carries its argument onto [-1, 1] first, and the multiplier
+// half of that is a plaintext product and a level. The blocked reduction ahead
+// of it is already paying for a plaintext product, so the multiplier can ride
+// on the mask. Free only if it is exact: a mask scaled wrong rescales every
+// output and nothing in the library notices.
+TEST(HEonGPU, CKKS_Llama3Rect_FoldedAffineMapMatchesTheMappedFit)
+{
+    Fixture fx(20, 10);
+    const int d = Fixture::d;
+    const int channels = fx.half();
+    const double eps = 1e-5;
+
+    const std::vector<double> x = random_matrix(d, channels, 63701u);
+
+    std::vector<double> want(x.size(), 0.0);
+    for (int u = 0; u < d; ++u)
+    {
+        double sum = 0.0;
+        for (int c = 0; c < channels; ++c)
+        {
+            const double v = x[static_cast<size_t>(u) * channels + c];
+            sum += v * v;
+        }
+        const double inv =
+            1.0 / std::sqrt(sum / static_cast<double>(channels) + eps);
+        for (int c = 0; c < channels; ++c)
+            want[static_cast<size_t>(u) * channels + c] =
+                x[static_cast<size_t>(u) * channels + c] * inv;
+    }
+
+    Rect::RectRMSNormConfig config;
+    config.eps = eps;
+    config.sum_lo = channels * 0.20;
+    config.sum_hi = channels * 0.50;
+    config.degree = 7; // What the range above actually needs.
+    config.newton_iterations = 0;
+
+    const std::vector<double> none;
+    auto run = [&](bool fold_affine, bool fold_mean)
+    {
+        Rect::RectRMSNormConfig c = config;
+        c.fold_affine_into_mask = fold_affine;
+        c.fold_mean_into_fit = fold_mean;
+        heongpu::llama::RectActivation ct =
+            fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+        heongpu::llama::RectActivation out =
+            fx.op->rms_norm(ct, none, c, *fx.galois, *fx.relin);
+        return std::make_pair(
+            fx.op->decrypt(out, *fx.decryptor, out.column.front().scale()),
+            out.column.front().depth());
+    };
+
+    const auto mapped = run(false, true);
+    const auto folded = run(true, true);
+    // With the mean NOT folded, the reduction mask carries the division by the
+    // channel count as well, so this lands at the same depth as the pair above
+    // -- the affine fold subsumes the mean fold rather than adding to it.
+    const auto folded_unmeaned = run(true, false);
+
+    std::cout << "rms_norm affine: mapped " << mapped.second << " levels, "
+              << "folded " << folded.second << ", folded without the mean fold "
+              << folded_unmeaned.second << "; worst error against the host "
+              << worst_diff(want, mapped.first) << " and "
+              << worst_diff(want, folded.first) << std::endl;
+
+    EXPECT_EQ(folded.second, mapped.second - 1);
+    EXPECT_EQ(folded_unmeaned.second, folded.second);
+    EXPECT_LT(worst_diff(want, folded.first), 5e-2);
+    EXPECT_LT(worst_diff(mapped.first, folded.first), 5e-2);
+    EXPECT_LT(worst_diff(folded_unmeaned.first, folded.first), 5e-2);
+}
+
+// The SoftMax's half of the same trick, which is the harder half. Its mask
+// feeds the numerator as well as the denominator, so the constant riding on it
+// has to come back out through the fitted function -- and the whole point of a
+// SoftMax is that its output is a distribution, which a leftover factor would
+// silently stop being.
+TEST(HEonGPU, CKKS_Llama3Rect_FoldedSoftmaxMatchesTheMappedOne)
+{
+    Fixture fx(22, 11);
+    const int d = Fixture::d;
+    const int axis = 16; // Key positions, one per part, as attention leaves it.
+    const double bound = 8.0;
+
+    // Scores already shifted into [-bound, 0], as the calibrated shift leaves
+    // them, and spread over the range the fit is told to expect.
+    std::mt19937_64 rng(64801u);
+    std::uniform_real_distribution<double> dist(-2.0, 0.0);
+    std::vector<std::vector<double>> scores(axis);
+    for (int p = 0; p < axis; ++p)
+    {
+        scores[p].assign(static_cast<size_t>(fx.half()), 0.0);
+        for (int u = 0; u < d; ++u)
+            for (int b = 0; b < fx.blocks(); ++b)
+                scores[p][static_cast<size_t>(b) + static_cast<size_t>(u) *
+                                                      fx.blocks()] = dist(rng);
+    }
+
+    // The host answer, per (row, batch slot), over the key axis.
+    std::vector<std::vector<double>> want(axis);
+    for (auto& w : want)
+        w.assign(static_cast<size_t>(fx.half()), 0.0);
+    for (int u = 0; u < d; ++u)
+    {
+        for (int b = 0; b < fx.blocks(); ++b)
+        {
+            const size_t at =
+                static_cast<size_t>(b) + static_cast<size_t>(u) * fx.blocks();
+            double total = 0.0;
+            for (int p = 0; p < axis; ++p)
+                total += std::exp(scores[p][at]);
+            for (int p = 0; p < axis; ++p)
+                want[p][at] = std::exp(scores[p][at]) / total;
+        }
+    }
+
+    heongpu::llama::Llama3Operator::SoftmaxConfig config;
+    config.strided = true;
+    config.stride = fx.half();
+    config.count = 1;
+    config.bound = bound;
+    config.iterations = 1;
+    config.exp_degree = 15;
+    config.inverse_degree = 15;
+    config.inverse_newton = 0;
+    // The calibrated range of Section 4.3, matching the spread above.
+    config.sum_lo = axis * std::exp(-2.0);
+    config.sum_hi = static_cast<double>(axis);
+
+    // Every part masked, since the fold rides on the mask. All ones here: what
+    // is being checked is the constant the fold puts on it, not the pattern.
+    const std::vector<std::vector<double>> masks(
+        axis, std::vector<double>(static_cast<size_t>(fx.half()), 1.0));
+
+    auto run = [&](bool fold)
+    {
+        heongpu::llama::Llama3Operator::SoftmaxConfig c = config;
+        c.fold_affine_into_mask = fold;
+
+        std::vector<heongpu::Ciphertext<S>> parts;
+        parts.reserve(axis);
+        for (int p = 0; p < axis; ++p)
+        {
+            heongpu::Plaintext<S> plain(fx.context);
+            fx.encoder->encode(plain, scores[p], fx.scale);
+            heongpu::Ciphertext<S> ct(fx.context);
+            fx.encryptor->encrypt(ct, plain);
+            parts.push_back(std::move(ct));
+        }
+
+        std::vector<heongpu::Ciphertext<S>> out = fx.op->arith().softmax(
+            parts, c, masks, *fx.galois, *fx.relin);
+
+        std::vector<std::vector<double>> got(axis);
+        for (int p = 0; p < axis; ++p)
+        {
+            heongpu::Plaintext<S> plain(fx.context);
+            fx.decryptor->decrypt(plain, out[p]);
+            std::vector<double> values;
+            fx.encoder->decode(values, plain);
+            got[p] = values;
+        }
+        return std::make_pair(got, out.front().depth());
+    };
+
+    const auto mapped = run(false);
+    const auto folded = run(true);
+
+    double worst_mapped = 0.0;
+    double worst_folded = 0.0;
+    double worst_between = 0.0;
+    for (int p = 0; p < axis; ++p)
+    {
+        for (int u = 0; u < d; ++u)
+            for (int b = 0; b < fx.blocks(); ++b)
+            {
+                const size_t at = static_cast<size_t>(b) +
+                                  static_cast<size_t>(u) * fx.blocks();
+                worst_mapped = std::max(
+                    worst_mapped, std::abs(mapped.first[p][at] - want[p][at]));
+                worst_folded = std::max(
+                    worst_folded, std::abs(folded.first[p][at] - want[p][at]));
+                worst_between =
+                    std::max(worst_between, std::abs(folded.first[p][at] -
+                                                     mapped.first[p][at]));
+            }
+    }
+
+    std::cout << "softmax affine: mapped " << mapped.second << " levels, "
+              << "folded " << folded.second << "; worst error against the host "
+              << worst_mapped << " and " << worst_folded << ", between them "
+              << worst_between << std::endl;
+
+    EXPECT_EQ(folded.second, mapped.second - 1);
+    // A SoftMax row sums to one, and a leftover factor from the fold would
+    // show up here before it showed up anywhere else.
+    for (int u = 0; u < d; u += 37)
+    {
+        double total = 0.0;
+        for (int p = 0; p < axis; ++p)
+            total += folded.first[p][static_cast<size_t>(u) * fx.blocks()];
+        EXPECT_NEAR(total, 1.0, 1e-2);
+    }
+    EXPECT_LT(worst_folded, 5e-3);
+    EXPECT_LT(worst_between, 5e-3);
 }

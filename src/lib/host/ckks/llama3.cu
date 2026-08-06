@@ -156,6 +156,100 @@ namespace heongpu
             return acc;
         }
 
+        int chebyshev_levels(int degree)
+        {
+            if (degree < 1)
+            {
+                return 0;
+            }
+            int levels = 0;
+            int reach = 1;
+            while (reach <= degree)
+            {
+                reach *= 2;
+                levels++;
+            }
+            return levels;
+        }
+
+        int chebyshev_round_degree(int degree)
+        {
+            if (degree < 1)
+            {
+                return degree < 0 ? 0 : degree;
+            }
+            int rounded = 1;
+            while (rounded < degree)
+            {
+                rounded = 2 * rounded + 1;
+            }
+            return rounded;
+        }
+
+        double chebyshev_max_error(const std::function<double(double)>& f,
+                                   double a, double b, int degree, bool relative,
+                                   int samples)
+        {
+            if (!(b > a))
+            {
+                throw std::invalid_argument("Interval must satisfy a < b");
+            }
+            if (samples < 2)
+            {
+                throw std::invalid_argument("A fit needs at least two samples");
+            }
+
+            const std::vector<double> coeffs =
+                chebyshev_coefficients(f, a, b, degree);
+
+            // Sampled uniformly rather than at the nodes: the nodes are where
+            // the interpolant is exact, so measuring there would report zero
+            // for any degree at all.
+            double worst = 0.0;
+            for (int i = 0; i < samples; i++)
+            {
+                const double x =
+                    a + (b - a) * static_cast<double>(i) / (samples - 1);
+                const double want = f(x);
+                double err = std::abs(chebyshev_evaluate(coeffs, a, b, x) - want);
+                if (relative)
+                {
+                    // A function with a zero inside its interval has no
+                    // relative error to speak of there; the caller asking for
+                    // one on such a function is the bug, not this guard.
+                    const double magnitude = std::abs(want);
+                    if (magnitude <= 0.0)
+                    {
+                        continue;
+                    }
+                    err /= magnitude;
+                }
+                worst = std::max(worst, err);
+            }
+            return worst;
+        }
+
+        int chebyshev_degree_for(const std::function<double(double)>& f, double a,
+                                 double b, double target, bool relative, int cap)
+        {
+            if (!(target > 0.0))
+            {
+                throw std::invalid_argument("Target precision must be positive");
+            }
+
+            // Only the Paterson-Stockmeyer shapes are tried, because the ones
+            // between two of them cost the same levels as the larger and
+            // approximate no better.
+            for (int degree = 1; degree <= cap; degree = 2 * degree + 1)
+            {
+                if (chebyshev_max_error(f, a, b, degree, relative) <= target)
+                {
+                    return degree;
+                }
+            }
+            return 0;
+        }
+
         MatrixLayout::MatrixLayout(int d_, int batch_) : d(d_), batch(batch_)
         {
             if (!is_power_of_two(d) || batch <= 0)
@@ -634,7 +728,8 @@ namespace heongpu
         }
 
         void Llama3Operator::sum_blocked(Ciphertext<Scheme::CKKS>& ct, int span,
-                                         Galoiskey<Scheme::CKKS>& galois_key)
+                                         Galoiskey<Scheme::CKKS>& galois_key,
+                                         double mask_scale)
         {
             if (!is_power_of_two(span) || span > slot_count_ ||
                 slot_count_ % span != 0)
@@ -645,6 +740,14 @@ namespace heongpu
             }
             if (span == 1)
             {
+                // There is no mask here to carry a folded constant on, so a
+                // caller that asked for one would silently not get it.
+                if (mask_scale != 1.0)
+                {
+                    throw std::invalid_argument(
+                        "A span of one does not mask, so there is nothing for "
+                        "a folded constant to ride on");
+                }
                 return;
             }
 
@@ -662,13 +765,15 @@ namespace heongpu
                 }
             }
 
-            // Keep those positions and discard the rest.
+            // Keep those positions and discard the rest. The kept entries
+            // carry mask_scale rather than one, which costs nothing: this
+            // product is being paid for either way.
             {
                 Range _r("sum_blocked.mask");
                 std::vector<double> mask(slot_count_, 0.0);
                 for (int p = 0; p < slot_count_; p += span)
                 {
-                    mask[p] = 1.0;
+                    mask[p] = mask_scale;
                 }
                 multiply_vector(ct, mask);
             }
@@ -691,9 +796,28 @@ namespace heongpu
         // Polynomial primitives
         // -------------------------------------------------------------------
 
+        double Llama3Operator::domain_scale(double a, double b)
+        {
+            if (!(b > a))
+            {
+                throw std::invalid_argument("Interval must satisfy a < b");
+            }
+            return 2.0 / (b - a);
+        }
+
+        double Llama3Operator::domain_shift(double a, double b)
+        {
+            if (!(b > a))
+            {
+                throw std::invalid_argument("Interval must satisfy a < b");
+            }
+            return -(a + b) / (b - a);
+        }
+
         Ciphertext<Scheme::CKKS> Llama3Operator::evaluate_chebyshev(
             Ciphertext<Scheme::CKKS>& ct, const std::vector<double>& coeffs,
-            double a, double b, Relinkey<Scheme::CKKS>& relin_key)
+            double a, double b, Relinkey<Scheme::CKKS>& relin_key,
+            bool pre_scaled)
         {
             if (coeffs.empty())
             {
@@ -710,10 +834,17 @@ namespace heongpu
             if (a != -1.0 || b != 1.0)
             {
                 // T_k is defined on [-1, 1], so the argument is mapped there
-                // first. This is the one level the affine map costs.
+                // first. The multiplier is the whole cost of that map; the
+                // shift is an addition and free. When the caller has already
+                // carried the multiplier on a plaintext product of its own,
+                // only the free half is left and the fit costs nothing to
+                // place on its interval.
                 Range _r("chebyshev.affine_map");
-                multiply_constant(t, 2.0 / (b - a));
-                add_constant(t, -(a + b) / (b - a));
+                if (!pre_scaled)
+                {
+                    multiply_constant(t, domain_scale(a, b));
+                }
+                add_constant(t, domain_shift(a, b));
             }
 
             // evaluate_poly starts the recursion at level - ceil(log2(degree))
@@ -755,10 +886,11 @@ namespace heongpu
         Llama3Operator::evaluate_function(Ciphertext<Scheme::CKKS>& ct,
                                           const std::function<double(double)>& f,
                                           double a, double b, int degree,
-                                          Relinkey<Scheme::CKKS>& relin_key)
+                                          Relinkey<Scheme::CKKS>& relin_key,
+                                          bool pre_scaled)
         {
             return evaluate_chebyshev(ct, chebyshev_coefficients(f, a, b, degree),
-                                      a, b, relin_key);
+                                      a, b, relin_key, pre_scaled);
         }
 
         Ciphertext<Scheme::CKKS>
@@ -813,19 +945,30 @@ namespace heongpu
         Ciphertext<Scheme::CKKS>
         Llama3Operator::inverse(Ciphertext<Scheme::CKKS>& ct, double lo,
                                 double hi, int degree, int newton_iterations,
-                                Relinkey<Scheme::CKKS>& relin_key)
+                                Relinkey<Scheme::CKKS>& relin_key,
+                                bool pre_scaled, double gain)
         {
             if (!(lo > 0.0))
             {
                 throw std::invalid_argument(
                     "1/x needs a strictly positive lower bound");
             }
+            if (newton_iterations > 0 && (pre_scaled || gain != 1.0))
+            {
+                // The step below multiplies by ct itself and converges on
+                // 1/x, so it wants the argument unscaled and the answer
+                // unweighted. Either fold or refine, not both.
+                throw std::invalid_argument(
+                    "A Newton step needs the argument unscaled and the fit "
+                    "unweighted, so it cannot be had with a folded domain map "
+                    "or a gain");
+            }
 
             Range _r_inv("inverse");
 
             Ciphertext<Scheme::CKKS> y = evaluate_function(
-                ct, [](double x) { return 1.0 / x; }, lo, hi, degree,
-                relin_key);
+                ct, [gain](double x) { return gain / x; }, lo, hi, degree,
+                relin_key, pre_scaled);
 
             // y <- y (2 - x y), two levels a step.
             Range _r_newton("inverse.newton");
@@ -856,7 +999,7 @@ namespace heongpu
 
         Ciphertext<Scheme::CKKS> Llama3Operator::exp_scaled_negative(
             Ciphertext<Scheme::CKKS>& ct, double bound, int squarings,
-            int degree, Relinkey<Scheme::CKKS>& relin_key)
+            int degree, Relinkey<Scheme::CKKS>& relin_key, bool pre_scaled)
         {
             if (!(bound > 0.0))
             {
@@ -875,7 +1018,7 @@ namespace heongpu
             const double divisor = std::pow(2.0, squarings);
             return evaluate_function(
                 ct, [divisor](double x) { return std::exp(x / divisor); },
-                -bound, 0.0, degree, relin_key);
+                -bound, 0.0, degree, relin_key, pre_scaled);
         }
 
         // -------------------------------------------------------------------
@@ -970,6 +1113,28 @@ namespace heongpu
             const bool fold_mean =
                 config.fold_mean_into_fit && config.newton_iterations <= 0;
 
+            // The same argument one step further along. The blocked reduction
+            // already spends a level on a mask, and the fit that follows
+            // spends another placing its argument on [-1, 1]; the first can
+            // carry the second. The strided reduction has no mask, so there
+            // is nothing to fold into and nothing is claimed.
+            const bool fold_affine = config.fold_affine_into_mask &&
+                                     config.blocked_span > 0 &&
+                                     config.newton_iterations <= 0;
+            const double fit_lo = fold_mean ? config.sum_lo : lo;
+            const double fit_hi = fold_mean ? config.sum_hi : hi;
+
+            // When the mean is NOT folded into the fit, the division by the
+            // channel count sits between the mask and the fit, so the mask
+            // carries it too and what is left of forming the mean is the
+            // addition of eps -- scaled to match, and free either way.
+            const double mean_divisor =
+                fold_mean ? 1.0 : 1.0 / static_cast<double>(config.channels);
+            const double mask_scale =
+                fold_affine
+                    ? Llama3Operator::domain_scale(fit_lo, fit_hi) * mean_divisor
+                    : 1.0;
+
             std::vector<Ciphertext<Scheme::CKKS>> out(
                 in.size(), Ciphertext<Scheme::CKKS>(context_));
 
@@ -1001,7 +1166,8 @@ namespace heongpu
                     // encoding and not of RMSNorm.
                     if (config.blocked_span > 0)
                     {
-                        sum_blocked(total, config.blocked_span, galois_key);
+                        sum_blocked(total, config.blocked_span, galois_key,
+                                    mask_scale);
                     }
                     else
                     {
@@ -1011,12 +1177,23 @@ namespace heongpu
 
                     // mean + eps. The addition is free and the division is
                     // not, so it is skipped entirely when the fit below can
-                    // carry it.
+                    // carry it -- or when the mask above already has.
                     if (!fold_mean)
                     {
-                        multiply_constant(
-                            total, 1.0 / static_cast<double>(config.channels));
-                        add_constant(total, config.eps);
+                        if (!fold_affine)
+                        {
+                            multiply_constant(total, mean_divisor);
+                            add_constant(total, config.eps);
+                        }
+                        else
+                        {
+                            // total already holds domain_scale * s / channels,
+                            // so eps joins it scaled the same way and the sum
+                            // is domain_scale * (mean + eps).
+                            add_constant(total,
+                                         Llama3Operator::domain_scale(lo, hi) *
+                                             config.eps);
+                        }
                     }
                 }
 
@@ -1037,7 +1214,15 @@ namespace heongpu
                                 return 1.0 / std::sqrt(s / channels + eps);
                             },
                             config.sum_lo, config.sum_hi, config.degree,
-                            relin_key);
+                            relin_key, fold_affine);
+                    }
+                    else if (fold_affine)
+                    {
+                        // No Newton step is possible here -- fold_affine says
+                        // so -- and without one inverse_sqrt is the fit alone.
+                        scale_factor = evaluate_function(
+                            total, [](double x) { return 1.0 / std::sqrt(x); },
+                            lo, hi, config.degree, relin_key, true);
                     }
                     else
                     {
@@ -1164,6 +1349,78 @@ namespace heongpu
             const double d =
                 static_cast<double>(config.count) * parts.size();
 
+            // Section 4.3. Round zero's denominator is a sum of exponentials
+            // and its range is a measurement; every round after it sees
+            // coordinates that already sum to one, so its denominator lies in
+            // [1/d, 1] and what calibration supplies is how far up that the
+            // sharpest row actually reaches.
+            auto round_range = [&](int round, double& lo, double& hi)
+            {
+                if (round == 0)
+                {
+                    if (config.sum_hi > config.sum_lo && config.sum_lo > 0.0)
+                    {
+                        lo = config.sum_lo;
+                        hi = config.sum_hi;
+                        return;
+                    }
+                    // Nothing measured: every coordinate might be at either
+                    // end at once. A reciprocal over this is the thing the
+                    // paper is telling us not to fit.
+                    const double smallest = std::exp(
+                        -2.0 * config.bound / std::pow(2.0, config.iterations));
+                    lo = d * smallest * 0.5;
+                    hi = d * 1.5;
+                    return;
+                }
+                const double top =
+                    config.concentration > 0.0
+                        ? std::min(config.concentration, d)
+                        : d;
+                lo = 0.5 / d;
+                hi = 1.5 * top / d;
+            };
+
+            // The domain map of each round's fit, carried upstream. Round
+            // zero's rides on the mask; a later round's rides on the fit of
+            // the round before, where it is a change of coefficients and free.
+            // Both are constant along the reduced axis, which is exactly the
+            // condition under which the normalising rounds cancel a factor.
+            const bool have_masks = [&] {
+                if (masks.size() != parts.size())
+                {
+                    return false;
+                }
+                for (const auto& mask : masks)
+                {
+                    if (mask.empty())
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }();
+            const bool fold_affine = config.fold_affine_into_mask &&
+                                     config.inverse_newton <= 0;
+            if (fold_affine && !have_masks)
+            {
+                throw std::invalid_argument(
+                    "A folded domain map rides on the mask of every part, so "
+                    "every part needs one");
+            }
+
+            std::vector<double> domain(config.iterations, 1.0);
+            if (fold_affine)
+            {
+                for (int round = 0; round < config.iterations; round++)
+                {
+                    double lo = 0.0;
+                    double hi = 0.0;
+                    round_range(round, lo, hi);
+                    domain[round] = Llama3Operator::domain_scale(lo, hi);
+                }
+            }
+
             std::vector<Ciphertext<Scheme::CKKS>> y;
             y.reserve(parts.size());
             {
@@ -1172,16 +1429,33 @@ namespace heongpu
                 {
                     y.push_back(exp_scaled_negative(
                         parts[p], config.bound, config.iterations,
-                        config.exp_degree, relin_key));
+                        config.exp_degree, relin_key, config.pre_scaled_input));
 
                     // Masking the exponentials rather than the scores removes a
                     // coordinate from the numerator and from the sum at once.
                     // The rounds below normalise, so a mask weight that is
                     // constant along the reduced axis cancels and only the
                     // pattern of zeros survives.
+                    //
+                    // Round zero's denominator is the sum of the SQUARES of
+                    // these, so the map it wants rides on the mask as its own
+                    // square root.
                     if (!masks.empty() && !masks[p].empty())
                     {
-                        multiply_vector(y.back(), masks[p]);
+                        if (fold_affine)
+                        {
+                            std::vector<double> scaled = masks[p];
+                            const double weight = std::sqrt(domain[0]);
+                            for (auto& entry : scaled)
+                            {
+                                entry *= weight;
+                            }
+                            multiply_vector(y.back(), scaled);
+                        }
+                        else
+                        {
+                            multiply_vector(y.back(), masks[p]);
+                        }
                     }
                 }
             }
@@ -1226,24 +1500,27 @@ namespace heongpu
                 // so the sum of squares is confined to [1/d, 1].
                 double lo;
                 double hi;
-                if (round == 0)
+                round_range(round, lo, hi);
+
+                // What the fit hands back carries the factor the NEXT round's
+                // argument wants, and the factor this round's argument already
+                // arrived with is divided out. On the last round there is no
+                // next round and the answer must be the SoftMax itself, so the
+                // gain is exactly what undoes the fold.
+                double gain = 1.0;
+                if (fold_affine)
                 {
-                    const double smallest = std::exp(
-                        -2.0 * config.bound / std::pow(2.0, config.iterations));
-                    lo = d * smallest * 0.5;
-                    hi = d * 1.5;
-                }
-                else
-                {
-                    lo = 0.5 / d;
-                    hi = 1.5;
+                    const bool last = round + 1 == config.iterations;
+                    gain = (last ? 1.0 : std::sqrt(domain[round + 1])) /
+                           domain[round];
                 }
 
                 Ciphertext<Scheme::CKKS> reciprocal;
                 {
                     Range _r("softmax.inverse");
                     reciprocal = inverse(total, lo, hi, config.inverse_degree,
-                                         config.inverse_newton, relin_key);
+                                         config.inverse_newton, relin_key,
+                                         fold_affine, gain);
                 }
 
                 for (std::size_t p = 0; p < y.size(); p++)

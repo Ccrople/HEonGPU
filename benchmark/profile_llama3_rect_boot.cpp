@@ -81,6 +81,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <random>
@@ -488,7 +489,11 @@ int main(int argc, char* argv[])
         c.attention_norm.eps = 1e-5;
         c.attention_norm.sum_lo = channels * 0.20;
         c.attention_norm.sum_hi = channels * 0.50;
-        c.attention_norm.degree = EnvInt("HEONGPU_BOOT_NORM_DEGREE", 15);
+        // Seven, not fifteen. Over a range that spans a factor of 2.5 the
+        // degree-7 fit is already accurate to 3.2e-06 and the degree-15 one to
+        // 1.5e-11, and nothing downstream can tell the difference: Section
+        // 3.1.2 puts the requirement at 12 bits. The two differ by a level.
+        c.attention_norm.degree = EnvInt("HEONGPU_BOOT_NORM_DEGREE", 7);
         c.attention_norm.newton_iterations =
             EnvInt("HEONGPU_BOOT_NORM_NEWTON", 0);
         c.feed_forward_norm = c.attention_norm;
@@ -502,9 +507,35 @@ int main(int argc, char* argv[])
             EnvInt("HEONGPU_BOOT_SOFTMAX_ITERS", 1);
         c.attention.softmax.exp_degree = EnvInt("HEONGPU_BOOT_EXP_DEGREE", 15);
         c.attention.softmax.inverse_degree =
-            EnvInt("HEONGPU_BOOT_INVERSE_DEGREE", 7);
+            EnvInt("HEONGPU_BOOT_INVERSE_DEGREE", 15);
         c.attention.softmax.inverse_newton =
             EnvInt("HEONGPU_BOOT_INVERSE_NEWTON", 0);
+
+        // Section 4.3, the calibrated range of the SoftMax denominator.
+        //
+        // The worst case is that every score sits at the bottom of [-bound, 0]
+        // or every one at the top, which puts the sum of exponentials across a
+        // factor of exp(2 bound / 2^iterations) -- 2981 here. No reciprocal is
+        // fitted across that: it takes degree 255 and eight levels to reach 12
+        // bits, and the degree 7 this target used to carry was wrong by 98.6%
+        // over its own stated range. The paper's answer is not a higher degree
+        // but a narrower interval, measured rather than bounded.
+        //
+        // SPREAD is that measurement, in logs: the denominator is taken to lie
+        // in [d exp(-spread), d]. Two costs degree 15 and four levels. What
+        // earns a number well below the worst case is Section 3.1.1's sink
+        // prefix -- public tokens, present in every row, attended by every
+        // query -- which is also what stops a causal row from attending to one
+        // position and driving the ratio to d on its own.
+        const double spread = EnvDouble("HEONGPU_BOOT_SOFTMAX_SPREAD", 2.0);
+        const double axis = static_cast<double>(d);
+        c.attention.softmax.sum_lo = axis * std::exp(-spread);
+        c.attention.softmax.sum_hi = axis;
+        // Read only when iterations is above one: after a round the
+        // coordinates sum to one, so the denominator is between 1/d and d/d,
+        // and this is how far up calibration says it reaches.
+        c.attention.softmax.concentration =
+            EnvDouble("HEONGPU_BOOT_SOFTMAX_CONCENTRATION", 8.0);
 
         c.feed_forward.in_channels = channels;
         c.feed_forward.hidden_channels = hidden;
@@ -524,6 +555,64 @@ int main(int argc, char* argv[])
             EnvFlag("HEONGPU_BOOT_REFRESH_FFN_NORM", true);
         c.refresh.feed_forward_hidden =
             EnvFlag("HEONGPU_BOOT_REFRESH_FFN_HIDDEN", true);
+
+        // What every fit in the block actually achieves over the range it is
+        // configured for, against the 12 bits of Section 3.1.2. A degree is
+        // not a free parameter -- it is what the range and the precision
+        // together leave -- and this is the line that says so. Sampled on the
+        // host, so it costs nothing and cannot be argued with.
+        {
+            const double target = std::pow(2.0, -12);
+            const double norm_lo = c.attention_norm.sum_lo;
+            const double norm_hi = c.attention_norm.sum_hi;
+            const double eps = c.attention_norm.eps;
+            const double cw = static_cast<double>(channels);
+            const auto report = [&](const char* what,
+                                    const std::function<double(double)>& f,
+                                    double lo, double hi, int degree,
+                                    bool relative)
+            {
+                const double e = heongpu::llama::chebyshev_max_error(
+                    f, lo, hi, degree, relative);
+                const int want = heongpu::llama::chebyshev_degree_for(
+                    f, lo, hi, target, relative);
+                std::cout << "[boot] fit " << what << ": degree " << degree
+                          << " over [" << lo << ", " << hi << "] -> "
+                          << (relative ? "rel" : "abs") << " err " << e
+                          << ", 2^-12 wants ";
+                if (want == 0)
+                {
+                    std::cout << "more than 511 -- the interval is too wide";
+                }
+                else
+                {
+                    std::cout << want << " ("
+                              << heongpu::llama::chebyshev_levels(want)
+                              << " levels)";
+                }
+                std::cout << (e <= target ? "" : "   <-- MISSES") << std::endl;
+            };
+
+            report("rms_norm 1/sqrt",
+                   [cw, eps](double s) {
+                       return 1.0 / std::sqrt(s / cw + eps);
+                   },
+                   norm_lo, norm_hi, c.attention_norm.degree, true);
+            report("softmax exp",
+                   [&c](double x) {
+                       return std::exp(
+                           x / std::pow(2.0, c.attention.softmax.iterations));
+                   },
+                   -c.attention.softmax.bound, 0.0,
+                   c.attention.softmax.exp_degree, true);
+            report("softmax 1/x", [](double x) { return 1.0 / x; },
+                   c.attention.softmax.sum_lo, c.attention.softmax.sum_hi,
+                   c.attention.softmax.inverse_degree, true);
+            report("swiglu silu",
+                   [](double x) { return x / (1.0 + std::exp(-x)); },
+                   -c.feed_forward.silu_bound, c.feed_forward.silu_bound,
+                   c.feed_forward.silu_degree, false);
+        }
 
         const bool refreshed = EnvFlag("HEONGPU_BOOT_REFRESHED", true);
         std::cout << "[boot] refreshes       : " << c.refresh.count()

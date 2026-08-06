@@ -79,6 +79,55 @@ namespace heongpu
         double chebyshev_evaluate(const std::vector<double>& coeffs, double a,
                                   double b, double x);
 
+        // -------------------------------------------------------------------
+        // How accurate a fit is, and what it costs -- Section 3.1.3
+        // -------------------------------------------------------------------
+        //
+        // "The sharp control of the required accuracy allows us to set the
+        // prime sizes for multiplicative level in CKKS parameters precisely."
+        // A degree is not a free parameter: it follows from the range the
+        // input actually occupies and the precision the model actually needs,
+        // and it is the range that is worth arguing about. These three make
+        // that mechanical, so a config can be CHECKED rather than guessed.
+
+        /**
+         * @brief Levels a Paterson-Stockmeyer evaluation of @p degree spends.
+         *
+         * ceil(log2(degree + 1)), which is why only the degrees one below a
+         * power of two are ever worth paying for: 16 and 31 cost the same
+         * five, so a fit that needs 17 should be asked for at 31.
+         */
+        int chebyshev_levels(int degree);
+
+        /** @brief The smallest degree of that shape at or above @p degree. */
+        int chebyshev_round_degree(int degree);
+
+        /**
+         * @brief Worst error of the degree-@p degree fit of @p f over [a, b].
+         *
+         * Sampled, not bounded: this is the number a test should assert on,
+         * and the reason a fit whose interval is too wide cannot hide.
+         *
+         * @param relative Divide by |f|, which is the meaningful measure for
+         *                 1/x and 1/sqrt(x) where the small end of the range
+         *                 carries the large values.
+         */
+        double chebyshev_max_error(const std::function<double(double)>& f,
+                                   double a, double b, int degree,
+                                   bool relative = true, int samples = 4096);
+
+        /**
+         * @brief Smallest Paterson-Stockmeyer degree meeting @p target.
+         *
+         * Returns 0 when no degree at or below @p cap does, which is a real
+         * answer and not a failure: it means the interval is too wide to fit
+         * at this precision, and the fix is to narrow the interval rather
+         * than to raise the degree.
+         */
+        int chebyshev_degree_for(const std::function<double(double)>& f,
+                                 double a, double b, double target,
+                                 bool relative = true, int cap = 511);
+
         /**
          * @brief Layout of a square matrix batch inside one ciphertext.
          *
@@ -287,31 +336,58 @@ namespace heongpu
              * correct at multiples of @p span, so this masks those positions
              * and fans them back out. Costs 2 log2(span) rotations and one
              * level for the mask.
+             *
+             * @param mask_scale Folded into the mask, where it is free. The
+             *                   mask is a plaintext product this reduction
+             *                   pays for anyway, so a constant a later step
+             *                   would otherwise spend a level multiplying can
+             *                   ride along on it -- which is what
+             *                   fold_affine_into_mask below does with the
+             *                   domain map of the fit that follows.
              */
             void sum_blocked(Ciphertext<Scheme::CKKS>& ct, int span,
-                             Galoiskey<Scheme::CKKS>& galois_key);
+                             Galoiskey<Scheme::CKKS>& galois_key,
+                             double mask_scale = 1.0);
 
             // ---------------------------------------------------------------
             // Polynomial primitives
             // ---------------------------------------------------------------
 
             /**
+             * @brief The multiplier the domain map of a fit on [a, b] applies.
+             *
+             * t = domain_scale * x + domain_shift carries [a, b] onto [-1, 1].
+             * The scale is a plaintext product and costs a level; the shift is
+             * an addition and costs nothing. Exposed so a caller holding a
+             * plaintext product of its own can carry the scale on it instead.
+             */
+            static double domain_scale(double a, double b);
+            static double domain_shift(double a, double b);
+
+            /**
              * @brief Evaluate a Chebyshev series on [a, b].
              *
              * Maps the input into [-1, 1] first, which costs one level, then
              * hands the series to the library's BSGS evaluator.
+             *
+             * @param pre_scaled The caller has already applied domain_scale,
+             *                   folded into a plaintext product it was paying
+             *                   for anyway. Only the free shift is applied
+             *                   here and the fit costs no mapping level.
              */
             Ciphertext<Scheme::CKKS>
             evaluate_chebyshev(Ciphertext<Scheme::CKKS>& ct,
                                const std::vector<double>& coeffs, double a,
-                               double b, Relinkey<Scheme::CKKS>& relin_key);
+                               double b, Relinkey<Scheme::CKKS>& relin_key,
+                               bool pre_scaled = false);
 
             /** @brief Chebyshev approximation of an arbitrary function. */
             Ciphertext<Scheme::CKKS>
             evaluate_function(Ciphertext<Scheme::CKKS>& ct,
                               const std::function<double(double)>& f, double a,
                               double b, int degree,
-                              Relinkey<Scheme::CKKS>& relin_key);
+                              Relinkey<Scheme::CKKS>& relin_key,
+                              bool pre_scaled = false);
 
             /**
              * @brief 1 / sqrt(x) on [lo, hi].
@@ -332,11 +408,21 @@ namespace heongpu
             /**
              * @brief 1 / x on [lo, hi], seeded then refined by Newton's
              *        y <- y (2 - x y). Two levels per step.
+             *
+             * @param pre_scaled As on evaluate_chebyshev. A Newton step
+             *                   refines against x itself and so needs it
+             *                   unscaled; the two cannot both be had.
+             * @param gain       Fitted in place of the leading one, so the
+             *                   result is gain / x. Free -- it is a change of
+             *                   coefficients -- and it is how a caller that
+             *                   folded a constant into an earlier plaintext
+             *                   takes the constant back out.
              */
             Ciphertext<Scheme::CKKS>
             inverse(Ciphertext<Scheme::CKKS>& ct, double lo, double hi,
                     int degree, int newton_iterations,
-                    Relinkey<Scheme::CKKS>& relin_key);
+                    Relinkey<Scheme::CKKS>& relin_key, bool pre_scaled = false,
+                    double gain = 1.0);
 
             /**
              * @brief SiLU, x * sigmoid(x), on [-bound, bound].
@@ -354,11 +440,18 @@ namespace heongpu
              *
              * The division by 2^k is folded into the approximated function, so
              * the scaling step of the algorithm is free.
+             *
+             * @param pre_scaled As on evaluate_chebyshev. The scores reach
+             *                   this through a projection whose weight is a
+             *                   host array, so the domain map of this fit can
+             *                   ride on the query weight exactly as
+             *                   1/sqrt(head_dim) already does.
              */
             Ciphertext<Scheme::CKKS>
             exp_scaled_negative(Ciphertext<Scheme::CKKS>& ct, double bound,
                                 int squarings, int degree,
-                                Relinkey<Scheme::CKKS>& relin_key);
+                                Relinkey<Scheme::CKKS>& relin_key,
+                                bool pre_scaled = false);
 
             // ---------------------------------------------------------------
             // Llama-3 layers
@@ -408,6 +501,18 @@ namespace heongpu
                 /// mean in hand; the fold is therefore taken only when
                 /// @c newton_iterations is 0, and ignored otherwise.
                 bool fold_mean_into_fit = false;
+                /// Carry the domain map of the 1/sqrt fit on the mask of the
+                /// blocked reduction, which is a plaintext product this layer
+                /// pays for anyway.
+                ///
+                /// The mask feeds the fit and nothing else, so the constant
+                /// needs no undoing on the far side: the fitted value is the
+                /// same value, evaluated at an argument that arrives already
+                /// mapped onto [-1, 1]. One more level, under the same two
+                /// conditions as the mean fold -- it needs @c blocked_span,
+                /// since the strided reduction has no mask to ride on, and it
+                /// needs no Newton step.
+                bool fold_affine_into_mask = false;
             };
 
             /**
@@ -449,6 +554,67 @@ namespace heongpu
                 int exp_degree = 31;
                 int inverse_degree = 15;
                 int inverse_newton = 2;
+
+                // -----------------------------------------------------------
+                // Section 4.3: sharp ranges instead of worst-case bounds
+                // -----------------------------------------------------------
+                //
+                // "Rather than relying on worst-case bounds as [25], we use
+                // the distributional data computed during calibration to
+                // obtain sharp estimates on the range of the inverse square
+                // root computations."
+                //
+                // The worst case is not close. The denominator of round zero
+                // ranges over [d exp(-2 bound / 2^k), d] if nothing is known,
+                // which at d = 128 and bound = 8 spans a factor of 3000, and
+                // a reciprocal cannot be fitted across that at any degree a
+                // circuit can afford -- degree 511, nine levels, to reach the
+                // 12 bits of Section 3.1.2. Narrow the interval instead and
+                // the same 12 bits cost four. This is the whole of the
+                // paper's argument about non-linear layers, and it is the
+                // reason these are inputs: the range is a measurement of the
+                // model, not a property of the algorithm.
+
+                /// Calibrated range of the round-zero denominator, sum_i
+                /// exp(2 x_i / 2^k) over the reduced axis. Both left at zero
+                /// keeps the worst case, which is what a fit must cover when
+                /// nothing has been measured.
+                double sum_lo = 0.0;
+                double sum_hi = 0.0;
+
+                /// Calibrated bound on the sum of squares AFTER a round, as a
+                /// multiple of its uniform value 1/d. One is a flat
+                /// distribution and d is a one-hot one; 0 keeps the worst
+                /// case, which is d.
+                ///
+                /// A causal row that attends to a single position really does
+                /// land at d, so this is not slack to be taken on faith --
+                /// what earns it is the sink prefix of Section 3.1.1, whose
+                /// tokens are public, always present, and attended by every
+                /// row. Only the last round matters for the output, and only
+                /// the rounds after the first read this.
+                double concentration = 0.0;
+
+                /// Carry the domain map of the reciprocal on the mask applied
+                /// to the exponentials.
+                ///
+                /// Unlike the RMSNorm fold, that mask feeds the numerator as
+                /// well as the denominator, so the constant has to come back
+                /// out: it rides on the mask as its square root, which puts
+                /// the factor itself on the denominator, and the fit gives
+                /// back gain/x rather than 1/x to cancel it. Needs a mask to
+                /// ride on and no Newton step.
+                bool fold_affine_into_mask = false;
+
+                /// The inputs already carry the domain map of the exponential,
+                /// 2/bound, applied wherever they were formed.
+                ///
+                /// For attention that is the query weight, a host array where
+                /// a scaling is free and where 1/sqrt(head_dim) already rides.
+                /// A caller setting this owes the same scaling of whatever
+                /// shift it subtracts, since what it hands over is no longer
+                /// a score.
+                bool pre_scaled_input = false;
             };
 
             /**

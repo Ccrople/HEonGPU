@@ -922,6 +922,7 @@ namespace heongpu
             slot_config.degree = config.degree;
             slot_config.newton_iterations = config.newton_iterations;
             slot_config.fold_mean_into_fit = config.fold_mean_into_fit;
+            slot_config.fold_affine_into_mask = config.fold_affine_into_mask;
 
             std::vector<Ciphertext<Scheme::CKKS>> normalised =
                 batch_.arith().rms_norm(slots, weights, slot_config, galois_key,
@@ -990,10 +991,24 @@ namespace heongpu
                 config.head_scale != 0.0
                     ? config.head_scale
                     : 1.0 / std::sqrt(static_cast<double>(d));
+
+            // And so does the domain map of the exponential, for exactly the
+            // same reason. The SoftMax fits exp over [-bound, 0] and has to
+            // carry its argument onto [-1, 1] first, which is a plaintext
+            // product and a level -- unless the scores arrive already carrying
+            // it, and every score is a linear function of this weight.
+            const bool fold_exp_domain =
+                config.fold_softmax_domain_into_query &&
+                config.softmax.bound > 0.0;
+            const double exp_domain =
+                fold_exp_domain
+                    ? Llama3Operator::domain_scale(-config.softmax.bound, 0.0)
+                    : 1.0;
+
             std::vector<double> query_weight = weights.query;
             for (auto& w : query_weight)
             {
-                w *= head_scale;
+                w *= head_scale * exp_domain;
             }
 
             // Grouped-query attention, expanded on the host. A kv head has to
@@ -1091,11 +1106,14 @@ namespace heongpu
                     note_depth("attention.refresh_post_qk", slots);
                 }
 
+                // The shift is scaled with the scores it is subtracted from.
+                // It is a constant either way, so this is free either way.
                 if (config.score_shift != 0.0)
                 {
                     for (auto& c : slots)
                     {
-                        batch_.arith().add_constant(c, -config.score_shift);
+                        batch_.arith().add_constant(
+                            c, -config.score_shift * exp_domain);
                     }
                 }
 
@@ -1106,6 +1124,11 @@ namespace heongpu
                 softmax.strided = true;
                 softmax.stride = slot_count_;
                 softmax.count = 1;
+                softmax.pre_scaled_input = fold_exp_domain;
+                // Round zero's domain map rides on the causal mask, so it can
+                // only be folded when there is one.
+                softmax.fold_affine_into_mask =
+                    config.fold_softmax_affine_into_mask && config.causal;
 
                 std::vector<std::vector<double>> masks;
                 if (config.causal)
