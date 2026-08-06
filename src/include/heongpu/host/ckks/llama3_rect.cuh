@@ -194,14 +194,32 @@
 //
 //   worst stretch 12 -> 11, at the SoftMax rather than the RMSNorm
 //
-// The chain is sized on the worst stretch, so 11 wants 37 limbs and not 38, and
-// at dnum = 1 the mod-down that dominates this path is O(L^2). The level table
-// is the smaller result: this path was previously measured with a reciprocal
-// that was not an approximation of one.
+// The chain is sized on the worst stretch, so 11 wants 37 limbs and not 38.
+//
+// AND IT IS NOT FASTER. Measured on one A6000 at d = 64, hidden 4096, 8 kv
+// heads -- one shape, three circuits:
+//
+//   before, 38 limbs ... 563.3 s   the old schedule, reciprocal wrong by 98.6%
+//   after,  38 limbs ... 576.8 s   +2.4%, correctness at the old chain
+//   after,  37 limbs ... 562.2 s   -0.2%, correctness at the chain it now needs
+//
+// So the level savings buy back exactly what correctness costs, and no more.
+// The reciprocal's degree had to go UP to be an approximation at all, and that
+// eats the two folds and the RMSNorm's degree drop between them. Anyone
+// expecting the shorter chain to pay for itself should note that it very nearly
+// does and no better: mod-down is O(L^2) at dnum = 1, but mod-down is one kernel
+// and the rest of a block scales nearer L, so a limb off 38 is worth well under
+// the 5% the square suggests.
+//
+// The result here is the accuracy, not the clock. Correctness for free is a
+// good trade and it is the whole trade.
 //
 // The SoftMax is now the worst stretch and the RMSNorm is not, which says where
 // to look next: 11 is the exponential's four levels, the reciprocal's four, the
-// squaring, the mask and the product. None of those is slack.
+// squaring, the mask and the product. None of those is slack. Note also that 37
+// leaves the SoftMax exactly ONE limb, where 38 left it two, so the shorter
+// chain spends the margin -- staying at 38 and taking only the accuracy is a
+// defensible reading of the same table.
 //
 // THE REAL SHAPE, MEASURED
 // ------------------------
