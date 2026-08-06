@@ -760,8 +760,15 @@ namespace heongpu
             const int half = layout_.N / 2;
             const int groups = x.groups;
 
-            std::vector<Ciphertext<Scheme::CKKS>> slots =
-                to_slots(x, galois_key);
+            // The crossings are named for their caller as well as for
+            // themselves. bridge.* aggregates every crossing in the circuit,
+            // which is the number worth knowing about this path; these say
+            // which sublayer paid it.
+            std::vector<Ciphertext<Scheme::CKKS>> slots;
+            {
+                Range _r_in("rms_norm.to_slots");
+                slots = to_slots(x, galois_key);
+            }
 
             // A channel is (ciphertext, fast slot index), so the learned scale
             // is a slot vector over the block axis and constant along the token
@@ -819,6 +826,7 @@ namespace heongpu
                 batch_.arith().rms_norm(slots, weights, slot_config, galois_key,
                                         relin_key);
 
+            Range _r_out("rms_norm.from_slots");
             return from_slots(normalised, channels, galois_key);
         }
 
@@ -956,8 +964,11 @@ namespace heongpu
 
                 // The SoftMax is slot-wise, so this is where the sublayer
                 // leaves the matrix encoding -- and the only place it does.
-                std::vector<Ciphertext<Scheme::CKKS>> slots =
-                    batch_.to_slots(scores, galois_key);
+                std::vector<Ciphertext<Scheme::CKKS>> slots;
+                {
+                    Range _r("attention.to_slots");
+                    slots = batch_.to_slots(scores, galois_key);
+                }
                 scores.column.clear();
 
                 if (config.score_shift != 0.0)
@@ -986,13 +997,19 @@ namespace heongpu
                     }
                 }
 
-                std::vector<Ciphertext<Scheme::CKKS>> p_slots =
-                    batch_.arith().softmax(slots, softmax, masks, galois_key,
-                                           relin_key);
+                std::vector<Ciphertext<Scheme::CKKS>> p_slots;
+                {
+                    Range _r("attention.softmax");
+                    p_slots = batch_.arith().softmax(
+                        slots, softmax, masks, galois_key, relin_key);
+                }
                 slots.clear();
 
-                BatchActivation p =
-                    batch_.from_slots(p_slots, d, galois_key);
+                BatchActivation p;
+                {
+                    Range _r("attention.from_slots");
+                    p = batch_.from_slots(p_slots, d, galois_key);
+                }
                 p_slots.clear();
 
                 // V is still where the projection left it, several levels
@@ -1015,8 +1032,11 @@ namespace heongpu
             k.column.clear();
             v.column.clear();
 
-            RectActivation out =
-                from_batch(out_groups, q_channels, galois_key);
+            RectActivation out;
+            {
+                Range _r("attention.from_batch");
+                out = from_batch(out_groups, q_channels, galois_key);
+            }
             out_groups.clear();
 
             if (weights.output.empty())
@@ -1108,10 +1128,12 @@ namespace heongpu
                 // convolves their coefficients. Both branches therefore cross
                 // to slot form, where a product is slot-wise, and the result
                 // crosses back for the down projection.
-                std::vector<Ciphertext<Scheme::CKKS>> gate_slots =
-                    to_slots(gate, galois_key);
-                std::vector<Ciphertext<Scheme::CKKS>> up_slots =
-                    to_slots(up, galois_key);
+                std::vector<Ciphertext<Scheme::CKKS>> gate_slots, up_slots;
+                {
+                    Range _r("ffn.to_slots");
+                    gate_slots = to_slots(gate, galois_key);
+                    up_slots = to_slots(up, galois_key);
+                }
                 gate.column.clear();
                 up.column.clear();
 
@@ -1132,7 +1154,11 @@ namespace heongpu
                 gate_slots.clear();
                 up_slots.clear();
 
-                RectActivation h = from_slots(hidden, cols, galois_key);
+                RectActivation h;
+                {
+                    Range _r("ffn.from_slots");
+                    h = from_slots(hidden, cols, galois_key);
+                }
                 hidden.clear();
 
                 const std::vector<double> down_w(
