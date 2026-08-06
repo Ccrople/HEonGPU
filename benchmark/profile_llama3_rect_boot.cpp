@@ -972,6 +972,13 @@ int main(int argc, char* argv[])
 
         if (real)
         {
+            // The compute time, taken BEFORE the read-back: decrypting and
+            // checking are measurement apparatus, not the circuit.
+            std::cout << "[boot] block compute   : " << std::fixed
+                      << std::setprecision(1) << whole.ms()
+                      << " ms before read-back" << std::defaultfloat
+                      << std::endl;
+
             // The yardstick: the exact host run of the same circuit on the
             // same input. Everything is in circuit units -- the rotated,
             // 1/B_stream-scaled convention -- which is also what the next
@@ -987,8 +994,28 @@ int main(int argc, char* argv[])
                     1.0 / real->scales.normed_ffn);
                 expect = &expect_nosink;
             }
-            std::vector<double> back =
-                op.decrypt(out, decryptor, out.column.front().scale());
+            std::cout << "[boot] read-back       : depth "
+                      << out.column.front().depth() << ", scale 2^"
+                      << std::log2(out.column.front().scale()) << std::endl;
+            std::vector<double> back;
+            try
+            {
+                back =
+                    op.decrypt(out, decryptor, out.column.front().scale());
+            }
+            catch (const std::exception& e)
+            {
+                // The decoder reconstructs coefficients into an int64 and a
+                // stray coefficient past 2^63 aborts the whole read. One
+                // refresh re-encodes the polynomial at the boot scale --
+                // garbling whatever was already out of range, and nothing
+                // else -- so the readable part of the output is still read.
+                std::cout << "[boot] direct read-back failed (" << e.what()
+                          << "); reading through one refresh" << std::endl;
+                op.bootstrap(out, "readback.refresh", galois, relin);
+                back =
+                    op.decrypt(out, decryptor, out.column.front().scale());
+            }
             back.resize(expect->size());
             double signal = 0.0;
             for (double v : *expect)
@@ -996,12 +1023,31 @@ int main(int argc, char* argv[])
                 signal = std::max(signal, std::abs(v));
             }
             const double err = max_abs_error(*expect, back);
+            // The flagged rows leave the block as a known mixture and their
+            // error is reported apart, so the private rows -- the ones whose
+            // output is exactly the true model's -- carry the headline.
+            double err_private = 0.0;
+            double err_flagged = 0.0;
+            for (std::size_t i = 0; i < expect->size(); i++)
+            {
+                const int row = static_cast<int>(i) / channels;
+                const double e = std::abs((*expect)[i] - back[i]);
+                const bool flagged =
+                    row < static_cast<int>(real->row_scale.size()) &&
+                    (nosink ? real->row_scale_nosink[row]
+                            : real->row_scale[row]) != 1.0;
+                (flagged ? err_flagged : err_private) =
+                    std::max(flagged ? err_flagged : err_private, e);
+            }
             std::cout << "[boot] real block error: max abs "
                       << std::scientific << std::setprecision(3) << err
-                      << " against a stream of |max| " << signal
+                      << " (private rows " << err_private
+                      << ", flagged rows " << err_flagged
+                      << ") against a stream of |max| " << signal
                       << std::defaultfloat << " -- "
-                      << std::setprecision(3) << std::log2(signal / err)
-                      << " bits, in circuit units (x "
+                      << std::setprecision(3)
+                      << std::log2(signal / err_private)
+                      << " bits on the private rows, circuit units (x "
                       << real->scales.stream << " for true units)"
                       << std::endl;
         }
