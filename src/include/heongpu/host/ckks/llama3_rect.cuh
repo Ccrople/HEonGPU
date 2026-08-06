@@ -714,6 +714,21 @@ namespace heongpu
                 /// Subtracted from the scores so they land in [-bound, 0].
                 /// Calibrated, as in the paper, not computed homomorphically.
                 double score_shift = 0.0;
+                /// Per-(query row, head) shift, row major d x heads, in true
+                /// score units; empty keeps the scalar above. Wins over it.
+                ///
+                /// One global shift leaves the SoftMax denominator spanning
+                /// whatever the sharpest and flattest rows disagree by --
+                /// measured 256x on real weights, which no reciprocal at any
+                /// sane degree covers. Shifting each row-head's maximum to
+                /// zero instead FLOORS the denominator at one, because the
+                /// coordinate achieving the maximum contributes exactly
+                /// exp(0). A shift constant along the key axis cancels in
+                /// the normalisation, so the output is unchanged; the range
+                /// the reciprocal must cover is not. It is calibration data
+                /// like every other range here, and it costs an encoded
+                /// ADDITION: no level, no rescale, no key.
+                std::vector<double> score_shift_rows;
                 /// Carry the domain map of the exponential, 2/bound, on the
                 /// query weight -- where 1/sqrt(head_dim) already rides and
                 /// where a scaling costs nothing. The shift above is scaled to

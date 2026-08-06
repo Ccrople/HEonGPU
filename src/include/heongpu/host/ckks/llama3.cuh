@@ -365,6 +365,18 @@ namespace heongpu
             static double domain_shift(double a, double b);
 
             /**
+             * @brief Slot-wise addition of one plaintext vector to a batch.
+             *
+             * Encoded once at the batch's own scale and level, so it costs
+             * no level and no rescale -- an addition's price is an encode.
+             * Every ciphertext must sit at one level and one scale, which is
+             * checked, because an addition at a mismatched scale is silently
+             * a weighted sum.
+             */
+            void add_vector(std::vector<Ciphertext<Scheme::CKKS>>& cts,
+                            const std::vector<double>& values);
+
+            /**
              * @brief Evaluate a Chebyshev series on [a, b].
              *
              * Maps the input into [-1, 1] first, which costs one level, then

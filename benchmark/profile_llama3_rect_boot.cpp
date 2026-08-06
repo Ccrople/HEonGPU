@@ -371,16 +371,20 @@ int main(int argc, char* argv[])
                       << std::endl;
             // The SoftMax denominator spread is what decides whether the
             // reciprocal is fittable at all, so it earns its own line: the
-            // round-zero range per squaring count, as a ratio.
+            // round-zero range per squaring count, as a ratio, under the
+            // global shift and under the per-row one whose floor is one.
             std::cout << "[boot]        " << std::setw(24) << ' '
-                      << " softmax D spread: k=1 "
+                      << " softmax D spread: global k=1 "
                       << (cal.softmax_sum_hi[0] / cal.softmax_sum_lo[0])
-                      << " [" << cal.softmax_sum_lo[0] << ", "
-                      << cal.softmax_sum_hi[0] << "], k=2 "
+                      << ", k=2 "
                       << (cal.softmax_sum_hi[1] / cal.softmax_sum_lo[1])
-                      << " [" << cal.softmax_sum_lo[1] << ", "
-                      << cal.softmax_sum_hi[1] << "], prob_sq "
-                      << cal.prob_sq_hi << std::endl;
+                      << "; per-row k=1 "
+                      << (cal.softmax_row_sum_hi[0] /
+                          cal.softmax_row_sum_lo[0])
+                      << " [" << cal.softmax_row_sum_lo[0] << ", "
+                      << cal.softmax_row_sum_hi[0] << "], row span "
+                      << cal.score_row_span << ", prob_sq " << cal.prob_sq_hi
+                      << std::endl;
         };
         dump("mitigated (sink, rotated)", real->raw);
         dump("without the sink prefix", real->raw_nosink);
@@ -770,42 +774,66 @@ int main(int argc, char* argv[])
                            c.feed_forward_norm.sum_hi, true, 1.0));
             }
 
-            // The scores: shifted to [-bound, 0] by the measured top, with
-            // squarings until the exponential's argument spans at most the
-            // eight the default fit was built for, and the denominator range
-            // measured under exactly that shift and squaring count.
-            const double bound_raw = cal.score_hi - cal.score_lo;
-            c.attention.score_shift = cal.score_hi;
+            // The scores. One calibrated shift leaves the denominator
+            // spanning whatever the sharpest and flattest rows disagree by
+            // -- measured 256x on the real weights, which no reciprocal at
+            // a sane degree covers -- so the shift is per (row, head) by
+            // default: every maximum lands at zero, the denominator is
+            // FLOORED at one by the coordinate achieving it, and both fit
+            // intervals collapse to what a single row actually spans.
+            const bool row_shift = EnvFlag("HEONGPU_BOOT_ROW_SHIFT", true);
+            double bound_raw = 0.0;
+            if (row_shift)
+            {
+                c.attention.score_shift_rows = cal.row_shift;
+                bound_raw = cal.score_row_span;
+            }
+            else
+            {
+                c.attention.score_shift = cal.score_hi;
+                bound_raw = cal.score_hi - cal.score_lo;
+            }
             c.attention.softmax.bound =
                 EnvDouble("HEONGPU_BOOT_SOFTMAX_BOUND", bound_raw * 1.02);
-            int iters = 1;
-            while (c.attention.softmax.bound / std::pow(2.0, iters) > 8.0 &&
-                   iters < 4)
+            const double sm_bound = c.attention.softmax.bound;
+            // The squaring count is what the exponential's oracle says: the
+            // smallest k whose fit reaches 12 bits at a degree worth paying
+            // for. Every extra round costs a squaring and a reciprocal --
+            // and past round zero the reciprocal's interval is the
+            // structural [1/d, 1] that calibration cannot narrow, since a
+            // causal first row really is one-hot -- so k stops rising the
+            // moment the fit fits.
+            int iters = 0;
+            int exp_degree = 0;
+            for (int k_try = 1; k_try <= 4 && exp_degree == 0; k_try++)
             {
-                iters++;
+                const double div = std::pow(2.0, k_try);
+                exp_degree = heongpu::llama::chebyshev_degree_for(
+                    [div](double v) { return std::exp(v / div); }, -sm_bound,
+                    0.0, target, true, 127);
+                iters = k_try;
+            }
+            if (exp_degree == 0)
+            {
+                exp_degree = 127; // the fit report below will say MISSES
             }
             iters = EnvInt("HEONGPU_BOOT_SOFTMAX_ITERS", iters);
             c.attention.softmax.iterations = iters;
-            c.attention.softmax.sum_lo =
-                cal.softmax_sum_lo[iters - 1] / 1.1;
-            c.attention.softmax.sum_hi =
-                cal.softmax_sum_hi[iters - 1] * 1.1;
+            c.attention.softmax.exp_degree =
+                EnvInt("HEONGPU_BOOT_EXP_DEGREE", exp_degree);
+            const double* sums_lo =
+                row_shift ? cal.softmax_row_sum_lo : cal.softmax_sum_lo;
+            const double* sums_hi =
+                row_shift ? cal.softmax_row_sum_hi : cal.softmax_sum_hi;
+            c.attention.softmax.sum_lo = sums_lo[iters - 1] / 1.1;
+            c.attention.softmax.sum_hi = sums_hi[iters - 1] * 1.1;
             c.attention.softmax.concentration = std::min(
                 static_cast<double>(d), cal.prob_sq_hi * 1.2 * d);
-            {
-                const double b = c.attention.softmax.bound;
-                const double div = std::pow(2.0, iters);
-                c.attention.softmax.exp_degree = EnvInt(
-                    "HEONGPU_BOOT_EXP_DEGREE",
-                    derive("softmax exp",
-                           [div](double v) { return std::exp(v / div); }, -b,
-                           0.0, true, 1.0));
-                c.attention.softmax.inverse_degree = EnvInt(
-                    "HEONGPU_BOOT_INVERSE_DEGREE",
-                    derive("softmax 1/x", [](double v) { return 1.0 / v; },
-                           c.attention.softmax.sum_lo,
-                           c.attention.softmax.sum_hi, true, 1.0));
-            }
+            c.attention.softmax.inverse_degree = EnvInt(
+                "HEONGPU_BOOT_INVERSE_DEGREE",
+                derive("softmax 1/x", [](double v) { return 1.0 / v; },
+                       c.attention.softmax.sum_lo,
+                       c.attention.softmax.sum_hi, true, 1.0));
 
             c.feed_forward.silu_bound = cal.silu_in_abs * 1.05;
             c.feed_forward.silu_degree = EnvInt(
@@ -820,7 +848,9 @@ int main(int argc, char* argv[])
             c.fold_norm_scale = false;
 
             std::cout << "[boot] calibrated      : score [" << cal.score_lo
-                      << ", " << cal.score_hi << "] -> bound "
+                      << ", " << cal.score_hi << "], "
+                      << (row_shift ? "per-row shift, span " : "global shift, span ")
+                      << bound_raw << " -> bound "
                       << c.attention.softmax.bound << " at " << iters
                       << " round(s), softmax sum ["
                       << c.attention.softmax.sum_lo << ", "

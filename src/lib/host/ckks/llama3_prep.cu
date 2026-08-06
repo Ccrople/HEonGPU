@@ -388,6 +388,14 @@ namespace heongpu
                 std::vector<double> attn(static_cast<std::size_t>(t) * c,
                                          0.0);
                 std::vector<double> scores(static_cast<std::size_t>(t) * t);
+                cal.row_shift.assign(static_cast<std::size_t>(t) * heads,
+                                     0.0);
+                for (int kk = 0; kk < 4; kk++)
+                {
+                    cal.softmax_row_sum_lo[kk] =
+                        std::numeric_limits<double>::infinity();
+                    cal.softmax_row_sum_hi[kk] = 0.0;
+                }
                 for (int head = 0; head < heads; head++)
                 {
                     const int kv_head = head / group;
@@ -411,11 +419,35 @@ namespace heongpu
                     for (int i = 0; i < t; i++)
                     {
                         double top = -std::numeric_limits<double>::infinity();
+                        double bottom =
+                            std::numeric_limits<double>::infinity();
                         for (int j = 0; j <= i; j++)
                         {
-                            top = std::max(
-                                top,
-                                scores[static_cast<std::size_t>(i) * t + j]);
+                            const double s =
+                                scores[static_cast<std::size_t>(i) * t + j];
+                            top = std::max(top, s);
+                            bottom = std::min(bottom, s);
+                        }
+                        cal.row_shift[static_cast<std::size_t>(i) * heads +
+                                      head] = top;
+                        cal.score_row_span =
+                            std::max(cal.score_row_span, top - bottom);
+                        for (int kk = 0; kk < 4; kk++)
+                        {
+                            double denom_k = 0.0;
+                            for (int j = 0; j <= i; j++)
+                            {
+                                denom_k += std::exp(
+                                    2.0 *
+                                    (scores[static_cast<std::size_t>(i) * t +
+                                            j] -
+                                     top) /
+                                    std::pow(2.0, kk + 1));
+                            }
+                            cal.softmax_row_sum_lo[kk] = std::min(
+                                cal.softmax_row_sum_lo[kk], denom_k);
+                            cal.softmax_row_sum_hi[kk] = std::max(
+                                cal.softmax_row_sum_hi[kk], denom_k);
                         }
                         double denom = 0.0;
                         for (int j = 0; j <= i; j++)

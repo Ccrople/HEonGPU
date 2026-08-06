@@ -1109,7 +1109,36 @@ namespace heongpu
 
                 // The shift is scaled with the scores it is subtracted from.
                 // It is a constant either way, so this is free either way.
-                if (config.score_shift != 0.0)
+                if (!config.score_shift_rows.empty())
+                {
+                    // Slot b + step*u of every part holds query u of head
+                    // g*step + b, so the per-(row, head) shift is one slot
+                    // vector per group, encoded once and added to every
+                    // part. Constant along the key axis, it cancels in the
+                    // normalisation and only the fitted ranges feel it.
+                    if (static_cast<int>(config.score_shift_rows.size()) !=
+                        d * config.heads)
+                    {
+                        throw std::invalid_argument(
+                            "score_shift_rows must be d x heads");
+                    }
+                    std::vector<double> flat(slot_count_, 0.0);
+                    const int step = layout_.batch;
+                    for (int b = 0; b < step; ++b)
+                    {
+                        for (int u = 0; u < d; ++u)
+                        {
+                            flat[b + u * step] =
+                                -config.score_shift_rows
+                                     [static_cast<std::size_t>(u) *
+                                          config.heads +
+                                      g * step + b] *
+                                exp_domain;
+                        }
+                    }
+                    batch_.arith().add_vector(slots, flat);
+                }
+                else if (config.score_shift != 0.0)
                 {
                     for (auto& c : slots)
                     {

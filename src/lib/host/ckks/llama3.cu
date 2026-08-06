@@ -545,6 +545,42 @@ namespace heongpu
             add_plain_v2(ct, Complex64(c, 0.0), ct);
         }
 
+        void Llama3Operator::add_vector(
+            std::vector<Ciphertext<Scheme::CKKS>>& cts,
+            const std::vector<double>& values)
+        {
+            if (cts.empty())
+            {
+                return;
+            }
+            if (static_cast<int>(values.size()) != slot_count_)
+            {
+                throw std::invalid_argument(
+                    "Slot vector must hold exactly slot_count() entries");
+            }
+            for (const auto& ct : cts)
+            {
+                // An addition with a mismatched scale is silently a weighted
+                // sum, so the batch must agree before one plaintext serves
+                // it all.
+                if (ct.scale() != cts.front().scale() ||
+                    ct.depth() != cts.front().depth())
+                {
+                    throw std::invalid_argument(
+                        "add_vector needs every ciphertext at one level and "
+                        "one scale");
+                }
+            }
+            // Encoded at the ciphertexts' own scale, not the rescale prime:
+            // an addition consumes no level and must not change the scale.
+            Plaintext<Scheme::CKKS> plain =
+                encode(values, cts.front().scale(), cts.front().depth());
+            for (auto& ct : cts)
+            {
+                add_plain_inplace(ct, plain);
+            }
+        }
+
         void Llama3Operator::square(Ciphertext<Scheme::CKKS>& ct,
                                     Relinkey<Scheme::CKKS>& relin_key)
         {

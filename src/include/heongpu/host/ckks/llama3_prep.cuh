@@ -142,6 +142,18 @@ namespace heongpu
             /// axis length before handing it over. Read only when the score
             /// range forces more than one normalise-and-square round.
             double prob_sq_hi = 0.0;
+            /// The per-(row, head) maximum visible score, row major
+            /// tokens x heads: RectAttentionConfig::score_shift_rows as
+            /// measured. Under it every denominator is floored at one.
+            std::vector<double> row_shift;
+            /// Worst over rows and heads of (max - min) visible score: the
+            /// exp fit's interval under the per-row shift.
+            double score_row_span = 0.0;
+            /// The round-zero denominator range under the PER-ROW shift,
+            /// indexed by squarings - 1, as softmax_sum_* is for the global
+            /// one. The lower end is structurally at least one.
+            double softmax_row_sum_lo[4] = {0.0, 0.0, 0.0, 0.0};
+            double softmax_row_sum_hi[4] = {0.0, 0.0, 0.0, 0.0};
             /// Peak |entry| of V, of the SiLU argument, of the SwiGLU hidden.
             double value_abs = 0.0;
             double silu_in_abs = 0.0;
