@@ -104,14 +104,29 @@
 // The coefficient bound is the one condition, and the rect encoding meets it
 // more easily than the slot encoding does: a rect coefficient IS one data entry
 // times the scale, where a slot coefficient is a transform of N/2 of them.
+// Measured on an A6000 at N = 4096, 31 limbs: a rect column comes back with a
+// worst absolute error of 1.2e-05 and a matrix encryption 5.2e-05, against the
+// 1e-3 a single crossing costs. The refresh is the accurate part of this
+// circuit.
+//
+// The key set is free as well. Bootstrapping asks for 24 rotation indices at
+// this ring, and Algorithm 5's CMT already holds every one of the 2047 there
+// are, so the union is 2048 -- one more key than the path needed anyway.
 //
 // WHERE THE REFRESHES GO
 // ----------------------
 // Six seams per block, chosen so that no stretch between two of them spends more
 // levels than one bootstrap hands back. RectRefreshConfig names them and any of
-// them can be switched off; Llama3RectOperator::block_level_schedule() reports
-// what each stretch costs, which is the number that decides whether a chain is
-// long enough and which appears in no timing report.
+// them can be switched off; set depth_trace to record what each stretch costs,
+// which is the number that decides whether a chain is long enough and which
+// appears in no timing report.
+//
+// The chain follows from the schedule and not the other way round. A regular
+// bootstrap at these parameters spends 25 levels whatever the chain is, so a
+// chain of L limbs hands back L - 26 usable levels, and a schedule whose worst
+// stretch is S wants exactly L = S + 26. Longer is not safer: it is slower, in
+// proportion to L^2 at dnum = 1, for levels the circuit throws away at the next
+// refresh.
 //
 // ORIENTATION AND SHAPE CONSTRAINTS
 // ---------------------------------
@@ -308,8 +323,13 @@ namespace heongpu
                 bool mid = true;
                 /// The normalised stream, before the gate and up projections.
                 bool after_feed_forward_norm = true;
-                /// Left off by default: the SwiGLU half fits in one stretch.
-                bool feed_forward_hidden = false;
+                /// The SwiGLU hidden, after the SiLU and the gate product.
+                ///
+                /// The SwiGLU half is 14 levels with the SiLU at the paper's
+                /// degree 31, so it is this seam or a degree nobody fits a
+                /// SiLU at. Splitting here rather than before the SiLU keeps
+                /// the two stretches at 10 and 4 instead of 3 and 11.
+                bool feed_forward_hidden = true;
 
                 /// Refreshes one block takes with these flags.
                 int count() const;
@@ -481,6 +501,12 @@ namespace heongpu
                 double sum_hi = 0.0;
                 int degree = 31;
                 int newton_iterations = 2;
+                /// Fit 1/sqrt over the summed square rather than over the
+                /// mean, which saves the level that forming the mean costs.
+                /// On by default here and off on the slot path: this is the
+                /// encoding under level pressure. Ignored when
+                /// @c newton_iterations is above zero.
+                bool fold_mean_into_fit = true;
             };
 
             /**

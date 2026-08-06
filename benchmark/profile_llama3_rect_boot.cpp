@@ -63,6 +63,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <random>
@@ -177,6 +178,14 @@ double max_abs_error(const std::vector<double>& a, const std::vector<double>& b)
 /// The level schedule: every seam of the block, what it left behind, and what
 /// the stretch before it spent. This is the deliverable of a refreshed circuit
 /// and it appears in no Nsight report.
+///
+/// A refresh is recognised by its name and not by the sign of the depth change.
+/// The two disagree whenever the chain is longer than the schedule needs: a
+/// bootstrap always hands back the SAME depth, so on a chain with plenty left
+/// it moves the ciphertext DOWN. That is not an error, it is the statement that
+/// the chain is longer than one bootstrap's worth -- and the number this class
+/// exists to produce, the worst stretch, is exactly what a chain should be cut
+/// back to.
 class Schedule
 {
   public:
@@ -184,22 +193,23 @@ class Schedule
 
     void operator()(const char* name, int depth)
     {
-        const int left = limbs_ - depth;
+        const bool refresh = std::strstr(name, "refresh") != nullptr;
         std::cout << "[boot] " << std::setw(34) << std::left << name
                   << std::right << " depth " << std::setw(3) << depth
-                  << "   limbs left " << std::setw(3) << left;
-        if (last_ >= 0)
+                  << "   limbs left " << std::setw(3) << (limbs_ - depth);
+        if (refresh)
+        {
+            std::cout << "   REFRESH";
+            refreshes_++;
+        }
+        else if (last_ >= 0)
         {
             const int spent = depth - last_;
-            if (spent >= 0)
+            std::cout << "   spent " << std::setw(3) << spent;
+            if (spent > worst_)
             {
-                std::cout << "   spent " << std::setw(3) << spent;
-                worst_ = std::max(worst_, spent);
-            }
-            else
-            {
-                std::cout << "   REFRESHED (+" << (-spent) << ")";
-                refreshes_++;
+                worst_ = spent;
+                worst_name_ = name;
             }
         }
         std::cout << std::endl;
@@ -207,12 +217,14 @@ class Schedule
     }
 
     int worst_stretch() const { return worst_; }
+    const std::string& worst_name() const { return worst_name_; }
     int refreshes() const { return refreshes_; }
 
   private:
     int limbs_;
     int last_ = -1;
     int worst_ = 0;
+    std::string worst_name_;
     int refreshes_ = 0;
 };
 
@@ -471,9 +483,9 @@ int main(int argc, char* argv[])
         c.attention.softmax.bound = EnvDouble("HEONGPU_BOOT_SOFTMAX_BOUND", 8.0);
         c.attention.softmax.iterations =
             EnvInt("HEONGPU_BOOT_SOFTMAX_ITERS", 1);
-        c.attention.softmax.exp_degree = EnvInt("HEONGPU_BOOT_EXP_DEGREE", 31);
+        c.attention.softmax.exp_degree = EnvInt("HEONGPU_BOOT_EXP_DEGREE", 15);
         c.attention.softmax.inverse_degree =
-            EnvInt("HEONGPU_BOOT_INVERSE_DEGREE", 15);
+            EnvInt("HEONGPU_BOOT_INVERSE_DEGREE", 7);
         c.attention.softmax.inverse_newton =
             EnvInt("HEONGPU_BOOT_INVERSE_NEWTON", 0);
 
@@ -494,7 +506,7 @@ int main(int argc, char* argv[])
         c.refresh.after_feed_forward_norm =
             EnvFlag("HEONGPU_BOOT_REFRESH_FFN_NORM", true);
         c.refresh.feed_forward_hidden =
-            EnvFlag("HEONGPU_BOOT_REFRESH_FFN_HIDDEN", false);
+            EnvFlag("HEONGPU_BOOT_REFRESH_FFN_HIDDEN", true);
 
         const bool refreshed = EnvFlag("HEONGPU_BOOT_REFRESHED", true);
         std::cout << "[boot] refreshes       : " << c.refresh.count()
@@ -508,7 +520,11 @@ int main(int argc, char* argv[])
         cudaDeviceSynchronize();
 
         std::cout << "[boot] worst stretch   : " << schedule.worst_stretch()
-                  << " levels between two refreshes" << std::endl;
+                  << " levels, at " << schedule.worst_name()
+                  << " -- a chain of " << (schedule.worst_stretch() + 26)
+                  << " limbs is what this schedule wants, since a refresh "
+                     "hands back the chain less 25"
+                  << std::endl;
         std::cout << "[boot] refreshes taken : " << schedule.refreshes()
                   << std::endl;
         std::cout << "[boot] block left      : depth "

@@ -395,6 +395,19 @@ namespace heongpu
                 /// costs. @c count must still be the number of channels being
                 /// reduced, since that is what the mean divides by.
                 int blocked_span = 0;
+                /// Divide by the channel count inside the FITTED FUNCTION
+                /// rather than by multiplying the ciphertext.
+                ///
+                /// 1/sqrt(s/C + eps) taken over the summed square s is the
+                /// same value from the same ciphertext as 1/sqrt(m + eps)
+                /// taken over the mean m, and it saves the plaintext product
+                /// and rescale that forming the mean costs -- a whole level,
+                /// for a different choice of interval and nothing else.
+                ///
+                /// A Newton step refines against x itself and so needs the
+                /// mean in hand; the fold is therefore taken only when
+                /// @c newton_iterations is 0, and ignored otherwise.
+                bool fold_mean_into_fit = false;
             };
 
             /**

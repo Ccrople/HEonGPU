@@ -921,6 +921,7 @@ namespace heongpu
             slot_config.sum_hi = config.sum_hi;
             slot_config.degree = config.degree;
             slot_config.newton_iterations = config.newton_iterations;
+            slot_config.fold_mean_into_fit = config.fold_mean_into_fit;
 
             std::vector<Ciphertext<Scheme::CKKS>> normalised =
                 batch_.arith().rms_norm(slots, weights, slot_config, galois_key,

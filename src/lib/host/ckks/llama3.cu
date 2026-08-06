@@ -963,6 +963,13 @@ namespace heongpu
                 config.sum_hi / static_cast<double>(config.channels) +
                 config.eps;
 
+            // Forming the mean is a plaintext product and a rescale, and the
+            // fit does not need it formed: it can be taken over the summed
+            // square instead. A Newton step does need it, so the two cannot
+            // both be had.
+            const bool fold_mean =
+                config.fold_mean_into_fit && config.newton_iterations <= 0;
+
             std::vector<Ciphertext<Scheme::CKKS>> out(
                 in.size(), Ciphertext<Scheme::CKKS>(context_));
 
@@ -1002,19 +1009,42 @@ namespace heongpu
                                     galois_key);
                     }
 
-                    // mean + eps. Both are one cheap step on an already reduced
-                    // value.
-                    multiply_constant(
-                        total, 1.0 / static_cast<double>(config.channels));
-                    add_constant(total, config.eps);
+                    // mean + eps. The addition is free and the division is
+                    // not, so it is skipped entirely when the fit below can
+                    // carry it.
+                    if (!fold_mean)
+                    {
+                        multiply_constant(
+                            total, 1.0 / static_cast<double>(config.channels));
+                        add_constant(total, config.eps);
+                    }
                 }
 
                 Ciphertext<Scheme::CKKS> scale_factor;
                 {
                     Range _r("rms_norm.inverse_sqrt");
-                    scale_factor =
-                        inverse_sqrt(total, lo, hi, config.degree,
-                                     config.newton_iterations, relin_key);
+                    if (fold_mean)
+                    {
+                        // The same value of the same ciphertext, fitted over
+                        // the summed square instead of over the mean. One
+                        // level cheaper, and the level is the whole reason.
+                        const double channels =
+                            static_cast<double>(config.channels);
+                        const double eps = config.eps;
+                        scale_factor = evaluate_function(
+                            total,
+                            [channels, eps](double s) {
+                                return 1.0 / std::sqrt(s / channels + eps);
+                            },
+                            config.sum_lo, config.sum_hi, config.degree,
+                            relin_key);
+                    }
+                    else
+                    {
+                        scale_factor =
+                            inverse_sqrt(total, lo, hi, config.degree,
+                                         config.newton_iterations, relin_key);
+                    }
                 }
 
                 Range _r("rms_norm.rescale_channels");
