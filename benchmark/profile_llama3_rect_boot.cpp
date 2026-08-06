@@ -59,12 +59,16 @@
 //
 //   HEONGPU_BOOT_D=128 HEONGPU_BOOT_CHANNEL_GROUPS=2
 //   HEONGPU_BOOT_HIDDEN_GROUPS=7 HEONGPU_BOOT_KV_HEADS=8
-//   HEONGPU_BOOT_HIDDEN_BLOCK_GROUPS=1 HEONGPU_BOOT_LIMBS=38
+//   HEONGPU_BOOT_HIDDEN_BLOCK_GROUPS=1 HEONGPU_BOOT_LIMBS=37
 //
 // -> d_model 4096, hidden 14336, 32 heads of 128 over 8 kv heads, 128 tokens.
-// Measured on one A6000: worst stretch 12 -- the same as at half the width,
-// since levels belong to the circuit and not to the model -- 14 refreshes and
-// 3326.8 s. HIDDEN_BLOCK_GROUPS = 1 is what holds the SwiGLU inside the card:
+// Measured on one A6000: worst stretch 11 -- the same as at half the width,
+// since levels belong to the circuit and not to the model -- 14 refreshes,
+// 2048 Galois keys at 9.25 GiB, and 2964.6 s. LIMBS is the one number worth
+// getting right here: 38 runs the identical schedule in 3358.4 s, because a
+// refresh hands back CHAIN LESS 25 and so one limb off the chain is one limb
+// off a working window of 13, not of 38.
+// HIDDEN_BLOCK_GROUPS = 1 is what holds the SwiGLU inside the card:
 // it forms, activates, refreshes and projects down one group of 2048 hidden
 // channels at a time, so the 14336 never exists at once.
 //

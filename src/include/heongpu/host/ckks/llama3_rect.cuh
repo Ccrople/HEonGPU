@@ -196,30 +196,30 @@
 //
 // The chain is sized on the worst stretch, so 11 wants 37 limbs and not 38.
 //
-// AND IT IS NOT FASTER. Measured on one A6000 at d = 64, hidden 4096, 8 kv
-// heads -- one shape, three circuits:
+// AT THIS SHAPE IT IS NOT FASTER. Measured on one A6000 at d = 64, hidden 4096,
+// 8 kv heads -- one shape, three circuits:
 //
 //   before, 38 limbs ... 563.3 s   the old schedule, reciprocal wrong by 98.6%
 //   after,  38 limbs ... 576.8 s   +2.4%, correctness at the old chain
 //   after,  37 limbs ... 562.2 s   -0.2%, correctness at the chain it now needs
 //
-// So the level savings buy back exactly what correctness costs, and no more.
-// The reciprocal's degree had to go UP to be an approximation at all, and that
-// eats the two folds and the RMSNorm's degree drop between them. Anyone
-// expecting the shorter chain to pay for itself should note that it very nearly
-// does and no better: mod-down is O(L^2) at dnum = 1, but mod-down is one kernel
-// and the rest of a block scales nearer L, so a limb off 38 is worth well under
-// the 5% the square suggests.
+// So at half the width the level savings buy back exactly what correctness
+// costs and no more. The reciprocal's degree had to go UP to be an
+// approximation at all, and that eats the two folds and the RMSNorm's degree
+// drop between them.
 //
-// The result here is the accuracy, not the clock. Correctness for free is a
-// good trade and it is the whole trade.
+// DO NOT GENERALISE THAT TABLE TO THE REAL MODEL. The same three circuits at
+// Llama-3 8B's own width give -10.9%; the block below has the numbers. A
+// half-width block is ten Algorithm 5 calls, so the key switching that a limb
+// actually shrinks is a small share of it, and the row above is measuring
+// mostly the things a limb does not touch.
 //
 // The SoftMax is now the worst stretch and the RMSNorm is not, which says where
 // to look next: 11 is the exponential's four levels, the reciprocal's four, the
 // squaring, the mask and the product. None of those is slack. Note also that 37
 // leaves the SoftMax exactly ONE limb, where 38 left it two, so the shorter
-// chain spends the margin -- staying at 38 and taking only the accuracy is a
-// defensible reading of the same table.
+// chain spends the margin. At half the width that is a real choice, since 37
+// buys nothing there; at the real width it is not, since it buys 11.7%.
 //
 // THE REAL SHAPE, MEASURED
 // ------------------------
@@ -230,17 +230,35 @@
 // attention at 8 kv heads is the host expansion RectAttentionConfig describes.
 //
 //   d_model 4096, hidden 14336, 32 heads of 128 over 8 kv heads, 128 tokens
-//   38 limbs, 2048 Galois keys at 9.5 GiB, one A6000
-//   worst stretch 12, at the RMSNorm -- the same schedule as at half the width
+//   37 limbs, 2048 Galois keys at 9.25 GiB, one A6000, 42.9 GiB of 47.5 used
+//   worst stretch 11, at the SoftMax -- the same schedule as at half the width,
+//   stretch for stretch, with attention.softmaxed landing on its last limb
 //   14 refreshes: the attention seams once per head group (32 heads is two
 //   Algorithm 4 calls of k/2 = 16), the SwiGLU once per hidden group
-//   3326.8 s for one block, against 563.3 s at half the width
+//   2964.6 s for one block, against 562.2 s at half the width
 //
 // The first of those is the useful one: a level schedule is a property of the
 // CIRCUIT and not of the model, so a chain sized on a shape that fits in an
-// afternoon holds at the real one. The cost is not -- 5.9x for a model 2x as
+// afternoon holds at the real one. The cost is not -- 5.3x for a model 2x as
 // wide, because a projection is one Algorithm 5 call per (input group, output
 // group) pair and that count went from 10 to 54.
+//
+// AND HERE THE LIMB IS WORTH SOMETHING. The same three circuits at this width:
+//
+//   before, 38 limbs ... 3326.8 s
+//   after,  38 limbs ... 3358.4 s   +0.9%, the circuit alone -- a wash
+//   after,  37 limbs ... 2964.6 s   -10.9% on the baseline, -11.7% on the row up
+//
+// The circuit change costs about nothing at either width. The whole win is the
+// limb, and its size is not the 2.6% that 38 -> 37 looks like, because a
+// refresh hands back CHAIN LESS 25: the window the block actually works in went
+// 13 -> 12 limbs, which is 7.7%. Pure O(L) on that window would give -7.7% and
+// pure O(L^2) -14.8%; the measured -11.7% sits between, which is what linear
+// work plus an O(L^2) mod-down should give. The same window shrinks identically
+// at half the width and buys 2.5% there, because there is a tenth as much key
+// switching for it to shrink.
+//
+// So read the level schedule off the small shape, and never the clock.
 //
 // ORIENTATION AND SHAPE CONSTRAINTS
 // ---------------------------------
