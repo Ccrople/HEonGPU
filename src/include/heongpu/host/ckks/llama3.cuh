@@ -513,6 +513,19 @@ namespace heongpu
                 /// since the strided reduction has no mask to ride on, and it
                 /// needs no Newton step.
                 bool fold_affine_into_mask = false;
+                /// Multiplied into the fitted 1/sqrt, so the norm hands back
+                /// output_scale * x / rms(x) for the price of x / rms(x).
+                ///
+                /// This is the pre-scaling of Section 3.1.3's bootstrapping
+                /// bound: a refresh wants the values it touches inside
+                /// [-1, 1], and the normalised stream is refreshed straight
+                /// after this layer, so 1/B rides here -- a change of fit
+                /// coefficients, free -- and B rides on the projections that
+                /// read the normalised stream, where a host scaling is also
+                /// free. A Newton step refines toward 1/sqrt itself and would
+                /// undo the gain, so any value but one needs
+                /// @c newton_iterations = 0 and throws otherwise.
+                double output_scale = 1.0;
             };
 
             /**

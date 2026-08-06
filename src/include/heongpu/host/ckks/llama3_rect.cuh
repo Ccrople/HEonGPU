@@ -645,6 +645,13 @@ namespace heongpu
                 /// a masked reduction, so it is the one with a plaintext
                 /// product to fold into.
                 bool fold_affine_into_mask = true;
+                /// Multiplied into the fitted 1/sqrt: the norm hands back
+                /// output_scale * x / rms(x) at no extra cost. This is where
+                /// the 1/B of the bootstrapping bound rides when the seam
+                /// after this norm is refreshed; the projections that read the
+                /// normalised stream carry B back in, on the host. Needs
+                /// @c newton_iterations = 0 when not one.
+                double output_scale = 1.0;
             };
 
             /**

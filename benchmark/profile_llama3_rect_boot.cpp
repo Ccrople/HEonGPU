@@ -75,8 +75,31 @@
 // As in the sibling targets the plaintext values are random and the fitted
 // intervals are nominal: nothing about the cost of a CKKS circuit depends on the
 // numbers in it. The probe stage is the exception and says so.
+//
+// THE REAL PARAMETERS
+// -------------------
+// HEONGPU_BOOT_WEIGHTS=<dir> replaces every random matrix with the real thing:
+// the directory fetch_llama3_weights.py wrote, holding one true Llama-3-8B
+// block and the true residual stream reaching it. The block stage then runs
+// Section 3.1 end to end -- the sink prefix is in the input, the orthogonal
+// rotations and the 1/B pre-scaling are folded into the weights by
+// prepare_block -- and every fitted range is CALIBRATED from an exact host
+// run of the same circuit rather than declared. The decrypted output is
+// checked against that host run, which is what makes this a circuit with an
+// error bar rather than a timing with random numbers inside.
+//
+//   HEONGPU_BOOT_ROTATE=0      switch off Section 3.1.1's rotations
+//   HEONGPU_BOOT_PRESCALE=0    switch off Section 3.1.3's 1/B folds
+//   HEONGPU_BOOT_NOSINK=1      run the input WITHOUT the sink prefix through
+//                              the sink-calibrated circuit
+//   HEONGPU_BOOT_MITIGATION_TABLE=0   skip the unrotated comparison prep
+//
+// The numbers in the circuit still cost nothing: what the real parameters buy
+// is the RANGES, and through them the degrees, the level schedule, and an
+// output that can be compared against the model it claims to run.
 
 #include <heongpu/heongpu.hpp>
+#include <heongpu/host/ckks/llama3_prep.cuh>
 
 #include <cuda_profiler_api.h>
 #include <nvtx3/nvToolsExt.h>
@@ -88,6 +111,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <set>
 #include <string>
@@ -285,7 +309,88 @@ int main(int argc, char* argv[])
     const int channels = channel_groups * half;
     const int hidden = hidden_groups * half;
     const int heads = channel_groups * step;
-    const int kv_heads = std::max(1, EnvInt("HEONGPU_BOOT_KV_HEADS", heads));
+    int kv_heads = std::max(1, EnvInt("HEONGPU_BOOT_KV_HEADS", heads));
+
+    // -----------------------------------------------------------------------
+    // The real parameters, prepared on the host before anything is allocated
+    // -----------------------------------------------------------------------
+    const std::string weights_dir = EnvStr("HEONGPU_BOOT_WEIGHTS", "");
+    std::unique_ptr<heongpu::llama::PreparedBlock> real;
+    if (!weights_dir.empty() && stage == "block")
+    {
+        heongpu::llama::RealBlockBundle bundle =
+            heongpu::llama::load_real_block(weights_dir);
+        if (bundle.tokens != d || bundle.head_dim != d)
+        {
+            std::cerr << "[boot] the bundle carries " << bundle.tokens
+                      << " tokens of head dim " << bundle.head_dim
+                      << ", and this encoding fixes both at d = " << d
+                      << std::endl;
+            return 2;
+        }
+        if (bundle.channels != channels || bundle.hidden != hidden)
+        {
+            std::cerr << "[boot] the bundle is d_model " << bundle.channels
+                      << " hidden " << bundle.hidden
+                      << "; set HEONGPU_BOOT_CHANNEL_GROUPS/HIDDEN_GROUPS to "
+                         "match ("
+                      << channels << " / " << hidden << " configured)"
+                      << std::endl;
+            return 2;
+        }
+        kv_heads = bundle.kv_channels / bundle.head_dim;
+
+        heongpu::llama::SylphPrepConfig prep;
+        prep.rotate = EnvFlag("HEONGPU_BOOT_ROTATE", true);
+        prep.prescale = EnvFlag("HEONGPU_BOOT_PRESCALE", true);
+        std::cout << "[boot] real weights    : layer " << bundle.layer
+                  << ", sink tokens " << bundle.sink_tokens << ", rotations "
+                  << (prep.rotate ? "on" : "off") << ", 1/B folds "
+                  << (prep.prescale ? "on" : "off") << std::endl;
+
+        real = std::make_unique<heongpu::llama::PreparedBlock>(
+            heongpu::llama::prepare_block(bundle, prep));
+
+        // Section 3.1.1's worth, measured rather than asserted: the same
+        // exact circuit on the same real stream, with each mitigation
+        // removed in turn. Everything here is in TRUE units -- the folds
+        // are left out of these runs on purpose.
+        const auto dump = [&](const char* label,
+                              const heongpu::llama::BlockCalibration& cal)
+        {
+            std::cout << "[boot] ranges " << std::setw(24) << std::left
+                      << label << std::right << " stream "
+                      << std::setprecision(4) << std::defaultfloat
+                      << std::max({cal.stream_entry_abs, cal.stream_mid_abs,
+                                   cal.stream_out_abs})
+                      << ", normed " << std::max(cal.normed_abs[0],
+                                                 cal.normed_abs[1])
+                      << ", scores [" << cal.score_lo << ", " << cal.score_hi
+                      << "], silu " << cal.silu_in_abs << ", hidden "
+                      << cal.hidden_abs << ", value " << cal.value_abs
+                      << std::endl;
+        };
+        dump("mitigated (sink, rotated)", real->raw);
+        dump("without the sink prefix", real->raw_nosink);
+        if (EnvFlag("HEONGPU_BOOT_MITIGATION_TABLE", true) && prep.rotate)
+        {
+            heongpu::llama::SylphPrepConfig norot = prep;
+            norot.rotate = false;
+            norot.prescale = false;
+            heongpu::llama::PreparedBlock flat =
+                heongpu::llama::prepare_block(bundle, norot);
+            dump("without the rotations", flat.raw);
+        }
+        std::cout << "[boot] bounds chosen   : B_stream "
+                  << real->scales.stream << ", B_normed "
+                  << real->scales.normed_attn << " / "
+                  << real->scales.normed_ffn << ", B_value "
+                  << real->scales.value << ", B_hidden "
+                  << real->scales.hidden << " -- log2 B_stream = "
+                  << std::log2(real->scales.stream)
+                  << " bits of the refresh's precision spent on the bound"
+                  << std::endl;
+    }
 
     const double key_bytes = SwitchingKeyBytes(n, limbs, special);
     const int rot_count = half - 1;
@@ -434,6 +539,29 @@ int main(int argc, char* argv[])
                       << "  (a crossing alone costs about 1e-3)" << std::endl;
         }
 
+        // What bound a refresh actually tolerates, which is the empirical
+        // basis of Section 3.1.3's B: EvalMod is fitted for values inside
+        // [-1, 1], and this sweep shows what an entry above that costs --
+        // first precision, then everything.
+        if (EnvFlag("HEONGPU_BOOT_PROBE_SWEEP", false))
+        {
+            for (const double amplitude : {1.0, 2.0, 4.0, 8.0, 16.0})
+            {
+                const std::vector<double> vals = random_matrix(
+                    static_cast<std::size_t>(d) * channels, amplitude, rng);
+                heongpu::llama::RectActivation sx =
+                    op.encrypt(vals, channels, encryptor, scale);
+                op.bootstrap(sx, "probe.sweep.refresh", galois, relin);
+                const std::vector<double> back =
+                    op.decrypt(sx, decryptor, sx.column.front().scale());
+                const double err = max_abs_error(vals, back);
+                std::cout << "[boot] refresh at bound " << std::defaultfloat
+                          << amplitude << ": max abs error "
+                          << std::scientific << std::setprecision(3) << err
+                          << ", relative " << (err / amplitude) << std::endl;
+            }
+        }
+
         cudaProfilerStop();
         std::cout << std::defaultfloat;
         ReportMemory("probe");
@@ -443,8 +571,11 @@ int main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // The activation every other stage runs on
     // -----------------------------------------------------------------------
+    const bool nosink = EnvFlag("HEONGPU_BOOT_NOSINK", false);
     heongpu::llama::RectActivation x = op.encrypt(
-        random_matrix(static_cast<std::size_t>(d) * channels, 1.0, rng),
+        real ? (nosink ? real->input_nosink : real->input)
+             : random_matrix(static_cast<std::size_t>(d) * channels, 1.0,
+                             rng),
         channels, encryptor, scale);
     ReportMemory("activation");
 
@@ -470,24 +601,34 @@ int main(int argc, char* argv[])
     }
     else if (stage == "block")
     {
-        const std::vector<double> norm_w =
-            random_matrix(static_cast<std::size_t>(channels), 0.5, rng);
         const int kv_channels = kv_heads * d;
 
         Rect::RectTransformerBlockWeights w;
-        w.attention_norm = norm_w;
-        w.feed_forward_norm = norm_w;
-        w.attention.query = random_matrix(
-            static_cast<std::size_t>(channels) * channels, amp, rng);
-        w.attention.key = random_matrix(
-            static_cast<std::size_t>(channels) * kv_channels, amp, rng);
-        w.attention.value = w.attention.key;
-        w.attention.output = w.attention.query;
-        w.feed_forward.gate = random_matrix(
-            static_cast<std::size_t>(channels) * hidden, amp, rng);
-        w.feed_forward.up = w.feed_forward.gate;
-        w.feed_forward.down = random_matrix(
-            static_cast<std::size_t>(hidden) * channels, amp, rng);
+        if (real)
+        {
+            // prepare_block folded the learned gains, the rotations and the
+            // 1/B bounds into these; the norm vectors are empty on purpose
+            // and fold_norm_scale goes off below to match.
+            w = real->weights;
+        }
+        else
+        {
+            const std::vector<double> norm_w = random_matrix(
+                static_cast<std::size_t>(channels), 0.5, rng);
+            w.attention_norm = norm_w;
+            w.feed_forward_norm = norm_w;
+            w.attention.query = random_matrix(
+                static_cast<std::size_t>(channels) * channels, amp, rng);
+            w.attention.key = random_matrix(
+                static_cast<std::size_t>(channels) * kv_channels, amp, rng);
+            w.attention.value = w.attention.key;
+            w.attention.output = w.attention.query;
+            w.feed_forward.gate = random_matrix(
+                static_cast<std::size_t>(channels) * hidden, amp, rng);
+            w.feed_forward.up = w.feed_forward.gate;
+            w.feed_forward.down = random_matrix(
+                static_cast<std::size_t>(hidden) * channels, amp, rng);
+        }
 
         Rect::RectTransformerBlockConfig c;
         c.attention_norm.eps = 1e-5;
@@ -559,6 +700,127 @@ int main(int argc, char* argv[])
             EnvFlag("HEONGPU_BOOT_REFRESH_FFN_NORM", true);
         c.refresh.feed_forward_hidden =
             EnvFlag("HEONGPU_BOOT_REFRESH_FFN_HIDDEN", true);
+
+        if (real)
+        {
+            // Every range below is a MEASUREMENT: prepare_block ran the exact
+            // circuit on the real stream and read them off. The degrees then
+            // follow from range + 12 bits through the oracle -- Section 3.1.3
+            // done with real numbers -- and an env override still wins, so a
+            // sweep can disagree with the derivation.
+            const heongpu::llama::BlockCalibration& cal = real->calibration;
+            const double target = std::pow(2.0, -12);
+            const auto derive = [&](const char* what,
+                                    const std::function<double(double)>& f,
+                                    double lo, double hi, bool relative,
+                                    double signal)
+            {
+                const int degree = heongpu::llama::chebyshev_degree_for(
+                    f, lo, hi, target * (relative ? 1.0 : signal), relative);
+                if (degree == 0)
+                {
+                    std::cout << "[boot] " << what
+                              << ": no degree at or below 511 reaches 12 "
+                                 "bits over ["
+                              << lo << ", " << hi
+                              << "] -- running at 511 and MISSING"
+                              << std::endl;
+                    return 511;
+                }
+                return degree;
+            };
+
+            // The norms: measured summed-square ranges in circuit units, the
+            // eps the stream scaling wants, and the 1/B_n gain that puts the
+            // refreshed seam inside [-1, 1].
+            c.attention_norm.eps = real->eps;
+            c.attention_norm.sum_lo = cal.norm_sum_lo[0] / 1.05;
+            c.attention_norm.sum_hi = cal.norm_sum_hi[0] * 1.05;
+            c.attention_norm.output_scale = 1.0 / real->scales.normed_attn;
+            c.feed_forward_norm = c.attention_norm;
+            c.feed_forward_norm.sum_lo = cal.norm_sum_lo[1] / 1.05;
+            c.feed_forward_norm.sum_hi = cal.norm_sum_hi[1] * 1.05;
+            c.feed_forward_norm.output_scale =
+                1.0 / real->scales.normed_ffn;
+            {
+                const double cw = static_cast<double>(channels);
+                const double eps = real->eps;
+                const auto inv_sqrt = [cw, eps](double s)
+                { return 1.0 / std::sqrt(s / cw + eps); };
+                c.attention_norm.degree = EnvInt(
+                    "HEONGPU_BOOT_NORM_DEGREE",
+                    derive("rms_norm", inv_sqrt, c.attention_norm.sum_lo,
+                           c.attention_norm.sum_hi, true, 1.0));
+                c.feed_forward_norm.degree = EnvInt(
+                    "HEONGPU_BOOT_NORM_DEGREE",
+                    derive("rms_norm (ffn)", inv_sqrt,
+                           c.feed_forward_norm.sum_lo,
+                           c.feed_forward_norm.sum_hi, true, 1.0));
+            }
+
+            // The scores: shifted to [-bound, 0] by the measured top, with
+            // squarings until the exponential's argument spans at most the
+            // eight the default fit was built for, and the denominator range
+            // measured under exactly that shift and squaring count.
+            const double bound_raw = cal.score_hi - cal.score_lo;
+            c.attention.score_shift = cal.score_hi;
+            c.attention.softmax.bound =
+                EnvDouble("HEONGPU_BOOT_SOFTMAX_BOUND", bound_raw * 1.02);
+            int iters = 1;
+            while (c.attention.softmax.bound / std::pow(2.0, iters) > 8.0 &&
+                   iters < 4)
+            {
+                iters++;
+            }
+            iters = EnvInt("HEONGPU_BOOT_SOFTMAX_ITERS", iters);
+            c.attention.softmax.iterations = iters;
+            c.attention.softmax.sum_lo =
+                cal.softmax_sum_lo[iters - 1] / 1.1;
+            c.attention.softmax.sum_hi =
+                cal.softmax_sum_hi[iters - 1] * 1.1;
+            c.attention.softmax.concentration = std::min(
+                static_cast<double>(d), cal.prob_sq_hi * 1.2 * d);
+            {
+                const double b = c.attention.softmax.bound;
+                const double div = std::pow(2.0, iters);
+                c.attention.softmax.exp_degree = EnvInt(
+                    "HEONGPU_BOOT_EXP_DEGREE",
+                    derive("softmax exp",
+                           [div](double v) { return std::exp(v / div); }, -b,
+                           0.0, true, 1.0));
+                c.attention.softmax.inverse_degree = EnvInt(
+                    "HEONGPU_BOOT_INVERSE_DEGREE",
+                    derive("softmax 1/x", [](double v) { return 1.0 / v; },
+                           c.attention.softmax.sum_lo,
+                           c.attention.softmax.sum_hi, true, 1.0));
+            }
+
+            c.feed_forward.silu_bound = cal.silu_in_abs * 1.05;
+            c.feed_forward.silu_degree = EnvInt(
+                "HEONGPU_BOOT_SILU_DEGREE",
+                derive("silu",
+                       [](double v) { return v / (1.0 + std::exp(-v)); },
+                       -c.feed_forward.silu_bound, c.feed_forward.silu_bound,
+                       false, c.feed_forward.silu_bound));
+
+            // prepare_block folded the learned gains already; folding the
+            // empty vectors here would be a no-op, but saying so is clearer.
+            c.fold_norm_scale = false;
+
+            std::cout << "[boot] calibrated      : score [" << cal.score_lo
+                      << ", " << cal.score_hi << "] -> bound "
+                      << c.attention.softmax.bound << " at " << iters
+                      << " round(s), softmax sum ["
+                      << c.attention.softmax.sum_lo << ", "
+                      << c.attention.softmax.sum_hi << "], silu bound "
+                      << c.feed_forward.silu_bound << std::endl;
+            std::cout << "[boot] derived degrees : norm "
+                      << c.attention_norm.degree << " / "
+                      << c.feed_forward_norm.degree << ", exp "
+                      << c.attention.softmax.exp_degree << ", 1/x "
+                      << c.attention.softmax.inverse_degree << ", silu "
+                      << c.feed_forward.silu_degree << std::endl;
+        }
 
         // What every fit in the block actually achieves over the range it is
         // configured for, against the 12 bits of Section 3.1.2. A degree is
@@ -647,6 +909,42 @@ int main(int argc, char* argv[])
                   << out.column.front().depth() << ", "
                   << (limbs - out.column.front().depth()) << " limbs"
                   << std::endl;
+
+        if (real)
+        {
+            // The yardstick: the exact host run of the same circuit on the
+            // same input. Everything is in circuit units -- the rotated,
+            // 1/B_stream-scaled convention -- which is also what the next
+            // block would consume, so no unfolding is owed here; multiply by
+            // B_stream for true units.
+            const std::vector<double>* expect = &real->expected;
+            std::vector<double> expect_nosink;
+            if (nosink)
+            {
+                expect_nosink = heongpu::llama::reference_block(
+                    real->weights, real->input_nosink, real->shape,
+                    real->eps, 1.0 / real->scales.normed_attn,
+                    1.0 / real->scales.normed_ffn);
+                expect = &expect_nosink;
+            }
+            std::vector<double> back =
+                op.decrypt(out, decryptor, out.column.front().scale());
+            back.resize(expect->size());
+            double signal = 0.0;
+            for (double v : *expect)
+            {
+                signal = std::max(signal, std::abs(v));
+            }
+            const double err = max_abs_error(*expect, back);
+            std::cout << "[boot] real block error: max abs "
+                      << std::scientific << std::setprecision(3) << err
+                      << " against a stream of |max| " << signal
+                      << std::defaultfloat << " -- "
+                      << std::setprecision(3) << std::log2(signal / err)
+                      << " bits, in circuit units (x "
+                      << real->scales.stream << " for true units)"
+                      << std::endl;
+        }
     }
     else
     {

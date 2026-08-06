@@ -923,6 +923,7 @@ namespace heongpu
             slot_config.newton_iterations = config.newton_iterations;
             slot_config.fold_mean_into_fit = config.fold_mean_into_fit;
             slot_config.fold_affine_into_mask = config.fold_affine_into_mask;
+            slot_config.output_scale = config.output_scale;
 
             std::vector<Ciphertext<Scheme::CKKS>> normalised =
                 batch_.arith().rms_norm(slots, weights, slot_config, galois_key,

@@ -29,6 +29,7 @@
 // on 2047 of them.
 
 #include <heongpu/heongpu.hpp>
+#include <heongpu/host/ckks/llama3_prep.cuh>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -1245,4 +1246,168 @@ TEST(HEonGPU, CKKS_Llama3Rect_FoldedSoftmaxMatchesTheMappedOne)
     }
     EXPECT_LT(worst_folded, 5e-3);
     EXPECT_LT(worst_between, 5e-3);
+}
+
+// ---------------------------------------------------------------------------
+// Section 3.1's model preparation: host-side exactness, then the one circuit
+// knob it needs
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    /// A block-shaped bundle with none of the real model's size, for pinning
+    /// the preparation's algebra. head_dim deliberately differs from the
+    /// fixture's d: reference_block does not care, and the tests should not
+    /// entangle the two.
+    heongpu::llama::RealBlockBundle synthetic_bundle(int tokens, int channels,
+                                                     int head_dim,
+                                                     int kv_heads, int hidden,
+                                                     uint64_t seed)
+    {
+        heongpu::llama::RealBlockBundle b;
+        b.layer = 0;
+        b.tokens = tokens;
+        b.channels = channels;
+        b.kv_channels = kv_heads * head_dim;
+        b.head_dim = head_dim;
+        b.hidden = hidden;
+        b.sink_tokens = 0;
+        const double amp = 1.0 / std::sqrt(static_cast<double>(channels));
+        b.query = random_matrix(channels, channels, seed + 1, amp);
+        b.key = random_matrix(channels, b.kv_channels, seed + 2, amp);
+        b.value = random_matrix(channels, b.kv_channels, seed + 3, amp);
+        b.output = random_matrix(channels, channels, seed + 4, amp);
+        b.gate = random_matrix(channels, hidden, seed + 5, amp);
+        b.up = random_matrix(channels, hidden, seed + 6, amp);
+        b.down = random_matrix(hidden, channels, seed + 7, amp);
+        // Gains held away from zero: a fold through a near-zero gain would
+        // hide a transposition the comparison exists to catch.
+        b.attention_norm = random_matrix(1, channels, seed + 8, 0.5);
+        for (double& g : b.attention_norm)
+            g += 1.0;
+        b.feed_forward_norm = random_matrix(1, channels, seed + 9, 0.5);
+        for (double& g : b.feed_forward_norm)
+            g += 1.0;
+        b.input = random_matrix(tokens, channels, seed + 10);
+        b.input_nosink = b.input;
+        return b;
+    }
+} // namespace
+
+TEST(HEonGPU, CKKS_Llama3Prep_RotationFusionIsExact)
+{
+    // The claim of Section 3.1.1: R1 and R2 fused into the weights change
+    // the representation and not the function. RMSNorm commutes because an
+    // orthogonal map preserves the sum of squares, SiLU and the SoftMax act
+    // on spaces the rotations never touch, so the two runs must agree to
+    // double precision -- not approximately, exactly.
+    const heongpu::llama::RealBlockBundle bundle =
+        synthetic_bundle(8, 16, 4, 2, 24, 515151u);
+
+    heongpu::llama::SylphPrepConfig plain;
+    plain.rotate = false;
+    plain.prescale = false;
+    heongpu::llama::SylphPrepConfig turned = plain;
+    turned.rotate = true;
+
+    const heongpu::llama::PreparedBlock flat =
+        heongpu::llama::prepare_block(bundle, plain);
+    const heongpu::llama::PreparedBlock rot =
+        heongpu::llama::prepare_block(bundle, turned);
+
+    std::vector<double> got = rot.expected;
+    heongpu::llama::rotate_stream(got, bundle.tokens, bundle.channels,
+                                  turned.seed, true);
+    std::cout << "rotation fusion worst error: "
+              << worst_diff(flat.expected, got) << std::endl;
+    EXPECT_LT(worst_diff(flat.expected, got), 1e-9);
+
+    // And the rotation must actually be there: the raw outputs disagree.
+    EXPECT_GT(worst_diff(flat.expected, rot.expected), 1e-3);
+}
+
+TEST(HEonGPU, CKKS_Llama3Prep_PrescaleFoldsAreExact)
+{
+    // The claim of Section 3.1.3: the 1/B folds change units, not values.
+    // The scaled block's output times B_stream is the unscaled block's
+    // output, and every seam a refresh touches sits inside [-1, 1].
+    const heongpu::llama::RealBlockBundle bundle =
+        synthetic_bundle(8, 16, 4, 2, 24, 616161u);
+
+    heongpu::llama::SylphPrepConfig base;
+    base.rotate = true;
+    base.prescale = false;
+    heongpu::llama::SylphPrepConfig folded_cfg = base;
+    folded_cfg.prescale = true;
+
+    const heongpu::llama::PreparedBlock wide =
+        heongpu::llama::prepare_block(bundle, base);
+    const heongpu::llama::PreparedBlock folded =
+        heongpu::llama::prepare_block(bundle, folded_cfg);
+
+    std::vector<double> undone = folded.expected;
+    for (double& v : undone)
+        v *= folded.scales.stream;
+    std::cout << "prescale fold worst error: "
+              << worst_diff(wide.expected, undone) << " at B_stream "
+              << folded.scales.stream << std::endl;
+    EXPECT_LT(worst_diff(wide.expected, undone), 1e-9);
+
+    const heongpu::llama::BlockCalibration& cal = folded.calibration;
+    EXPECT_LE(cal.stream_entry_abs, 1.0);
+    EXPECT_LE(cal.stream_mid_abs, 1.0);
+    EXPECT_LE(cal.stream_out_abs, 1.0);
+    EXPECT_LE(cal.normed_abs[0], 1.0);
+    EXPECT_LE(cal.normed_abs[1], 1.0);
+    EXPECT_LE(cal.value_abs, 1.0);
+    EXPECT_LE(cal.hidden_abs, 1.0);
+}
+
+TEST(HEonGPU, CKKS_Llama3Rect_RMSNormOutputScale)
+{
+    // The one circuit change the folds need: the norm's fitted 1/sqrt
+    // carries a gain, so the seam refreshed after it arrives pre-scaled at
+    // no cost. Everything else about the fold is host arithmetic.
+    Fixture fx(24, 12);
+    const int d = Fixture::d;
+    const int channels = fx.half();
+    const double eps = 1e-5;
+    const double gain = 0.25;
+
+    const std::vector<double> x = random_matrix(d, channels, 19191u);
+    std::vector<double> want(x.size(), 0.0);
+    for (int u = 0; u < d; ++u)
+    {
+        double sum = 0.0;
+        for (int c = 0; c < channels; ++c)
+        {
+            const double v = x[static_cast<size_t>(u) * channels + c];
+            sum += v * v;
+        }
+        const double inv =
+            gain / std::sqrt(sum / static_cast<double>(channels) + eps);
+        for (int c = 0; c < channels; ++c)
+            want[static_cast<size_t>(u) * channels + c] =
+                x[static_cast<size_t>(u) * channels + c] * inv;
+    }
+
+    Rect::RectRMSNormConfig config;
+    config.eps = eps;
+    config.sum_lo = channels * 0.20;
+    config.sum_hi = channels * 0.50;
+    config.degree = 31;
+    config.newton_iterations = 0;
+    config.output_scale = gain;
+
+    const std::vector<double> none;
+    heongpu::llama::RectActivation ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+    heongpu::llama::RectActivation out =
+        fx.op->rms_norm(ct, none, config, *fx.galois, *fx.relin);
+
+    const std::vector<double> got =
+        fx.op->decrypt(out, *fx.decryptor, out.column.front().scale());
+    std::cout << "rect RMSNorm output_scale worst error: "
+              << worst_diff(want, got) << std::endl;
+    EXPECT_LT(worst_diff(want, got), 5e-2 * gain);
 }

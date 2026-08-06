@@ -1098,6 +1098,13 @@ namespace heongpu
                 throw std::invalid_argument(
                     "RMSNorm needs a positive range for the summed square");
             }
+            if (config.output_scale != 1.0 && config.newton_iterations > 0)
+            {
+                throw std::invalid_argument(
+                    "RMSNorm's output_scale rides on the fitted 1/sqrt, and a "
+                    "Newton step refines toward 1/sqrt itself: the two cannot "
+                    "both be had");
+            }
 
             const double lo =
                 config.sum_lo / static_cast<double>(config.channels) +
@@ -1208,10 +1215,11 @@ namespace heongpu
                         const double channels =
                             static_cast<double>(config.channels);
                         const double eps = config.eps;
+                        const double gain = config.output_scale;
                         scale_factor = evaluate_function(
                             total,
-                            [channels, eps](double s) {
-                                return 1.0 / std::sqrt(s / channels + eps);
+                            [channels, eps, gain](double s) {
+                                return gain / std::sqrt(s / channels + eps);
                             },
                             config.sum_lo, config.sum_hi, config.degree,
                             relin_key, fold_affine);
@@ -1220,9 +1228,22 @@ namespace heongpu
                     {
                         // No Newton step is possible here -- fold_affine says
                         // so -- and without one inverse_sqrt is the fit alone.
+                        const double gain = config.output_scale;
                         scale_factor = evaluate_function(
-                            total, [](double x) { return 1.0 / std::sqrt(x); },
+                            total,
+                            [gain](double x) { return gain / std::sqrt(x); },
                             lo, hi, config.degree, relin_key, true);
+                    }
+                    else if (config.output_scale != 1.0)
+                    {
+                        // The guard above pinned newton_iterations to 0, so
+                        // inverse_sqrt would be the bare fit anyway; this is
+                        // the same fit with the gain in its coefficients.
+                        const double gain = config.output_scale;
+                        scale_factor = evaluate_function(
+                            total,
+                            [gain](double x) { return gain / std::sqrt(x); },
+                            lo, hi, config.degree, relin_key, false);
                     }
                     else
                     {
