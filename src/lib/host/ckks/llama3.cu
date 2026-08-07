@@ -1599,6 +1599,10 @@ namespace heongpu
                     }
                 }
             }
+            if (debug_trace)
+            {
+                debug_trace("softmax.exp_masked", y);
+            }
 
             for (int round = 0; round < config.iterations; round++)
             {
@@ -1633,6 +1637,11 @@ namespace heongpu
                 else
                 {
                     sum_blocked(total, config.count, galois_key);
+                }
+                if (debug_trace)
+                {
+                    std::vector<Ciphertext<Scheme::CKKS>> one{total};
+                    debug_trace("softmax.denominator", one);
                 }
 
                 // Before the first round every coordinate sits in
@@ -1699,6 +1708,11 @@ namespace heongpu
                                     config.inverse_newton, relin_key,
                                     fold_affine, gain);
                     }
+                }
+                if (debug_trace)
+                {
+                    std::vector<Ciphertext<Scheme::CKKS>> one{reciprocal};
+                    debug_trace("softmax.reciprocal", one);
                 }
 
                 for (std::size_t p = 0; p < y.size(); p++)
