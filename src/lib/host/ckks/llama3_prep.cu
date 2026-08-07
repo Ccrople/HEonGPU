@@ -495,6 +495,19 @@ namespace heongpu
                                       head] = top;
                         cal.score_row_span =
                             std::max(cal.score_row_span, top - bottom);
+                        // causal_column_mask weights query i's exponentials
+                        // by sqrt(d / (i + 1)) before they are squared and
+                        // summed -- constant along the key axis, so it
+                        // cancels in the normalised probabilities below and
+                        // the ACTUAL OUTPUT is unaffected, but it multiplies
+                        // the DENOMINATOR every row-shift reciprocal actually
+                        // meets by d / (i + 1), up to 128x for the earliest
+                        // rows. A calibration that leaves this factor out is
+                        // not measuring what the circuit computes; it is
+                        // measuring a different, unmasked quantity that
+                        // happens to share a name.
+                        const double mask_weight_sq =
+                            static_cast<double>(t) / static_cast<double>(i + 1);
                         for (int kk = 0; kk < 4; kk++)
                         {
                             double denom_k = 0.0;
@@ -507,6 +520,7 @@ namespace heongpu
                                      top) /
                                     std::pow(2.0, kk + 1));
                             }
+                            denom_k *= mask_weight_sq;
                             cal.softmax_row_sum_lo[kk] = std::min(
                                 cal.softmax_row_sum_lo[kk], denom_k);
                             cal.softmax_row_sum_hi[kk] = std::max(
@@ -568,6 +582,11 @@ namespace heongpu
                 {
                     for (int i = 0; i < t; i++)
                     {
+                        // The same causal_column_mask weighting as the
+                        // row-shift path above.
+                        const double mask_weight_sq =
+                            static_cast<double>(t) /
+                            static_cast<double>(i + 1);
                         double denom[4] = {0.0, 0.0, 0.0, 0.0};
                         for (int j = 0; j <= i; j++)
                         {
@@ -588,6 +607,7 @@ namespace heongpu
                         }
                         for (int kk = 0; kk < 4; kk++)
                         {
+                            denom[kk] *= mask_weight_sq;
                             cal.softmax_sum_lo[kk] =
                                 std::min(cal.softmax_sum_lo[kk], denom[kk]);
                             cal.softmax_sum_hi[kk] =
