@@ -1727,3 +1727,317 @@ TEST(HEonGPU, CKKS_Llama3Rect_RMSNormOutputScale)
               << worst_diff(want, got) << std::endl;
     EXPECT_LT(worst_diff(want, got), 5e-2 * gain);
 }
+
+TEST(HEonGPU, CKKS_Llama3Rect_AttentionPerRowScoreShiftMatchesHostReference)
+{
+    // The real-8B run measured a 256x SoftMax denominator spread under one
+    // global shift and switched to score_shift_rows -- one shift per (query
+    // row, head) instead of one for the whole call -- to floor it at one.
+    // That path has no coverage anywhere else: this pins it against the same
+    // host reference the global-shift test uses, at TWO GROUPS of heads
+    // (heads = 2 * blocks-per-group) so a bug in the g * step + b indexing
+    // the second group reads -- which one head group alone cannot show --
+    // is not invisible here.
+    Fixture fx(42, 21);
+    const int d = Fixture::d;
+    const int step = fx.blocks();
+    const int channels = fx.half();
+    const int heads = 2 * step;
+    const int q_channels = heads * d;
+    const double amp = 1.0 / std::sqrt(static_cast<double>(channels));
+
+    const std::vector<double> x = random_matrix(d, channels, 34343u);
+    Rect::RectAttentionWeights weights;
+    weights.query = random_matrix(channels, q_channels, 35353u, amp);
+    weights.key = random_matrix(channels, q_channels, 36363u, amp);
+    weights.value = random_matrix(channels, q_channels, 37373u, amp);
+
+    Rect::RectAttentionConfig config;
+    config.in_channels = channels;
+    config.heads = heads;
+    config.kv_heads = heads;
+    config.causal = false;
+    config.softmax.iterations = 2;
+    config.softmax.exp_degree = 31;
+    config.softmax.inverse_degree = 15;
+    config.softmax.inverse_newton = 1;
+
+    const double head_scale = 1.0 / std::sqrt(static_cast<double>(d));
+    const std::vector<double> q =
+        host_product(x, weights.query, d, channels, q_channels);
+    const std::vector<double> k =
+        host_product(x, weights.key, d, channels, q_channels);
+    const std::vector<double> v =
+        host_product(x, weights.value, d, channels, q_channels);
+
+    std::vector<double> want(static_cast<size_t>(d) * q_channels, 0.0);
+    // The per-(row, head) shift itself: each query's own row maximum, which
+    // is what score_shift_rows is filled with in prepare_block.
+    std::vector<double> row_shift(static_cast<size_t>(d) * heads, 0.0);
+    double worst_bound = 0.0;
+    for (int h = 0; h < heads; ++h)
+        for (int u = 0; u < d; ++u)
+        {
+            std::vector<double> row(d, 0.0);
+            double top = -1e30;
+            double bottom = 1e30;
+            for (int t = 0; t < d; ++t)
+            {
+                double s = 0.0;
+                for (int c = 0; c < d; ++c)
+                    s += q[static_cast<size_t>(u) * q_channels + h * d + c] *
+                         k[static_cast<size_t>(t) * q_channels + h * d + c];
+                row[t] = s * head_scale;
+                top = std::max(top, row[t]);
+                bottom = std::min(bottom, row[t]);
+            }
+            row_shift[static_cast<size_t>(u) * heads + h] = top;
+            worst_bound = std::max(worst_bound, top - bottom);
+            double norm = 0.0;
+            for (int t = 0; t < d; ++t)
+            {
+                row[t] = std::exp(row[t] - top);
+                norm += row[t];
+            }
+            for (int c = 0; c < d; ++c)
+            {
+                double acc = 0.0;
+                for (int t = 0; t < d; ++t)
+                    acc += row[t] / norm *
+                           v[static_cast<size_t>(t) * q_channels + h * d + c];
+                want[static_cast<size_t>(u) * q_channels + h * d + c] = acc;
+            }
+        }
+
+    config.score_shift_rows = row_shift;
+    config.softmax.bound = worst_bound * 1.05;
+    std::cout << "rect attention per-row bound: " << config.softmax.bound
+              << std::endl;
+
+    heongpu::llama::RectActivation ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+    heongpu::llama::RectActivation out =
+        fx.op->attention(ct, weights, config, *fx.galois, *fx.relin);
+
+    const std::vector<double> got =
+        fx.op->decrypt(out, *fx.decryptor, out.column.front().scale());
+
+    double signal = 0.0;
+    for (double w : want)
+        signal = std::max(signal, std::abs(w));
+    const double worst = worst_diff(want, got);
+    std::cout << "rect attention per-row shift worst error: " << worst
+              << " against a signal of " << signal << " ("
+              << (100.0 * worst / signal) << "%)" << std::endl;
+    EXPECT_LT(worst, 0.30 * signal);
+}
+
+TEST(HEonGPU, CKKS_Llama3Rect_RMSNormOutputScaleTwoGroups)
+{
+    // The real-8B run holds d_model in TWO channel groups (N=4096, d=128,
+    // width 4096 = 2 * half), and every RMSNorm test until now ran at one.
+    // output_scale's gain rides in the fitted 1/sqrt, which is evaluated
+    // once per GROUP: this pins that it is not silently applied group_count
+    // times, or once when it should be per-group.
+    Fixture fx(24, 12);
+    const int d = Fixture::d;
+    const int channels = 2 * fx.half();
+    const double eps = 1e-5;
+    const double gain = 0.25;
+
+    const std::vector<double> x = random_matrix(d, channels, 39191u);
+    std::vector<double> want(x.size(), 0.0);
+    for (int u = 0; u < d; ++u)
+    {
+        double sum = 0.0;
+        for (int c = 0; c < channels; ++c)
+        {
+            const double v = x[static_cast<size_t>(u) * channels + c];
+            sum += v * v;
+        }
+        const double inv =
+            gain / std::sqrt(sum / static_cast<double>(channels) + eps);
+        for (int c = 0; c < channels; ++c)
+            want[static_cast<size_t>(u) * channels + c] =
+                x[static_cast<size_t>(u) * channels + c] * inv;
+    }
+
+    Rect::RectRMSNormConfig config;
+    config.eps = eps;
+    config.sum_lo = channels * 0.20;
+    config.sum_hi = channels * 0.50;
+    config.degree = 31;
+    config.newton_iterations = 0;
+    config.output_scale = gain;
+
+    const std::vector<double> none;
+    heongpu::llama::RectActivation ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+    heongpu::llama::RectActivation out =
+        fx.op->rms_norm(ct, none, config, *fx.galois, *fx.relin);
+
+    const std::vector<double> got =
+        fx.op->decrypt(out, *fx.decryptor, out.column.front().scale());
+    std::cout << "rect RMSNorm output_scale (2 groups) worst error: "
+              << worst_diff(want, got) << std::endl;
+    EXPECT_LT(worst_diff(want, got), 5e-2 * gain);
+}
+
+TEST(HEonGPU, CKKS_Llama3Rect_FeedForwardMultipleHiddenGroups)
+{
+    // The real-8B run holds the hidden width in SEVEN groups, accumulated
+    // one HEONGPU_BOOT_HIDDEN_BLOCK_GROUPS-sized chunk at a time; every
+    // FeedForward test until now ran at one group and never exercised the
+    // accumulate loop at all. Two groups is the smallest case that does.
+    Fixture fx(18, 9);
+    const int d = Fixture::d;
+    const int channels = fx.half();
+    const int hidden = 2 * fx.half();
+    const double amp = 1.0 / std::sqrt(static_cast<double>(channels));
+
+    const std::vector<double> x = random_matrix(d, channels, 40404u);
+    const std::vector<double> gate =
+        random_matrix(channels, hidden, 41414u, amp);
+    const std::vector<double> up = random_matrix(channels, hidden, 42424u, amp);
+    const std::vector<double> down =
+        random_matrix(hidden, channels, 43434u, amp);
+
+    const std::vector<double> hg = host_product(x, gate, d, channels, hidden);
+    const std::vector<double> hu = host_product(x, up, d, channels, hidden);
+    std::vector<double> hv(hg.size());
+    for (size_t e = 0; e < hg.size(); ++e)
+    {
+        const double s = hg[e] / (1.0 + std::exp(-hg[e]));
+        hv[e] = s * hu[e];
+    }
+    const std::vector<double> want = host_product(hv, down, d, hidden, channels);
+
+    Rect::RectFeedForwardWeights weights;
+    weights.gate = gate;
+    weights.up = up;
+    weights.down = down;
+
+    Rect::RectFeedForwardConfig config;
+    config.in_channels = channels;
+    config.hidden_channels = hidden;
+    config.silu_bound = 6.0;
+    config.silu_degree = 31;
+    config.hidden_block_groups = 1; // one N/2 chunk at a time, as on GPU
+
+    heongpu::llama::RectActivation ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+    heongpu::llama::RectActivation out =
+        fx.op->feed_forward(ct, weights, config, *fx.galois, *fx.relin);
+
+    const std::vector<double> got =
+        fx.op->decrypt(out, *fx.decryptor, out.column.front().scale());
+    std::cout << "rect SwiGLU (2 hidden groups) worst error: "
+              << worst_diff(want, got) << std::endl;
+    EXPECT_LT(worst_diff(want, got), 5e-1);
+}
+
+TEST(HEonGPU, CKKS_Llama3Rect_AttentionGroupedQueryMatchesHostReference)
+{
+    // The real-8B run is grouped-query attention at group_size 4 (32 heads
+    // over 8 kv heads); every attention test until now ran kv_heads == heads
+    // and never touched the host-side expand() that repeats a kv head's
+    // projection columns across its query group. This is the smallest case
+    // the encoding allows at the real group_size: one head group (16 heads,
+    // the ring's own step) at group_size 4, so 4 kv heads.
+    Fixture fx(42, 21);
+    const int d = Fixture::d;
+    const int step = fx.blocks();
+    const int channels = fx.half();
+    const int heads = step;
+    const int group_size = 4;
+    const int kv_heads = heads / group_size;
+    const int kv_channels = kv_heads * d;
+    const double amp = 1.0 / std::sqrt(static_cast<double>(channels));
+
+    const std::vector<double> x = random_matrix(d, channels, 44444u);
+    Rect::RectAttentionWeights weights;
+    weights.query = random_matrix(channels, channels, 45454u, amp);
+    weights.key = random_matrix(channels, kv_channels, 46464u, amp);
+    weights.value = random_matrix(channels, kv_channels, 47474u, amp);
+
+    Rect::RectAttentionConfig config;
+    config.in_channels = channels;
+    config.heads = heads;
+    config.kv_heads = kv_heads;
+    config.causal = false;
+    config.softmax.iterations = 2;
+    config.softmax.exp_degree = 31;
+    config.softmax.inverse_degree = 15;
+    config.softmax.inverse_newton = 1;
+
+    const double head_scale = 1.0 / std::sqrt(static_cast<double>(d));
+    const std::vector<double> q =
+        host_product(x, weights.query, d, channels, channels);
+    const std::vector<double> k =
+        host_product(x, weights.key, d, channels, kv_channels);
+    const std::vector<double> v =
+        host_product(x, weights.value, d, channels, kv_channels);
+
+    std::vector<double> want(static_cast<size_t>(d) * channels, 0.0);
+    std::vector<double> row_shift(static_cast<size_t>(d) * heads, 0.0);
+    double worst_bound = 0.0;
+    for (int h = 0; h < heads; ++h)
+    {
+        const int kv = h / group_size;
+        for (int u = 0; u < d; ++u)
+        {
+            std::vector<double> row(d, 0.0);
+            double top = -1e30;
+            double bottom = 1e30;
+            for (int t = 0; t < d; ++t)
+            {
+                double s = 0.0;
+                for (int c = 0; c < d; ++c)
+                    s += q[static_cast<size_t>(u) * channels + h * d + c] *
+                         k[static_cast<size_t>(t) * kv_channels + kv * d + c];
+                row[t] = s * head_scale;
+                top = std::max(top, row[t]);
+                bottom = std::min(bottom, row[t]);
+            }
+            row_shift[static_cast<size_t>(u) * heads + h] = top;
+            worst_bound = std::max(worst_bound, top - bottom);
+            double norm = 0.0;
+            for (int t = 0; t < d; ++t)
+            {
+                row[t] = std::exp(row[t] - top);
+                norm += row[t];
+            }
+            for (int c = 0; c < d; ++c)
+            {
+                double acc = 0.0;
+                for (int t = 0; t < d; ++t)
+                    acc += row[t] / norm *
+                           v[static_cast<size_t>(t) * kv_channels + kv * d +
+                             c];
+                want[static_cast<size_t>(u) * channels + h * d + c] = acc;
+            }
+        }
+    }
+
+    config.score_shift_rows = row_shift;
+    config.softmax.bound = worst_bound * 1.05;
+    std::cout << "rect attention GQA bound: " << config.softmax.bound
+              << std::endl;
+
+    heongpu::llama::RectActivation ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+    heongpu::llama::RectActivation out =
+        fx.op->attention(ct, weights, config, *fx.galois, *fx.relin);
+
+    const std::vector<double> got =
+        fx.op->decrypt(out, *fx.decryptor, out.column.front().scale());
+
+    double signal = 0.0;
+    for (double w : want)
+        signal = std::max(signal, std::abs(w));
+    const double worst = worst_diff(want, got);
+    std::cout << "rect attention GQA worst error: " << worst
+              << " against a signal of " << signal << " ("
+              << (100.0 * worst / signal) << "%)" << std::endl;
+    EXPECT_LT(worst, 0.30 * signal);
+}
