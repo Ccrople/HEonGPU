@@ -646,6 +646,9 @@ int main(int argc, char* argv[])
                       << std::scientific << std::setprecision(3) << worst
                       << std::defaultfloat << std::endl;
         };
+        // The same probe, one level lower: inside softmax() itself, at the
+        // exp/mask, denominator and reciprocal steps op.ct_trace cannot see.
+        op.arith().debug_trace = op.ct_trace;
     }
 
     std::cout << "[boot] --- measured region ---" << std::endl;

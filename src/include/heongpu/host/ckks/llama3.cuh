@@ -219,6 +219,18 @@ namespace heongpu
             /** @brief Slots available to every routine here. */
             int slot_count() const noexcept { return slot_count_; }
 
+            /**
+             * @brief Debug hook: reports a named ciphertext vector wherever
+             *        this class chooses to call it. Empty by default and
+             *        costs nothing then; used to bisect where inside a
+             *        multi-step routine a value stops matching expectation,
+             *        which no per-call trace on the caller's side can see.
+             */
+            std::function<void(const char* name,
+                               const std::vector<Ciphertext<Scheme::CKKS>>&
+                                   ct)>
+                debug_trace;
+
             /** @brief Default scaling factor. */
             double default_scale() const noexcept { return default_scale_; }
 

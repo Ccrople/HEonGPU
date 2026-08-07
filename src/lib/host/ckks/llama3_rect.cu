@@ -1150,6 +1150,7 @@ namespace heongpu
                             c, -config.score_shift * exp_domain);
                     }
                 }
+                note_depth("attention.shifted", slots);
 
                 Llama3Operator::SoftmaxConfig softmax = config.softmax;
                 // The key axis is entirely across ciphertexts: one coordinate
