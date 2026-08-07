@@ -1515,3 +1515,107 @@ TEST(HEonGPU, CKKS_Llama3Rect_AttentionPerRowScoreShiftMatchesHostReference)
               << (100.0 * worst / signal) << "%)" << std::endl;
     EXPECT_LT(worst, 0.30 * signal);
 }
+
+TEST(HEonGPU, CKKS_Llama3Rect_RMSNormOutputScaleTwoGroups)
+{
+    // The real-8B run holds d_model in TWO channel groups (N=4096, d=128,
+    // width 4096 = 2 * half), and every RMSNorm test until now ran at one.
+    // output_scale's gain rides in the fitted 1/sqrt, which is evaluated
+    // once per GROUP: this pins that it is not silently applied group_count
+    // times, or once when it should be per-group.
+    Fixture fx(24, 12);
+    const int d = Fixture::d;
+    const int channels = 2 * fx.half();
+    const double eps = 1e-5;
+    const double gain = 0.25;
+
+    const std::vector<double> x = random_matrix(d, channels, 39191u);
+    std::vector<double> want(x.size(), 0.0);
+    for (int u = 0; u < d; ++u)
+    {
+        double sum = 0.0;
+        for (int c = 0; c < channels; ++c)
+        {
+            const double v = x[static_cast<size_t>(u) * channels + c];
+            sum += v * v;
+        }
+        const double inv =
+            gain / std::sqrt(sum / static_cast<double>(channels) + eps);
+        for (int c = 0; c < channels; ++c)
+            want[static_cast<size_t>(u) * channels + c] =
+                x[static_cast<size_t>(u) * channels + c] * inv;
+    }
+
+    Rect::RectRMSNormConfig config;
+    config.eps = eps;
+    config.sum_lo = channels * 0.20;
+    config.sum_hi = channels * 0.50;
+    config.degree = 31;
+    config.newton_iterations = 0;
+    config.output_scale = gain;
+
+    const std::vector<double> none;
+    heongpu::llama::RectActivation ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+    heongpu::llama::RectActivation out =
+        fx.op->rms_norm(ct, none, config, *fx.galois, *fx.relin);
+
+    const std::vector<double> got =
+        fx.op->decrypt(out, *fx.decryptor, out.column.front().scale());
+    std::cout << "rect RMSNorm output_scale (2 groups) worst error: "
+              << worst_diff(want, got) << std::endl;
+    EXPECT_LT(worst_diff(want, got), 5e-2 * gain);
+}
+
+TEST(HEonGPU, CKKS_Llama3Rect_FeedForwardMultipleHiddenGroups)
+{
+    // The real-8B run holds the hidden width in SEVEN groups, accumulated
+    // one HEONGPU_BOOT_HIDDEN_BLOCK_GROUPS-sized chunk at a time; every
+    // FeedForward test until now ran at one group and never exercised the
+    // accumulate loop at all. Two groups is the smallest case that does.
+    Fixture fx(18, 9);
+    const int d = Fixture::d;
+    const int channels = fx.half();
+    const int hidden = 2 * fx.half();
+    const double amp = 1.0 / std::sqrt(static_cast<double>(channels));
+
+    const std::vector<double> x = random_matrix(d, channels, 40404u);
+    const std::vector<double> gate =
+        random_matrix(channels, hidden, 41414u, amp);
+    const std::vector<double> up = random_matrix(channels, hidden, 42424u, amp);
+    const std::vector<double> down =
+        random_matrix(hidden, channels, 43434u, amp);
+
+    const std::vector<double> hg = host_product(x, gate, d, channels, hidden);
+    const std::vector<double> hu = host_product(x, up, d, channels, hidden);
+    std::vector<double> hv(hg.size());
+    for (size_t e = 0; e < hg.size(); ++e)
+    {
+        const double s = hg[e] / (1.0 + std::exp(-hg[e]));
+        hv[e] = s * hu[e];
+    }
+    const std::vector<double> want = host_product(hv, down, d, hidden, channels);
+
+    Rect::RectFeedForwardWeights weights;
+    weights.gate = gate;
+    weights.up = up;
+    weights.down = down;
+
+    Rect::RectFeedForwardConfig config;
+    config.in_channels = channels;
+    config.hidden_channels = hidden;
+    config.silu_bound = 6.0;
+    config.silu_degree = 31;
+    config.hidden_block_groups = 1; // one N/2 chunk at a time, as on GPU
+
+    heongpu::llama::RectActivation ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+    heongpu::llama::RectActivation out =
+        fx.op->feed_forward(ct, weights, config, *fx.galois, *fx.relin);
+
+    const std::vector<double> got =
+        fx.op->decrypt(out, *fx.decryptor, out.column.front().scale());
+    std::cout << "rect SwiGLU (2 hidden groups) worst error: "
+              << worst_diff(want, got) << std::endl;
+    EXPECT_LT(worst_diff(want, got), 5e-1);
+}
