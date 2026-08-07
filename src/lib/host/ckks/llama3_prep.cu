@@ -439,9 +439,21 @@ namespace heongpu
                 for (int head = 0; head < heads; head++)
                 {
                     const int kv_head = head / group;
+                    // EVERY key, not just the causal ones. The circuit
+                    // exponentiates every (query, key) pair before the
+                    // causal mask zeroes the non-causal ones out -- masking
+                    // removes a term from the SUM, it does not stop the
+                    // exponential from having been evaluated on it. A shift
+                    // that only bounds the causal keys leaves those other
+                    // evaluations free to land outside the fitted domain,
+                    // where a Chebyshev fit of any real degree diverges; the
+                    // masked zero that should have followed does not undo an
+                    // already-corrupted ciphertext, since CKKS's noise scales
+                    // with the magnitudes actually present and not with the
+                    // logical result of multiplying one of them by zero.
                     for (int i = 0; i < t; i++)
                     {
-                        for (int j = 0; j <= i; j++)
+                        for (int j = 0; j < t; j++)
                         {
                             double s = 0.0;
                             for (int e = 0; e < hd; e++)
@@ -452,16 +464,27 @@ namespace heongpu
                                        kv_head * hd + e];
                             }
                             scores[static_cast<std::size_t>(i) * t + j] = s;
+                            // Every key the exponential actually meets, not
+                            // just the causal ones: the global (non-row)
+                            // shift is subject to the identical hazard.
                             cal.score_lo = std::min(cal.score_lo, s);
                             cal.score_hi = std::max(cal.score_hi, s);
                         }
                     }
                     for (int i = 0; i < t; i++)
                     {
+                        // The shift itself, and the span it has to cover:
+                        // over ALL keys, since that is what actually reaches
+                        // the exponential. Shift invariance of softmax does
+                        // not care which constant is subtracted, so bounding
+                        // wider than the causal keys need costs nothing
+                        // mathematically -- it costs only some of the
+                        // interval's precision, and buys every evaluation a
+                        // safe domain.
                         double top = -std::numeric_limits<double>::infinity();
                         double bottom =
                             std::numeric_limits<double>::infinity();
-                        for (int j = 0; j <= i; j++)
+                        for (int j = 0; j < t; j++)
                         {
                             const double s =
                                 scores[static_cast<std::size_t>(i) * t + j];
