@@ -66,7 +66,7 @@
 //                         Galois keys                       20000
 //   HEONGPU_RING_CCMM_ONLY  1 to skip rect pcmm entirely    0
 
-#include <heongpu/heongpu.cuh>
+#include <heongpu/heongpu.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -79,7 +79,7 @@
 #include <string>
 #include <vector>
 
-using S = heongpu::Scheme::CKKS;
+constexpr auto S = heongpu::Scheme::CKKS;
 using Clock = std::chrono::steady_clock;
 
 namespace
@@ -122,9 +122,16 @@ namespace
     {
         int log_n = 0;
         int limbs = 0;
-        double ccmm_ms = 0.0;      // one call
-        double rect_ms = 0.0;      // one call, negative if not measured
-        double macs = 0.0;         // per call, both algorithms
+        double ccmm_ms = 0.0; // one call
+        double rect_ms = 0.0; // one call, negative if not measured
+        // The two algorithms do DIFFERENT amounts of work per call and the
+        // difference is a factor of k/2, so one shared figure would be wrong
+        // for one of them. ccmm multiplies two d x d matrix encryptions, k/2
+        // of them batched: (k/2) * d^3 = N*d^2/2. rectangular_pcmm multiplies
+        // a d x (N/2) encryption by an (N/2) x (N/2) plaintext, which is
+        // (k/2)^2 blocks of d x d: (k/2)^2 * d^3 = N^2*d/4.
+        double ccmm_macs = 0.0;
+        double rect_macs = 0.0;
         int galois_keys = 0;
     };
 
@@ -161,8 +168,8 @@ int main()
     std::cout << "[ring] d = " << d << ", reps = " << reps
               << ", rect pcmm skipped above " << key_cap << " Galois keys"
               << std::endl;
-    std::cout << "[ring] one call contracts k/2 = N/2d blocks of d x d, so it "
-                 "is N*d^2/2 MACs at every ring"
+    std::cout << "[ring] work per call: ccmm (k/2)*d^3 = N*d^2/2, rect pcmm "
+                 "(k/2)^2*d^3 = N^2*d/4"
               << std::endl;
 
     std::vector<Point> points;
@@ -182,7 +189,9 @@ int main()
             Point p;
             p.log_n = log_n;
             p.limbs = limbs;
-            p.macs = 0.5 * static_cast<double>(n) * d * d;
+            p.ccmm_macs = 0.5 * static_cast<double>(n) * d * d;
+            p.rect_macs =
+                0.25 * static_cast<double>(n) * static_cast<double>(n) * d;
 
             const int prime_bits = 40;
             const double scale = std::pow(2.0, prime_bits);
@@ -268,8 +277,8 @@ int main()
             }
             else
             {
-                heongpu::Galoiskey<S> rect_galois(context,
-                                                  rect.rotation_indices());
+                std::vector<int> rect_shifts = rect.rotation_indices();
+                heongpu::Galoiskey<S> rect_galois(context, rect_shifts);
                 keygen.generate_galois_key(rect_galois, secret);
 
                 const std::vector<double> x = RandomMatrix(
@@ -323,16 +332,16 @@ int main()
             if (p.limbs != limbs)
                 continue;
             if (ccmm_base == 0.0)
-                ccmm_base = p.ccmm_ms * 1e6 / p.macs;
+                ccmm_base = p.ccmm_ms * 1e6 / p.ccmm_macs;
             if (rect_base == 0.0 && p.rect_ms > 0.0)
-                rect_base = p.rect_ms * 1e6 / p.macs;
+                rect_base = p.rect_ms * 1e6 / p.rect_macs;
         }
 
         for (const Point& p : points)
         {
             if (p.limbs != limbs)
                 continue;
-            const double c = p.ccmm_ms * 1e6 / p.macs;
+            const double c = p.ccmm_ms * 1e6 / p.ccmm_macs;
             std::cout << "[ring]   " << std::setw(2) << p.log_n << "   "
                       << std::setw(2) << p.limbs << "  | " << std::fixed
                       << std::setprecision(4) << std::setw(14) << c << " "
@@ -340,7 +349,7 @@ int main()
                       << (ccmm_base > 0.0 ? c / ccmm_base : 0.0) << "x | ";
             if (p.rect_ms > 0.0)
             {
-                const double r = p.rect_ms * 1e6 / p.macs;
+                const double r = p.rect_ms * 1e6 / p.rect_macs;
                 std::cout << std::setprecision(4) << std::setw(14) << r << " "
                           << std::setprecision(2) << std::setw(5)
                           << (rect_base > 0.0 ? r / rect_base : 0.0) << "x";

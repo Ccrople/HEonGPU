@@ -51,7 +51,7 @@
 //   HEONGPU_B2S_TAYLOR       EvalMod Taylor degree              11
 //   HEONGPU_B2S_COLUMNS      how many columns to check           2
 
-#include <heongpu/heongpu.cuh>
+#include <heongpu/heongpu.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -64,7 +64,7 @@
 #include <string>
 #include <vector>
 
-using S = heongpu::Scheme::CKKS;
+constexpr auto S = heongpu::Scheme::CKKS;
 using Rect = heongpu::llama::Llama3RectOperator;
 using Clock = std::chrono::steady_clock;
 
@@ -120,6 +120,70 @@ namespace
                   << std::setprecision(6) << std::setw(10) << f.gain
                   << "   worst " << std::scientific << std::setprecision(2)
                   << f.residual << "   rel " << f.rel << std::endl;
+    }
+
+    uint32_t BitRev(uint32_t v, int bits)
+    {
+        uint32_t r = 0;
+        for (int i = 0; i < bits; ++i)
+            r |= ((v >> i) & 1u) << (bits - 1 - i);
+        return r;
+    }
+
+    // Which slot did coefficient c end up in? Answered by matching values
+    // rather than by asserting a convention. The plaintext is 2048 independent
+    // uniform draws, so the typical gap between two of them is ~4e-4 while a
+    // bootstrap's own error is ~1e-5: a nearest-value match is unambiguous by
+    // two orders of magnitude, and the worst match distance is printed so that
+    // claim is checked and not assumed.
+    struct Discovered
+    {
+        std::vector<int> perm;   // perm[c] = slot holding coefficient c
+        double worst_match = 0.0;
+        bool bijective = false;
+    };
+
+    Discovered DiscoverPermutation(const std::vector<double>& measured,
+                                   const std::vector<double>& predicted)
+    {
+        const int count = static_cast<int>(predicted.size());
+        std::vector<std::pair<double, int>> sorted;
+        sorted.reserve(count);
+        for (int s = 0; s < count; ++s)
+            sorted.emplace_back(measured[s], s);
+        std::sort(sorted.begin(), sorted.end());
+
+        Discovered out;
+        out.perm.assign(count, -1);
+        std::vector<int> hits(count, 0);
+        for (int c = 0; c < count; ++c)
+        {
+            const double target = predicted[c];
+            auto it = std::lower_bound(
+                sorted.begin(), sorted.end(), std::make_pair(target, -1));
+            double best = 1e30;
+            int best_slot = -1;
+            for (auto probe = (it == sorted.begin() ? it : std::prev(it));
+                 probe != sorted.end() &&
+                 probe != std::next(it, std::min<std::ptrdiff_t>(
+                                            2, sorted.end() - it));
+                 ++probe)
+            {
+                const double dist = std::abs(probe->first - target);
+                if (dist < best)
+                {
+                    best = dist;
+                    best_slot = probe->second;
+                }
+            }
+            out.perm[c] = best_slot;
+            out.worst_match = std::max(out.worst_match, best);
+            if (best_slot >= 0)
+                hits[best_slot]++;
+        }
+        out.bijective = std::all_of(hits.begin(), hits.end(),
+                                    [](int h) { return h == 1; });
+        return out;
     }
 } // namespace
 
@@ -181,7 +245,7 @@ int main()
         shift_set.insert(r);
     for (int r : op.arith().bootstrapping_key_indexs())
         shift_set.insert(r);
-    const std::vector<int> shifts(shift_set.begin(), shift_set.end());
+    std::vector<int> shifts(shift_set.begin(), shift_set.end());
     std::cout << "[b2s] keys   : " << shifts.size()
               << " rotation indices (crossing + bootstrap union)" << std::endl;
 
@@ -296,6 +360,84 @@ int main()
             b_perm[static_cast<std::size_t>(perm[c])] = got_b[c];
         Report("A vs B, stride perm", FitTo(got_a, b_perm));
         Report("A vs B, identity", FitTo(got_a, got_b));
+
+        // ---------------------------------------------------------------
+        // If none of the candidate orderings fits, the question is whether
+        // the DATA is there at all. Match by value and see.
+        // ---------------------------------------------------------------
+        const Discovered disc = DiscoverPermutation(got_b, predicted);
+        std::cout << "[b2s]   discovered ordering: worst match "
+                  << std::scientific << std::setprecision(2)
+                  << disc.worst_match << ", bijective "
+                  << (disc.bijective ? "YES" : "no") << std::endl;
+
+        // A worst match at bootstrap precision means every value is PRESENT.
+        // Bijectivity is a weaker signal than it looks: 2048 uniform draws on
+        // a width-0.8 interval have around 70 pairs closer together than the
+        // bootstrap's own error, so a handful of ambiguous matches is the
+        // birthday problem and not evidence about the transform.
+        if (disc.worst_match < 1e-2)
+        {
+            int fixed_points = 0, stride_hits = 0, bitrev_hits = 0,
+                pow5_hits = 0;
+            int logh = 0;
+            while ((1 << logh) < half)
+                logh++;
+
+            // The CKKS slot enumeration: slot j reads the plaintext at
+            // zeta^(5^j). If CoeffToSlot indexes its output by the raw
+            // coefficient and the decoder indexes by that enumeration, the
+            // relabelling between them is this map and nothing else.
+            std::vector<int> pow5(static_cast<std::size_t>(half));
+            {
+                const uint64_t mod = 2ull * n;
+                uint64_t g = 1;
+                for (int j = 0; j < half; ++j)
+                {
+                    pow5[j] = static_cast<int>((g - 1) / 2);
+                    g = (g * 5) % mod;
+                }
+            }
+            std::vector<int> pow5_inv(static_cast<std::size_t>(half), -1);
+            for (int j = 0; j < half; ++j)
+                if (pow5[j] >= 0 && pow5[j] < half)
+                    pow5_inv[static_cast<std::size_t>(pow5[j])] = j;
+
+            for (int c = 0; c < half; ++c)
+            {
+                if (disc.perm[c] == c)
+                    fixed_points++;
+                if (disc.perm[c] == perm[c])
+                    stride_hits++;
+                if (disc.perm[c] ==
+                    static_cast<int>(BitRev(static_cast<uint32_t>(c), logh)))
+                    bitrev_hits++;
+                if (disc.perm[c] == pow5_inv[static_cast<std::size_t>(c)])
+                    pow5_hits++;
+            }
+            std::cout << "[b2s]   of " << half << " coefficients matched by: "
+                      << "identity " << fixed_points << ", stride "
+                      << stride_hits << ", bit reversal " << bitrev_hits
+                      << ", 5-power " << pow5_hits << std::endl;
+            std::cout << "[b2s]   perm[0..15]  =";
+            for (int c = 0; c < std::min(16, half); ++c)
+                std::cout << " " << disc.perm[c];
+            std::cout << std::endl;
+            std::cout << "[b2s]   perm[2^j]    =";
+            for (int c = 1; c < half; c <<= 1)
+                std::cout << " " << disc.perm[c];
+            std::cout << std::endl;
+            std::cout << "[b2s]   pow5inv[0..7]=";
+            for (int c = 0; c < std::min(8, half); ++c)
+                std::cout << " " << pow5_inv[static_cast<std::size_t>(c)];
+            std::cout << std::endl;
+        }
+        else
+        {
+            std::cout << "[b2s]   the data is NOT a rearrangement of the "
+                         "input; this is not an ordering problem."
+                      << std::endl;
+        }
     }
 
     std::cout << "[b2s] -----------------------------------------------------"

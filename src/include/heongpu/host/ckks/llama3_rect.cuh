@@ -482,10 +482,26 @@ namespace heongpu
              * StoC_piece, and it halves EvalMod, because the upper coefficient
              * half that solo_coeff_to_slot discards was zero to begin with.
              *
-             * The slot ORDER is the one CoeffToSlot produces, which is not the
-             * one to_slots() produces; slot_reading_permutation() gives the
-             * relabelling between them. Same key and parameter requirements as
-             * bootstrap().
+             * Measured: profile_boot_to_slots finds every one of the N/2
+             * values present to 7.4e-6, and the levels come out as promised --
+             * 21 against 27 for bootstrap() plus to_slots(), so SIX levels
+             * back, and 221 ms against 526 ms per column.
+             *
+             * THE CATCH, AND IT IS NOT RESOLVED HERE. The slot ORDER is
+             * BIT REVERSED, which is what a decimation-in-time factorisation
+             * leaves behind and which to_slots() does not do.
+             * slot_reading_permutation() returns it. That is free for anything
+             * slot-wise -- a Chebyshev fit, a plaintext mask, a product -- as
+             * long as the plaintext constants are permuted to match, which is
+             * a host-side relabelling and costs nothing. It is NOT free for
+             * anything that rotates: sum_blocked, the strided sums inside
+             * RMSNorm and the SoftMax, and from_slots all read a slot geometry
+             * that bit reversal destroys. Consuming this output therefore
+             * needs either those reductions reformulated on the reversed
+             * index, or the reversal folded into Vandermonde's CtoS diagonals,
+             * which is where it belongs and where it is not yet.
+             *
+             * Same key and parameter requirements as bootstrap().
              */
             Ciphertext<Scheme::CKKS>
             bootstrap_to_slots(Ciphertext<Scheme::CKKS>& ct,
@@ -493,12 +509,13 @@ namespace heongpu
                                Relinkey<Scheme::CKKS>& relin_key);
 
             /**
-             * @brief Where bootstrap_to_slots leaves entry i + d*t of a column.
+             * @brief Where bootstrap_to_slots leaves each coefficient.
              *
-             * Returns p of length N/2 with p[c] = the slot that coefficient c
-             * lands in. The rect encoding walks the token axis fastest, and
-             * CoeffToSlot reads the coefficient index straight through, so the
-             * two orders differ by the d x (k/2) stride transpose this returns.
+             * Returns p of length N/2 with p[c] = the slot holding coefficient
+             * c, which the rect encoding filled with token c mod d of block
+             * c div d. Measured to be bit reversal; see the note on
+             * bootstrap_to_slots. to_slots() differs from it by the further
+             * d x (k/2) stride transpose.
              */
             std::vector<int> slot_reading_permutation() const;
 

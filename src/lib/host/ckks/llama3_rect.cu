@@ -591,23 +591,38 @@ namespace heongpu
 
         std::vector<int> Llama3RectOperator::slot_reading_permutation() const
         {
-            // Coefficient i + d*t of a rect column holds token i of block t.
-            // CoeffToSlot puts coefficient c into slot c, so the block index
-            // ends up on the slow axis where to_slots() puts it on the fast
-            // one. The relabelling is the d x (k/2) stride transpose and
-            // nothing else: no bit reversal, because the factorisation the
-            // crossing uses and the one CoeffToSlot uses agree on everything
-            // but which axis they walk first.
-            const int d = layout_.d;
-            const int blocks = layout_.k / 2;
-            std::vector<int> p(static_cast<size_t>(d) * blocks);
-            for (int t = 0; t < blocks; ++t)
+            // MEASURED, not derived. profile_boot_to_slots matches every one
+            // of the N/2 values by magnitude and reports which slot it landed
+            // in; at logN 12, d 64 the answer was bit reversal on 2037 of 2048
+            // coefficients, the other 11 being pairs of draws closer together
+            // than the bootstrap's own 7e-6 error rather than exceptions.
+            //
+            // Bit reversal is what a decimation-in-time factorisation leaves
+            // behind, and CoeffToSlot's is one. It is NOT what the crossing
+            // leaves behind: to_slots() returns the natural order under the
+            // d x (k/2) stride transpose, which the same profile confirms to
+            // 1.8e-5. So the two readings of one rect column differ by bit
+            // reversal composed with that transpose, and this returns the
+            // first half of it -- where bootstrap_to_slots puts coefficient c,
+            // which is where the rect encoding put token c mod d of block
+            // c div d.
+            const int half = layout_.N / 2;
+            int bits = 0;
+            while ((1 << bits) < half)
             {
-                for (int i = 0; i < d; ++i)
+                bits++;
+            }
+
+            std::vector<int> p(static_cast<size_t>(half));
+            for (int c = 0; c < half; ++c)
+            {
+                unsigned r = 0;
+                for (int b = 0; b < bits; ++b)
                 {
-                    p[static_cast<size_t>(i) + static_cast<size_t>(d) * t] =
-                        t + blocks * i;
+                    r |= ((static_cast<unsigned>(c) >> b) & 1u)
+                         << (bits - 1 - b);
                 }
+                p[static_cast<size_t>(c)] = static_cast<int>(r);
             }
             return p;
         }

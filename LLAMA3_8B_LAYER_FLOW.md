@@ -191,12 +191,44 @@ not merely fusible — it is already inside the bootstrap. And omitting StoC han
 back `StoC_piece = 3` *more* levels, and halves EvalMod (one live ciphertext
 instead of two).
 
-The only fix-up is the index order: the coefficient reading is `u + d·b`, the
-slot reading `to_slots` targets is `b + (k/2)·u` — a `d × (k/2)` stride
-permutation, both powers of two, which is the kind of thing a DFT factorisation
-absorbs in its index tables. *This is analysis, not measurement: no fused
-bootstrap has been run. The permutation must be checked against the encoder's
-`5^s` slot ordering before it is claimed.*
+#### Now measured, and the fix-up is **not** the stride permutation
+
+`HEArithmeticOperator::coeff_to_slot_bootstrapping` implements exactly the above
+— ModRaise, `solo_coeff_to_slot`, EvalMod, no stage 4 — and
+`benchmark/profile_boot_to_slots.cpp` runs it against `bootstrap()` + `to_slots()`
+at logN 12, d 64, 36 limbs. Both claims about *value* hold:
+
+| | measured |
+|---|---|
+| levels, `bootstrap()` then `to_slots()` | depth **27** |
+| levels, `bootstrap_to_slots()` | depth **21** |
+| **levels returned** | **6** (StoC_piece 3 + its rescale, + the 2-level crossing) |
+| time, per column | **221 ms** vs 526 ms |
+| every value present, worst match | **7.4e-6** — the data is all there |
+
+**The index order is bit reversal, not the stride permutation.** Matching all
+2048 values by magnitude: `identity 64, stride 64, bit reversal 2037, 5-power 2`
+(the 11 misses are pairs of random draws closer together than the bootstrap's own
+7e-6 error — a birthday effect at 2048 samples, not exceptions). `perm[2^j]`
+came back `1024, 512, 256, …, 1`. That is what a decimation-in-time
+factorisation leaves behind, and CoeffToSlot's is one. The reference path
+confirms the other half: `to_slots()` matches the natural order under the stride
+transpose to **1.8e-5**.
+
+So the two readings differ by **bit reversal ∘ stride transpose**, and the
+earlier guess ("a `d × (k/2)` stride permutation, which a DFT factorisation
+absorbs") was half right — the stride part is the crossing's, the reversal is the
+bootstrap's, and only the first was accounted for.
+
+**What that costs.** Bit reversal is free for everything slot-wise — a Chebyshev
+fit, a plaintext mask, a product — provided the plaintext constants are permuted
+to match, which is a host-side relabelling. It is **not** free for anything that
+rotates, and `sum_blocked`, the strided sums inside RMSNorm and the SoftMax, and
+`from_slots` all read a slot geometry that bit reversal destroys. So the 6 levels
+are real but **not yet spendable**: the minimum modification is either those
+reductions reformulated on the reversed index, or the reversal folded into
+`Vandermonde`'s CtoS diagonals — which is where it belongs, since a
+decimation-in-frequency factorisation produces natural order at the same cost.
 
 ### The five boundaries
 
@@ -406,19 +438,133 @@ keys at logN = 12. Ring switching needs its own switch key in each direction and
 the two rings' secrets must be related (`s_12(X) = s_16(X^16)` for the embedding;
 a trace for the descent). **Neither key nor either direction exists.**
 
-**6. Special P.** At `dnum = 1`, `P ≈ Q`. `dnum = 1` is not a preference here: it
-is the only decomposition whose 2047-key set fits on one card. So `log PQ ≈ 214`.
+**6. Special P — read from the validator, not assumed.** `P` is whatever the
+caller passes; `set_coeff_modulus_bit_sizes` sets
+`KEYSWITCHING_METHOD_I` when `|P| == 1` and II otherwise, and
+`coefficient_validator` (`util.cu:11`) is the only structural constraint: it cuts
+`Q` into consecutive chunks of exactly `|P|` primes and demands **each chunk's
+bit-sum ≤ Σ log P**. So `dnum = ceil(|Q| / |P|)`, and the minimum legal `P` is
+the largest chunk.
 
-**7. 128-bit security at logN = 12 — NO.** The standard table gives
-`log PQ ≤ 109` at N = 4096 for a ternary secret. `Q` alone is 107; **any** P at
-all breaks it. Worse, this pipeline uses a sparse secret of Hamming weight 16
-(EvalMod's range demands it) and builds its context with
-`sec_level_type::none` — the existing profile is an honest **cost model**, not a
-deployable parameter set, and this proposal inherits that.
+For `Q = {41, 33, 33}` that gives three options, and only one of them is the
+`log PQ ≈ 214` this document previously quoted:
 
-**8. Are the total Q and P valid at N = 2^12?** `Q = 107 ≤ 109` on its own; `PQ`
-is not, at any useful scale. Shrinking to fit (`log PQ ≤ 109` ⇒ `log Q ≤ 54` ⇒
-`q0 = 20, p = 17`) leaves ~5 bits after the contraction and is useless.
+| `\|P\|` | dnum | chunks | min log P | log PQ |
+|---|---|---|---|---|
+| 1 | 3 | {41} {33} {33} | 41 | **148** |
+| 2 | 2 | {41,33} {33} | 74 | 181 |
+| 3 | 1 | {41,33,33} | 107 | 214 |
+
+**214 was a `dnum = 1` figure, and `dnum = 1` was a key-budget choice, not a
+requirement of the primes.** The honest minimum is **148**.
+
+**7. 128-bit security at logN = 12 — still NO, by 39 bits, not by 105.**
+`context.cu:113` checks `Σ log Q + Σ log P` against `heongpu_128bit_std_parms(N)`,
+which is **109** at N = 4096 (`secstdparams.h:29`). The best case above is 148.
+No choice of `dnum` rescues it.
+
+What N = 4096 *can* hold, uniform primes of `b` bits, `L` of them, `|P| = 1`
+(which is optimal — a larger `|P|` forces a larger `P`), so `(L+1)·b ≤ 109`:
+
+| levels | primes | scale | log PQ | verdict |
+|---|---|---|---|---|
+| **1** | 2 × 36, P = 36 | 2^36 | 108 | ✔ comfortable |
+| **2** | 3 × 27, P = 27 | 2^27 | 108 | ✔ tight |
+| 3 | 4 × 21, P = 21 | 2^21 | 105 | ✔ useless |
+
+Kang's own S12 sits in the first row (`log Q = 36 + 28`, `log QP = 104`) and their
+first three-level parameter set, S13b, is at **N = 8192** (`log QP = 160`). They
+move rings exactly where this table says they must.
+
+**So the real constraint is not "41+33+33 is insecure" but "N = 4096 holds ONE
+comfortable multiplicative level".** That reframes the design question, and §7bis
+answers it with measurement.
+
+The 27-bit two-level row is not obviously dead but it is **not verified**: Δ = 2^27
+against a d = 128 contraction (7 bits of growth per product, twice) leaves roughly
+13 bits over the 12-bit target of §3.1.2 with nothing for input quantisation. No
+measurement of product precision at 27 bits exists in this tree.
+
+Separately, and applying to the **whole existing pipeline** and not only to this
+proposal: every profile here builds its context with `sec_level_type::none` and a
+**sparse secret of Hamming weight 16**. The 109 in that table is for a *ternary
+uniform* secret; a weight-16 secret at N = 4096 is weaker, not stronger, against
+hybrid dual attacks. These are honest **cost models**, not deployable parameter
+sets, and nothing in this document changes that.
+
+**8. Are the total Q and P valid at N = 2^12?** `Q = 107 ≤ 109` on its own, but
+the check is on `PQ` and the smallest legal `P` is 41. Not valid.
+
+## 7bis. Does ring switching actually make the products cheaper? **No.**
+
+The premise behind the whole low-ring island is that a matrix product wants the
+smallest ring it can get. `benchmark/profile_ring_cost.cpp` tests it by dividing
+a call's wall time by the matrix work that call performs, which is the only way
+to compare rings — a smaller ring makes each call cheaper *and* makes each call
+do proportionally less. The two algorithms do different amounts of work per call
+and the difference is a factor of `k/2`, so they are normalised separately:
+
+* `ccmm` multiplies two `d × d` encryptions, `k/2` batched: `(k/2)·d³ = N·d²/2`.
+* `rectangular_pcmm` multiplies a `d × (N/2)` encryption by an `(N/2) × (N/2)`
+  plaintext: `(k/2)²·d³ = N²·d/4`.
+
+A6000, GPU 2, `d = 128`, 4 limbs, one 45-bit special prime, best of 3:
+
+| logN | ccmm ns/MAC | rel | rect pcmm ns/MAC | rel | Galois keys for Alg 5 |
+|---|---|---|---|---|---|
+| 12 | 1.642 | 1.00× | 1.821 | 1.00× | 2047 |
+| 13 | 0.973 | **0.59×** | 1.616 | **0.89×** | 4095 |
+| 14 | 0.841 | **0.51×** | *OOM* | — | 8191 |
+| 15 | 0.813 | 0.50× | — | — | 16383 |
+| 16 | 0.837 | 0.51× | — | — | 32767 |
+
+**Both products are cheaper per unit of matrix work at a LARGER ring.** The CCMM
+is 2× cheaper at logN ≥ 14 than at logN 12 and then flat; the rect PCMM is 1.12×
+cheaper at logN 13 than at logN 12. Ring switching *down* does not reduce the
+cost of either — it increases it.
+
+That is not a contradiction of the theory, it is the theory. A key switch costs
+`O(N log N)` per limb pair, and the key-switch **count** per call is `~4d` for
+`ccmm` and `~N/2` for `rectangular_pcmm`; divide either by that call's MACs and
+the ring cancels, leaving only `log N` and device occupancy. Occupancy is what
+the table is actually showing: at logN 12 a CCMM issues 512 key switches on
+4096-coefficient ciphertexts and is launch-bound, and the small ring loses.
+
+### So why a low ring at all? Feasibility, not speed
+
+`rectangular_pcmm` needs `N/2 − 1` Galois keys — a count that depends on the ring
+**alone**. The sweep did not stop at logN 14 by choice: it died with
+`rmm::out_of_memory` trying to grow past a 40.8 GiB pool for 8191 keys at four
+limbs. At logN 16 the same set is 32767 keys and around 172 GB. **Algorithm 5
+cannot be keyed at a high ring at any speed**, and that — not throughput — is the
+entire argument for the low ring.
+
+`ccmm` has no such problem: its three CMTs are all at layout `(N, d)` and ask for
+`d` keys, independent of `N`.
+
+### Which changes the better option
+
+The proposal ring-switches **Stage 3 wholesale** — CCMM then rect PCMM, two
+levels, both low. The measurement says to split them:
+
+* **Batch CCMM stays high.** It has no key-count constraint and is 2× cheaper per
+  MAC there. Ring-switching it down pays a conversion to make it slower.
+* **Only Algorithm 5 goes low**, because only Algorithm 5 has to.
+
+And Algorithm 5 is **one level**. So the low-ring island needs exactly one
+multiplicative level — which is precisely the row §7's table says N = 4096 *can*
+carry at 128-bit security, at a 2^36 scale, and it is the regime Kang's own S12
+parameter set sits in. **The two-level requirement that made 41 + 33 + 33
+impossible at logN 12 was an artefact of pairing the two products in the same
+island, and it dissolves when they are separated.**
+
+Two things this does not settle, and they are the cost of the split:
+1. §4's no-conversion property between Algorithm 4 and Algorithm 5 holds *at one
+   ring*. A ring switch between them re-introduces a boundary, and whether the
+   descent preserves a matrix encryption is unverified — ring switching still
+   does not exist in either direction.
+2. `Llama3RectOperator::project` hardcodes `BlockAxis::coefficient`, so the
+   CCMM → PCMM hand-off is not reachable from the wrapper today regardless.
 
 ### Closest valid alternative
 
