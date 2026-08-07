@@ -255,6 +255,26 @@
 // product the activation was heading for anyway -- two host-side numbers, so
 // the scaling that makes the refresh sound costs no level of its own.
 //
+// Measured at d = 64, d_model 2048, hidden 2048, N = 4096, seven seams, with
+// the narrow-track refreshes and the folds on -- one A6000, three circuits:
+//
+//   seam on the hidden,     35 limbs ... 305.9 s   stretch 9
+//   seam on the activation, 35 limbs ... 301.1 s   stretch 8, chain now overlong
+//   seam on the activation, 34 limbs ... 261.9 s   stretch 8, -14.4%
+//
+// The middle row is the move on its own and it is already slightly ahead: the
+// product moves ABOVE the seam so from_slots and the down projection run at
+// four fewer limbs, which buys more than the product loses by running at seven
+// instead of one. The bottom row is the limb, and it is worth far more than the
+// L^2 of key switching suggests, for the reason the chain note above gives --
+// a refresh hands back CHAIN LESS 25, so a limb off 35 is a limb off a working
+// window of 10.
+//
+// Both FFN stretches are 8 now (fit-side 8, tail-side 8, balanced), and the
+// attention's 7 is next. Going below 8 needs the SiLU in four levels, which
+// needs B <= 6.1, which the model does not offer at 10.8 -- or a second wide
+// bootstrap on the up branch, which is not obviously worth one.
+//
 // THE REAL SHAPE, MEASURED
 // ------------------------
 // That table is one block at d = 64 and half the width. Llama-3 8B's own
