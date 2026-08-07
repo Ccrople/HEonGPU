@@ -221,6 +221,40 @@
 // chain spends the margin. At half the width that is a real choice, since 37
 // buys nothing there; at the real width it is not, since it buys 11.7%.
 //
+// THE SWIGLU'S LEVEL IS IN THE SEAM, NOT IN THE FIT
+// -------------------------------------------------
+// Once the narrow-track refresh takes the SoftMax down to 7, the SwiGLU is the
+// worst stretch at 9, and it decomposes as projection 1 + crossing 2 + SiLU 5 +
+// gate product 1. Three of those four are load-bearing:
+//
+//   - the crossing is 2 because it is two transforms, the row bridge and the
+//     block map, and the block map is a subring DFT rather than a permutation.
+//     That matters: a permutation would COMMUTE with a slot-wise SiLU and with
+//     a Hadamard product, so the one in to_slots and the one in from_slots
+//     would cancel and the SwiGLU would need neither. A DFT does not commute,
+//     and the fit genuinely needs its argument in the value domain.
+//
+//   - the SiLU is 5 because 5 is what 12 bits over Table 2's range costs, and
+//     no rearrangement of the polynomial beats it. SiLU(x) = x/2 + h(x^2) with
+//     h even, which halves the degree -- 31 in x becomes 15 in x^2 at exactly
+//     the same error -- and then the squaring spends exactly the level the
+//     halving saved. Measured on the host, that tie holds at EVERY bound: a
+//     degree-31 direct fit and a degree-15 fit in x^2 both reach B = 14.1 in 5
+//     levels, both reach 6.1 in 4. The only lever on the fit is the range, and
+//     the range is a measurement of the model: 10.8, which wants 31.
+//
+//   - the projection is one plaintext product.
+//
+// The gate product is the one that need not be where it is. It does not have to
+// sit ABOVE the seam. Refreshing the ACTIVATION instead of the hidden is the
+// same single bootstrap one level earlier, and it takes the stretch to 8 --
+// which is where the second-worst stretch, the attention's 7, starts to matter.
+// RectFeedForwardConfig::refresh_activation is that move. It is legal because
+// the fit can be given a gain of 1/B, landing the activation on the [-1, 1] a
+// bootstrap assumes (Section 3.1.3), with the up weight carrying B back on the
+// product the activation was heading for anyway -- two host-side numbers, so
+// the scaling that makes the refresh sound costs no level of its own.
+//
 // THE REAL SHAPE, MEASURED
 // ------------------------
 // That table is one block at d = 64 and half the width. Llama-3 8B's own
@@ -455,12 +489,16 @@ namespace heongpu
                 bool mid = true;
                 /// The normalised stream, before the gate and up projections.
                 bool after_feed_forward_norm = true;
-                /// The SwiGLU hidden, after the SiLU and the gate product.
+                /// The SwiGLU hidden, after the SiLU and the gate product --
+                /// or, with RectFeedForwardConfig::refresh_activation, on the
+                /// activation just before that product.
                 ///
                 /// The SwiGLU half is 14 levels with the SiLU at the paper's
                 /// degree 31, so it is this seam or a degree nobody fits a
                 /// SiLU at. Splitting here rather than before the SiLU keeps
-                /// the two stretches at 10 and 4 instead of 3 and 11.
+                /// the two stretches at 10 and 4 instead of 3 and 11; taking
+                /// it one level earlier still, on the activation, makes them
+                /// 8 and 8 for the same single bootstrap.
                 bool feed_forward_hidden = true;
 
                 /// Refreshes one block takes with these flags.
@@ -803,6 +841,29 @@ namespace heongpu
                 /// scaling is free where the map is otherwise the one
                 /// plaintext product the fit pays before its series.
                 bool fold_silu_domain_into_gate = false;
+                /// Take the feed-forward seam on the ACTIVATION, before the
+                /// gate product, rather than on the hidden after it.
+                ///
+                /// It is the same seam and the same one bootstrap -- only
+                /// earlier by one level -- and that level is the whole point:
+                /// the stretch that sets the chain runs from the norm's
+                /// refresh to whatever the seam lands on, so moving the seam
+                /// up the gate product takes it from 9 levels to 8. Nothing
+                /// downstream notices, because the product it used to precede
+                /// still happens, just below the seam instead of above it.
+                ///
+                /// The activation leaves the fit on [-B, B] and a bootstrap
+                /// wants [-1, 1] (Section 3.1.3), so the SiLU is fitted with
+                /// a gain of 1/activation_scale() and the up weight carries
+                /// the factor back. Both are host-side numbers: the scaling
+                /// that makes the refresh legal costs no level at all.
+                bool refresh_activation = false;
+                /// The bound the activation is scaled onto for that refresh;
+                /// 0 takes silu_bound, which is the range the fit already
+                /// covers and so an upper bound on what it can return.
+                /// Setting the measured activation peak instead recovers the
+                /// log2 of the ratio in bootstrap precision.
+                double activation_bound = 0.0;
                 /// Hidden GROUPS held at once; 0 takes the whole width.
                 ///
                 /// The Hadamard product needs both branches in both encodings at

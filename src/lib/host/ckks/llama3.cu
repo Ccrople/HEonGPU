@@ -1026,12 +1026,20 @@ namespace heongpu
         Ciphertext<Scheme::CKKS>
         Llama3Operator::silu(Ciphertext<Scheme::CKKS>& ct, double bound,
                              int degree, Relinkey<Scheme::CKKS>& relin_key,
-                             bool pre_scaled)
+                             bool pre_scaled, double gain)
         {
+            if (gain == 0.0)
+            {
+                throw std::invalid_argument(
+                    "SiLU gain must not be zero: nothing downstream can "
+                    "divide it back out");
+            }
+
             Range _r("silu");
             return evaluate_function(
-                ct, [](double x) { return x / (1.0 + std::exp(-x)); }, -bound,
-                bound, degree, relin_key, pre_scaled);
+                ct,
+                [gain](double x) { return gain * x / (1.0 + std::exp(-x)); },
+                -bound, bound, degree, relin_key, pre_scaled);
         }
 
         Ciphertext<Scheme::CKKS> Llama3Operator::exp_scaled_negative(

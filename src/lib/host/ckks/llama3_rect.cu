@@ -1256,9 +1256,33 @@ namespace heongpu
         {
             require_uniform(x, "feed_forward");
 
-            const bool refresh_hidden = boot_key != nullptr &&
-                                        refresh != nullptr &&
-                                        refresh->feed_forward_hidden;
+            const bool refresh_seam = boot_key != nullptr &&
+                                      refresh != nullptr &&
+                                      refresh->feed_forward_hidden;
+            // The same seam, one level earlier: on the activation instead of
+            // on the hidden. It is worth a level because the stretch that
+            // sets the chain ends at the seam, and the gate product is the
+            // last thing before it.
+            const bool refresh_act = refresh_seam && config.refresh_activation;
+            const bool refresh_hidden = refresh_seam && !refresh_act;
+
+            // A bootstrap wants its slots on [-1, 1] and the fit returns the
+            // activation on [-B, B], so the fit is given a gain of 1/B and
+            // the up weight carries B back. Both ends are host-side numbers,
+            // so the scaling Section 3.1.3 asks for costs nothing here.
+            double activation_scale = 1.0;
+            if (refresh_act)
+            {
+                activation_scale = config.activation_bound > 0.0
+                                       ? config.activation_bound
+                                       : config.silu_bound;
+                if (!(activation_scale > 0.0))
+                {
+                    throw std::invalid_argument(
+                        "Refreshing the activation needs a positive bound to "
+                        "scale it onto, and silu_bound is not one");
+                }
+            }
 
             Range _r("feed_forward");
 
@@ -1325,7 +1349,11 @@ namespace heongpu
                     for (int j = 0; j < cols; ++j)
                     {
                         gate_w[dst + j] = weights.gate[src + j] * silu_domain;
-                        up_w[dst + j] = weights.up[src + j];
+                        // The up weight undoes the activation's refresh
+                        // scaling on the very product the activation was
+                        // heading for, so the scaling is free at both ends.
+                        up_w[dst + j] =
+                            weights.up[src + j] * activation_scale;
                     }
                 }
 
@@ -1348,22 +1376,46 @@ namespace heongpu
                 gate.column.clear();
                 up.column.clear();
 
-                std::vector<Ciphertext<Scheme::CKKS>> hidden;
-                hidden.reserve(gate_slots.size());
+                // The fit and the gate product are separated so the seam can
+                // sit between them. With activation_scale at 1 the gain is 1
+                // and this is the fused loop it replaces, ciphertext for
+                // ciphertext.
+                std::vector<Ciphertext<Scheme::CKKS>> activated;
+                activated.reserve(gate_slots.size());
                 {
                     Range _r_silu("ffn.silu");
                     for (size_t j = 0; j < gate_slots.size(); ++j)
                     {
-                        Ciphertext<Scheme::CKKS> activated =
-                            batch_.arith().silu(gate_slots[j],
-                                                config.silu_bound,
-                                                config.silu_degree, relin_key,
-                                                fold_silu);
-                        hidden.push_back(batch_.arith().multiply_and_rescale(
-                            activated, up_slots[j], relin_key));
+                        activated.push_back(batch_.arith().silu(
+                            gate_slots[j], config.silu_bound,
+                            config.silu_degree, relin_key, fold_silu,
+                            1.0 / activation_scale));
                     }
                 }
                 gate_slots.clear();
+                note_depth("ffn.activation", activated);
+
+                // The seam, taken before the product: the stretch from the
+                // norm's refresh ends here rather than one level further
+                // down, which is the level this buys.
+                if (refresh_act)
+                {
+                    bootstrap(activated, "ffn.refresh_activation", *boot_key,
+                              relin_key);
+                    note_depth("ffn.refresh_activation", activated);
+                }
+
+                std::vector<Ciphertext<Scheme::CKKS>> hidden;
+                hidden.reserve(activated.size());
+                {
+                    Range _r_product("ffn.gate_product");
+                    for (size_t j = 0; j < activated.size(); ++j)
+                    {
+                        hidden.push_back(batch_.arith().multiply_and_rescale(
+                            activated[j], up_slots[j], relin_key));
+                    }
+                }
+                activated.clear();
                 up_slots.clear();
                 note_depth("ffn.activated", hidden);
 

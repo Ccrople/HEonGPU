@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -1039,6 +1040,120 @@ TEST(HEonGPU, CKKS_Llama3Rect_RefreshedNormSumSavesTheFitLevels)
     // shows the refresh added at most a bootstrap's noise to it.
     EXPECT_LT(aux_path.first, 5e-2);
     EXPECT_LT(std::abs(aux_path.first - inline_path.first), 2e-2);
+}
+
+// The SwiGLU's level, taken from the seam rather than from the fit.
+//
+// The stretch that sets the chain runs from the norm's refresh to the seam, and
+// with the seam on the hidden that is projection 1 + crossing 2 + SiLU 5 +
+// product 1 = 9. None of those four is negotiable: the crossing is a subring
+// DFT and not a permutation, and 5 levels is what a degree-31 fit costs -- which
+// is itself what 12 bits over Table 2's range of 10.8 costs, since halving the
+// degree by fitting the even part in x^2 buys back exactly the level the
+// squaring spends. The product, though, does not have to be ABOVE the seam. Move
+// the seam one level up it and the stretch is 8 for the same single bootstrap.
+//
+// What makes the move legal is the scaling: the activation leaves the fit on
+// [-B, B] and a bootstrap assumes [-1, 1] (Section 3.1.3), so the fit is given a
+// gain of 1/B and the up weight carries B back on the very product the
+// activation was heading for. Both are host-side numbers, so the rescaling that
+// buys the level costs no level of its own. This pins the whole claim: one less
+// level held, the same answer.
+TEST(HEonGPU, CKKS_Llama3Rect_ActivationSeamCostsTheSwigluOneLessLevel)
+{
+    BootFixture fx(35);
+    const int d = BootFixture::d;
+    const int channels = fx.half();
+    const double amp = 1.0 / std::sqrt(static_cast<double>(channels));
+
+    const std::vector<double> x = random_matrix(d, channels, 31311u);
+    const std::vector<double> gate =
+        random_matrix(channels, channels, 32322u, amp);
+    const std::vector<double> up =
+        random_matrix(channels, channels, 33433u, amp);
+    const std::vector<double> down =
+        random_matrix(channels, channels, 34544u, amp);
+
+    const std::vector<double> hg = host_product(x, gate, d, channels, channels);
+    const std::vector<double> hu = host_product(x, up, d, channels, channels);
+    std::vector<double> hidden(hg.size());
+    double widest = 0.0;
+    for (size_t e = 0; e < hg.size(); ++e)
+    {
+        widest = std::max(widest, std::abs(hg[e]));
+        hidden[e] = (hg[e] / (1.0 + std::exp(-hg[e]))) * hu[e];
+    }
+    const std::vector<double> want =
+        host_product(hidden, down, d, channels, channels);
+
+    Rect::RectFeedForwardWeights weights;
+    weights.gate = gate;
+    weights.up = up;
+    weights.down = down;
+
+    Rect::RectFeedForwardConfig config;
+    config.in_channels = channels;
+    config.hidden_channels = channels;
+    config.silu_bound = 6.0;
+    config.silu_degree = 31;
+    // As the block schedule runs it. Without the fold the fit pays a sixth
+    // level for its own affine map and the SwiGLU no longer fits the chain at
+    // all -- which is the measurement this test would otherwise be making.
+    config.fold_silu_domain_into_gate = true;
+    ASSERT_LT(widest, config.silu_bound);
+
+    Rect::RectRefreshConfig refresh;
+    refresh.feed_forward_hidden = true;
+
+    // Both runs start where the schedule puts this half: on the level a
+    // refresh hands back. Anything else measures the fixture instead of the
+    // circuit, because a bootstrap returns to the same depth whatever the
+    // chain has left.
+    auto run = [&](bool on_activation)
+    {
+        int deepest = 0;
+        fx.op->depth_trace = [&deepest](const char* name, int depth)
+        {
+            if (std::strstr(name, "refresh") == nullptr)
+            {
+                deepest = std::max(deepest, depth);
+            }
+        };
+
+        Rect::RectFeedForwardConfig c = config;
+        c.refresh_activation = on_activation;
+
+        heongpu::llama::RectActivation ct =
+            fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+        for (auto& column : ct.column)
+        {
+            fx.op->arith().drop_to_depth(column, 25);
+        }
+        heongpu::llama::RectActivation out =
+            fx.op->feed_forward(ct, weights, c, *fx.galois, *fx.relin,
+                                &*fx.galois, &refresh);
+        fx.op->depth_trace = nullptr;
+
+        const std::vector<double> got =
+            fx.op->decrypt(out, *fx.decryptor, out.column.front().scale());
+        return std::make_pair(worst_diff(want, got), deepest);
+    };
+
+    const auto hidden_seam = run(false);
+    const auto activation_seam = run(true);
+
+    std::cout << "swiglu seam: on the hidden, deepest " << hidden_seam.second
+              << ", error " << hidden_seam.first << "; on the activation, "
+              << "deepest " << activation_seam.second << ", error "
+              << activation_seam.first << std::endl;
+
+    // The level, which is the whole point: the chain has to hold whatever the
+    // deepest ciphertext before a seam reaches, and that is one less here.
+    EXPECT_EQ(hidden_seam.second - activation_seam.second, 1);
+    // And the answer is the same one. The seam moved across a product; it did
+    // not remove one, so neither run has an accuracy argument over the other.
+    EXPECT_LT(hidden_seam.first, 5e-1);
+    EXPECT_LT(activation_seam.first, 5e-1);
 }
 
 // The other level the norm gives up. Fitting 1/sqrt over the summed square

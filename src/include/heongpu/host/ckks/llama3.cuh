@@ -441,11 +441,20 @@ namespace heongpu
              *
              * Section 3.1.3 reports degree 31 after calibration brings the
              * input range down; Table 2 puts that range at about 10.8.
+             *
+             * gain multiplies the fitted function, so the series returns
+             * gain * SiLU(x) for the same levels and the same relative error:
+             * a Chebyshev coefficient is a host-side number and scaling one
+             * costs nothing. A gain of 1/B lands the activation on [-1, 1],
+             * which is what Section 3.1.3 asks of a bootstrap input, and the
+             * factor comes back out on whatever plaintext the activation
+             * meets next.
              */
             Ciphertext<Scheme::CKKS> silu(Ciphertext<Scheme::CKKS>& ct,
                                           double bound, int degree,
                                           Relinkey<Scheme::CKKS>& relin_key,
-                                          bool pre_scaled = false);
+                                          bool pre_scaled = false,
+                                          double gain = 1.0);
 
             /**
              * @brief exp(x / 2^k) for x in [-bound, 0], the y^(0) of the

@@ -247,14 +247,27 @@ class Schedule
         {
             std::cout << "   REFRESH";
             refreshes_++;
+            base_ = depth;
         }
-        else if (last_ >= 0)
+        else
         {
-            const int spent = depth - last_;
-            std::cout << "   spent " << std::setw(3) << spent;
-            if (spent > worst_)
+            if (last_ >= 0)
             {
-                worst_ = spent;
+                std::cout << "   spent " << std::setw(3) << (depth - last_);
+            }
+            // The number that sets the chain is the whole run since the last
+            // refresh, not the step. They differ wherever a stretch is noted
+            // more than once, and a chain cut to the largest STEP is a chain
+            // that runs out in the middle of the largest stretch.
+            if (base_ < 0)
+            {
+                base_ = depth;
+            }
+            const int stretch = depth - base_;
+            std::cout << "   stretch " << std::setw(3) << stretch;
+            if (stretch > worst_)
+            {
+                worst_ = stretch;
                 worst_name_ = name;
             }
         }
@@ -269,6 +282,7 @@ class Schedule
   private:
     int limbs_;
     int last_ = -1;
+    int base_ = -1;
     int worst_ = 0;
     std::string worst_name_;
     int refreshes_ = 0;
@@ -731,6 +745,13 @@ int main(int argc, char* argv[])
         // copy of the query fold. Off by default for comparability.
         c.feed_forward.fold_silu_domain_into_gate =
             EnvFlag("HEONGPU_BOOT_SILU_FOLD", false);
+        // The feed-forward seam on the activation rather than on the hidden:
+        // the same one bootstrap, one level earlier, which is one level off
+        // the stretch that sets the chain. Off by default for comparability.
+        c.feed_forward.refresh_activation =
+            EnvFlag("HEONGPU_BOOT_ACT_SEAM", false);
+        c.feed_forward.activation_bound =
+            EnvDouble("HEONGPU_BOOT_ACT_BOUND", 0.0);
         c.feed_forward.hidden_block_groups =
             EnvInt("HEONGPU_BOOT_HIDDEN_BLOCK_GROUPS", 1);
 
