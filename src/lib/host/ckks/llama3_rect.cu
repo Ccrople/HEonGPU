@@ -620,6 +620,10 @@ namespace heongpu
             {
                 depth_trace(name, ct.front().depth());
             }
+            if (ct_trace && !ct.empty())
+            {
+                ct_trace(name, ct);
+            }
         }
 
         void Llama3RectOperator::fold_scale(std::vector<double>& weight,

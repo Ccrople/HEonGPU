@@ -478,6 +478,22 @@ namespace heongpu
              */
             std::function<void(const char* name, int depth)> depth_trace;
 
+            /**
+             * @brief Report every seam's raw ciphertext, for debugging.
+             *
+             * Called alongside @c depth_trace with the SAME vector, empty by
+             * default and costing nothing then. A caller that decrypts here
+             * gets a generic (slot-decoded) magnitude at every named point,
+             * whatever encoding the ciphertext actually carries -- accurate
+             * enough to see WHERE a value leaves its expected range, not
+             * accurate enough to read the value itself at a rect or matrix
+             * seam. Nothing in this class reads it.
+             */
+            std::function<void(const char* name,
+                               const std::vector<Ciphertext<Scheme::CKKS>>&
+                                   ct)>
+                ct_trace;
+
             // ---------------------------------------------------------------
             // Rotation keys
             // ---------------------------------------------------------------

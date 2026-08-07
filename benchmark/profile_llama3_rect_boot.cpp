@@ -617,6 +617,37 @@ int main(int argc, char* argv[])
     op.depth_trace = [&schedule](const char* name, int depth)
     { schedule(name, depth); };
 
+    // A generic magnitude probe: decode every named seam as ordinary CKKS
+    // slots, whatever encoding it actually carries. A rect or matrix
+    // ciphertext's true values are not what this reads, but a canonical
+    // embedding is bounded-distortion, so a value that has actually blown up
+    // is still visibly huge here -- the only thing this is for. Off by
+    // default; it decrypts, so it costs a secret-key operation per seam.
+    if (EnvFlag("HEONGPU_BOOT_TRACE_VALUES", false))
+    {
+        op.ct_trace = [&](const char* name,
+                          const std::vector<heongpu::Ciphertext<S>>& ct)
+        {
+            double worst = 0.0;
+            for (const auto& c : ct)
+            {
+                heongpu::Ciphertext<S> copy = c;
+                heongpu::Plaintext<S> plain(context);
+                decryptor.decrypt(plain, copy);
+                std::vector<double> values;
+                encoder.decode(values, plain);
+                for (double v : values)
+                {
+                    worst = std::max(worst, std::abs(v));
+                }
+            }
+            std::cout << "[boot] trace " << std::setw(30) << std::left
+                      << name << std::right << " max |slot| "
+                      << std::scientific << std::setprecision(3) << worst
+                      << std::defaultfloat << std::endl;
+        };
+    }
+
     std::cout << "[boot] --- measured region ---" << std::endl;
     cudaProfilerStart();
     RegionTimer whole;
