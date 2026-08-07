@@ -462,6 +462,46 @@ namespace heongpu
                       Galoiskey<Scheme::CKKS>& boot_key,
                       Relinkey<Scheme::CKKS>& relin_key);
 
+            /**
+             * @brief Refresh a RECT column and hand back its SLOT reading.
+             *
+             * The crossing this saves is not merely fused into the bootstrap;
+             * it IS the bootstrap's second stage. A rect column's data occupies
+             * R_N coefficients 0..N/2-1 and nothing above -- see
+             * build_matrix_encryption_coefficients, which writes block t at
+             * i + d*t for t < k/2 only -- and the composition this module
+             * otherwise performs to reach slot form, the d-point row bridge
+             * along the token axis then the k/2-point block_map along the block
+             * axis, is a factorisation of the N/2-point DFT. That is the
+             * transform CoeffToSlot evaluates.
+             *
+             * So bootstrap() followed by to_slots() runs the same DFT three
+             * times: once as CoeffToSlot, once backwards as SlotToCoeff, once
+             * forwards again as the crossing. This entry point runs it once. It
+             * saves the caller the two crossing levels and the bootstrap's
+             * StoC_piece, and it halves EvalMod, because the upper coefficient
+             * half that solo_coeff_to_slot discards was zero to begin with.
+             *
+             * The slot ORDER is the one CoeffToSlot produces, which is not the
+             * one to_slots() produces; slot_reading_permutation() gives the
+             * relabelling between them. Same key and parameter requirements as
+             * bootstrap().
+             */
+            Ciphertext<Scheme::CKKS>
+            bootstrap_to_slots(Ciphertext<Scheme::CKKS>& ct,
+                               Galoiskey<Scheme::CKKS>& boot_key,
+                               Relinkey<Scheme::CKKS>& relin_key);
+
+            /**
+             * @brief Where bootstrap_to_slots leaves entry i + d*t of a column.
+             *
+             * Returns p of length N/2 with p[c] = the slot that coefficient c
+             * lands in. The rect encoding walks the token axis fastest, and
+             * CoeffToSlot reads the coefficient index straight through, so the
+             * two orders differ by the d x (k/2) stride transpose this returns.
+             */
+            std::vector<int> slot_reading_permutation() const;
+
             /** @brief Refresh every ciphertext, in place. */
             void bootstrap(std::vector<Ciphertext<Scheme::CKKS>>& ct,
                            const char* name,

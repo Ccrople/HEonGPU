@@ -577,6 +577,41 @@ namespace heongpu
             return batch_.arith().bootstrap(ct, boot_key, relin_key);
         }
 
+        Ciphertext<Scheme::CKKS> Llama3RectOperator::bootstrap_to_slots(
+            Ciphertext<Scheme::CKKS>& ct, Galoiskey<Scheme::CKKS>& boot_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            // The one place this module does read the encoding. bootstrap()
+            // above is encoding-blind because it puts the polynomial back the
+            // way it found it; this one stops at the slot reading, which is
+            // only the crossing the caller wanted because a rect column is
+            // supported on coefficients 0..N/2-1.
+            return batch_.arith().bootstrap_to_slots(ct, boot_key, relin_key);
+        }
+
+        std::vector<int> Llama3RectOperator::slot_reading_permutation() const
+        {
+            // Coefficient i + d*t of a rect column holds token i of block t.
+            // CoeffToSlot puts coefficient c into slot c, so the block index
+            // ends up on the slow axis where to_slots() puts it on the fast
+            // one. The relabelling is the d x (k/2) stride transpose and
+            // nothing else: no bit reversal, because the factorisation the
+            // crossing uses and the one CoeffToSlot uses agree on everything
+            // but which axis they walk first.
+            const int d = layout_.d;
+            const int blocks = layout_.k / 2;
+            std::vector<int> p(static_cast<size_t>(d) * blocks);
+            for (int t = 0; t < blocks; ++t)
+            {
+                for (int i = 0; i < d; ++i)
+                {
+                    p[static_cast<size_t>(i) + static_cast<size_t>(d) * t] =
+                        t + blocks * i;
+                }
+            }
+            return p;
+        }
+
         void Llama3RectOperator::bootstrap(
             std::vector<Ciphertext<Scheme::CKKS>>& ct, const char* name,
             Galoiskey<Scheme::CKKS>& boot_key,

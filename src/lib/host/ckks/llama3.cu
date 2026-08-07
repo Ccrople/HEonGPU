@@ -3185,6 +3185,18 @@ namespace heongpu
             return regular_bootstrapping(x, boot_key, relin_key);
         }
 
+        Ciphertext<Scheme::CKKS>
+        Llama3Operator::bootstrap_to_slots(Ciphertext<Scheme::CKKS>& x,
+                                           Galoiskey<Scheme::CKKS>& boot_key,
+                                           Relinkey<Scheme::CKKS>& relin_key)
+        {
+            Range _r("bootstrap_to_slots");
+            // Same reason as bootstrap(): ModRaise starts from one prime, and
+            // anything unspent was about to be discarded anyway.
+            drop_to_depth(x, context_->get_ciphertext_modulus_count() - 1);
+            return coeff_to_slot_bootstrapping(x, boot_key, relin_key);
+        }
+
         std::vector<Ciphertext<Scheme::CKKS>>
         Llama3Operator::bootstrap(std::vector<Ciphertext<Scheme::CKKS>>& x,
                                   Galoiskey<Scheme::CKKS>& boot_key,

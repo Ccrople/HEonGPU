@@ -1230,6 +1230,23 @@ namespace heongpu
                       Galoiskey<Scheme::CKKS>& boot_key,
                       Relinkey<Scheme::CKKS>& relin_key);
 
+            /**
+             * @brief Refresh a ciphertext read as coefficients, return slots.
+             *
+             * bootstrap() ends with SlotToCoeff so that it gives back the
+             * encoding it was given. A caller who wanted the slot reading
+             * anyway pays for that undoing and then pays again for the
+             * crossing. This one stops after EvalMod and hands the CoeffToSlot
+             * output straight out, so the bootstrap's own homomorphic DFT does
+             * the caller's conversion. Cheaper by StoC_piece levels, and by
+             * half of EvalMod, since only the lower coefficient half is
+             * carried.
+             */
+            Ciphertext<Scheme::CKKS>
+            bootstrap_to_slots(Ciphertext<Scheme::CKKS>& x,
+                               Galoiskey<Scheme::CKKS>& boot_key,
+                               Relinkey<Scheme::CKKS>& relin_key);
+
             /** @brief Plaintext weights of one whole transformer block. */
             struct TransformerBlockWeights
             {

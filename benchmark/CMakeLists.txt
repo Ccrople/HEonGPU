@@ -17,6 +17,8 @@ set(EXECUTABLES
     llama3_rect_boot_profile profile_llama3_rect_boot.cpp
     llama3_levels_profile profile_llama3_levels.cpp
     boot_precision_sweep profile_boot_precision.cpp
+    ring_cost_profile profile_ring_cost.cpp
+    boot_to_slots_profile profile_boot_to_slots.cpp
 )
 
 function(add_benchmark exe source)

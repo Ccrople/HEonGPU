@@ -7302,6 +7302,140 @@ namespace heongpu
     }
 
     __host__ Ciphertext<Scheme::CKKS>
+    HEArithmeticOperator<Scheme::CKKS>::coeff_to_slot_bootstrapping(
+        Ciphertext<Scheme::CKKS>& input1, Galoiskey<Scheme::CKKS>& galois_key,
+        Relinkey<Scheme::CKKS>& relin_key, const ExecutionOptions& options)
+    {
+        if (!boot_context_generated_)
+        {
+            throw std::invalid_argument(
+                "Bootstrapping operation can not be performed before "
+                "generating Bootstrapping parameters!");
+        }
+
+        // Same entry condition as regular_bootstrapping: ModRaise is only
+        // meaningful from the bottom of the chain.
+        int current_decomp_count = context_->Q_size - input1.depth_;
+        if (current_decomp_count != 1)
+        {
+            throw std::logic_error("Ciphertexts leveled should be at max!");
+        }
+
+        ExecutionOptions options_inner =
+            ExecutionOptions()
+                .set_stream(options.stream_)
+                .set_storage_type(storage_type::DEVICE)
+                .set_initial_location(true);
+
+        gpuntt::ntt_rns_configuration<Data64> cfg_intt = {
+            .n_power = context_->n_power,
+            .ntt_type = gpuntt::INVERSE,
+            .ntt_layout = gpuntt::PerPolynomial,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding = false,
+            .mod_inverse = context_->n_inverse_->data(),
+            .stream = options.stream_};
+
+        gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
+            .n_power = context_->n_power,
+            .ntt_type = gpuntt::FORWARD,
+            .ntt_layout = gpuntt::PerPolynomial,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding = false,
+            .stream = options.stream_};
+
+        DeviceVector<Data64> input_intt_poly(2 * context_->n, options.stream_);
+        Ciphertext<Scheme::CKKS> c_raised =
+            operator_ciphertext(scale_boot_, options_inner.stream_);
+
+        {
+            BootRange _r("boot.mod_raise");
+            input_storage_manager(
+                input1,
+                [&](Ciphertext<Scheme::CKKS>& input1_)
+                {
+                    gpuntt::GPU_INTT(input1.data(), input_intt_poly.data(),
+                                     context_->intt_table_->data(),
+                                     context_->modulus_->data(), cfg_intt, 2,
+                                     1);
+                },
+                options, false);
+
+            mod_raise_kernel<<<dim3((context_->n >> 8), context_->Q_size, 2),
+                               256, 0, options_inner.stream_>>>(
+                input_intt_poly.data(), c_raised.data(),
+                context_->modulus_->data(), context_->n_power);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+            gpuntt::GPU_NTT_Inplace(
+                c_raised.data(), context_->ntt_table_->data(),
+                context_->modulus_->data(), cfg_ntt, 2 * context_->Q_size,
+                context_->Q_size);
+            c_raised.encoding_ = encoding::COEFFICIENT;
+        }
+
+        // The solo transform, not the pair regular_bootstrapping uses. It
+        // returns (c + conj c)/2, which reads the LOWER coefficient half into
+        // the slots; the pair's second output carries the upper half. A caller
+        // whose plaintext polynomial is supported on coefficients 0..N/2-1 --
+        // which is exactly what a batch-matrix column is -- has nothing in that
+        // upper half, so the second output would be an encryption of zero and
+        // every operation on it is wasted. Half the EvalMod work disappears
+        // with it.
+        Ciphertext<Scheme::CKKS> CtoS_result;
+        {
+            BootRange _r("boot.coeff_to_slot");
+            CtoS_result =
+                solo_coeff_to_slot(c_raised, galois_key, options_inner);
+        }
+
+        BootRange _r_evalmod("boot.eval_mod");
+
+        Ciphertext<Scheme::CKKS> ciph_neg_exp =
+            operator_ciphertext(0, options_inner.stream_);
+        Ciphertext<Scheme::CKKS> ciph_exp;
+        {
+            BootRange _r("boot.eval_mod.exp");
+            ciph_exp = exp_scaled(CtoS_result, relin_key, options_inner);
+        }
+
+        Ciphertext<Scheme::CKKS> ciph_sin =
+            operator_ciphertext(0, options_inner.stream_);
+        {
+            BootRange _r("boot.eval_mod.conjugate");
+            conjugate(ciph_exp, ciph_neg_exp, galois_key, options_inner);
+            sub(ciph_exp, ciph_neg_exp, ciph_sin, options_inner);
+        }
+
+        {
+            BootRange _r("boot.eval_mod.scale");
+            current_decomp_count = context_->Q_size - ciph_sin.depth_;
+            cipherplain_multiplication_kernel<<<
+                dim3((context_->n >> 8), current_decomp_count, 2), 256, 0,
+                options_inner.stream_>>>(
+                ciph_sin.data(), encoded_complex_minus_iscale_.data(),
+                ciph_sin.data(), context_->modulus_->data(),
+                context_->n_power);
+            ciph_sin.scale_ = ciph_sin.scale_ * scale_boot_;
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+            ciph_sin.rescale_required_ = true;
+            rescale_inplace(ciph_sin, options_inner);
+        }
+        _r_evalmod.close();
+
+        // No stage 4. regular_bootstrapping ends with SlotToCoeff because it
+        // promises to hand back the representation it was given; this one
+        // promises the slot reading instead, and that is what EvalMod has
+        // already produced. The StoC_piece levels it would have cost stay with
+        // the caller, and so does the homomorphic DFT the caller would
+        // otherwise have had to perform itself to leave the coefficient
+        // encoding.
+        ciph_sin.scale_ = scale_boot_;
+        ciph_sin.encoding_ = encoding::SLOT;
+        return ciph_sin;
+    }
+
+    __host__ Ciphertext<Scheme::CKKS>
     HEArithmeticOperator<Scheme::CKKS>::slim_bootstrapping(
         Ciphertext<Scheme::CKKS>& input1, Galoiskey<Scheme::CKKS>& galois_key,
         Relinkey<Scheme::CKKS>& relin_key, const ExecutionOptions& options)

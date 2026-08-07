@@ -2321,6 +2321,39 @@ namespace heongpu
             Relinkey<Scheme::CKKS>& relin_key,
             const ExecutionOptions& options = ExecutionOptions());
 
+        /**
+         * @brief Refreshes a COEFFICIENT-encoded ciphertext and returns it
+         * SLOT-encoded.
+         *
+         * ModRaise -> CoeffToSlot -> EvalMod, with no closing SlotToCoeff.
+         * regular_bootstrapping runs the fourth stage because it contracts to
+         * return the encoding it was handed; a caller that wanted the slot
+         * reading anyway then pays for a homomorphic DFT twice, once inside the
+         * bootstrap to undo it and once outside to redo it. This entry point
+         * stops after EvalMod, so the CoeffToSlot the bootstrap performs IS the
+         * caller's conversion.
+         *
+         * Only the real half is carried: solo_coeff_to_slot reads coefficients
+         * 0..N/2-1, which is the whole support of a batch-matrix column, so
+         * EvalMod runs once rather than twice.
+         *
+         * @param input1 Input ciphertext, coefficient-encoded, at the bottom of
+         * the chain (exactly one active prime).
+         * @param galois_key Galois key.
+         * @param relin_key Relinearization key.
+         * @param options Execution options.
+         * @return Ciphertext Refreshed, slot-encoded.
+         *
+         * @throws std::invalid_argument if bootstrapping context not
+         * initialized.
+         * @throws std::logic_error if input ciphertext not at maximum depth.
+         */
+        __host__ Ciphertext<Scheme::CKKS> coeff_to_slot_bootstrapping(
+            Ciphertext<Scheme::CKKS>& input1,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key,
+            const ExecutionOptions& options = ExecutionOptions());
+
         using HEOperator<Scheme::CKKS>::coeff_to_slot;
         using HEOperator<Scheme::CKKS>::slot_to_coeff;
     };
