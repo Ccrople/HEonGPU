@@ -43,6 +43,7 @@ namespace heongpu
         template <Scheme S> friend class HELogicOperator;
         template <Scheme S> friend class HEMultiPartyManager;
         template <Scheme S> friend class HEBatchMatrixOperator;
+        template <Scheme S> friend class HERingSwitchOperator;
 
       public:
         HEContextImpl(const sec_level_type = sec_level_type::sec128);

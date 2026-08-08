@@ -68,6 +68,8 @@ namespace heongpu
 
     template <Scheme S> class HEBatchMatrixOperator;
 
+    template <Scheme S> class HERingSwitchOperator;
+
     // Describes the type of encryption scheme to be used.
     enum class scheme_type : std::uint8_t
     {
