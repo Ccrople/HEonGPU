@@ -296,6 +296,10 @@ namespace heongpu
         Ciphertext<Scheme::CKKS> output = allocate_at_level(
             big_, big_q_size_ - under_embedded.depth_, under_embedded);
         big_operators.keyswitch(under_embedded, output, *swk_up_, options);
+        // switch_down returns with its stream drained (its temporaries force
+        // it); returning compose_up the same way keeps the pair symmetric and
+        // keeps wall-clock timings of either direction honest.
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(options.stream_));
         return output;
     }
 
