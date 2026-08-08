@@ -82,15 +82,17 @@ int main()
               << " limbs, shared prefix " << shared << ", iters " << iters
               << std::endl;
 
-    // Big context: 60-bit q0 + 50-bit body, two 61-bit specials (method II —
-    // a single special prime has no key-switch noise budget at logN 16).
+    // Big context: 60-bit q0 + 50-bit body, two 60-bit specials (method II —
+    // a single special prime has no key-switch noise budget at logN 16; and
+    // 60 is MAX_USER_DEFINED_MOD_BIT_COUNT, user-supplied bit sizes cannot
+    // reach the internal 61-bit primes).
     std::vector<int> q_bits{60};
     for (int i = 1; i < limbs; i++)
         q_bits.push_back(50);
 
     auto big = heongpu::GenHEContext<S>(heongpu::sec_level_type::none);
     big->set_poly_modulus_degree(static_cast<size_t>(n_big));
-    big->set_coeff_modulus_bit_sizes(q_bits, {61, 61});
+    big->set_coeff_modulus_bit_sizes(q_bits, {60, 60});
     big->generate();
 
     const auto primes = big->get_key_modulus();

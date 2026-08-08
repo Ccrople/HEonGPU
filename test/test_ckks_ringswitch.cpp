@@ -80,7 +80,7 @@ namespace
             k = n_big / n_small;
 
             big->set_poly_modulus_degree(static_cast<size_t>(n_big));
-            big->set_coeff_modulus_bit_sizes(q_bits, {61, 61});
+            big->set_coeff_modulus_bit_sizes(q_bits, {60, 60});
             big->generate();
 
             const auto primes = big->get_key_modulus();
