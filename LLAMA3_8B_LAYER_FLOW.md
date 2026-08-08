@@ -220,15 +220,96 @@ earlier guess ("a `d × (k/2)` stride permutation, which a DFT factorisation
 absorbs") was half right — the stride part is the crossing's, the reversal is the
 bootstrap's, and only the first was accounted for.
 
-**What that costs.** Bit reversal is free for everything slot-wise — a Chebyshev
-fit, a plaintext mask, a product — provided the plaintext constants are permuted
-to match, which is a host-side relabelling. It is **not** free for anything that
-rotates, and `sum_blocked`, the strided sums inside RMSNorm and the SoftMax, and
-`from_slots` all read a slot geometry that bit reversal destroys. So the 6 levels
-are real but **not yet spendable**: the minimum modification is either those
-reductions reformulated on the reversed index, or the reversal folded into
-`Vandermonde`'s CtoS diagonals — which is where it belongs, since a
-decimation-in-frequency factorisation produces natural order at the same cost.
+#### The reversal never has to be undone — measured
+
+The earlier conclusion here was that the 6 levels were real but not spendable,
+and that the fix was to fold the reversal into `Vandermonde`'s CtoS diagonals.
+**That was the wrong fix.** The reversal does not need removing, because the way
+back out of the island is not `from_slots` but the bootstrap's own fourth stage:
+
+```
+refresh_to_slots   =  ModRaise -> CoeffToSlot -> EvalMod          (stops)
+   ... slot work, on the reversed index ...
+slots_to_rect      =  SlotToCoeff                                 (the inverse)
+```
+
+`SlotToCoeff` is the *same* Vandermonde run backwards, so whatever relabelling
+the forward map applied it inverts by construction — no agreement about twiddle
+conventions, no bit-reversal bookkeeping, nothing to name. `benchmark/profile_slot_island.cpp`
+measures it at logN 12, d 64, 36 limbs:
+
+| | measured |
+|---|---|
+| round trip vs input | gain **1.000002**, worst **8.78e-6**, rel 2.19e-5 |
+| a plain `bootstrap()` vs input (the floor) | gain 1.000002, worst **8.76e-6**, rel 2.19e-5 |
+| depth, island: refresh → close | 0 → **21** → **25** |
+| depth, today: bootstrap → `to_slots` → `from_slots` | 0 → 25 → 27 → **29** |
+| time, 64 columns | refresh 14121 ms + close 3668 ms = **17789 ms**; `bootstrap()` alone 22017 ms |
+
+**The round trip is the identity, to the bootstrap's own error and no worse.**
+Four levels come back on the full crossing, and — the number that matters when
+the island is deep — the slot work starts at depth 21 instead of 27, so it has
+**six more levels of headroom**.
+
+Two things had to be found by measurement, and both would have been silent bugs:
+
+* **The alignment drop is exactly one level.** The pair form of `slot_to_coeff`
+  spends a level folding in the imaginary half and drops the real half to match,
+  and the diagonals are encoded for the level *after* that drop
+  (`generate_encoding_transform_context` encodes at `StoC_start_level + 1`). The
+  solo form has no imaginary half, so nothing spends that level for it. Swept:
+  drop 0 → `max|slot| 1.9e168`, drop 2 → `1.5e138`, drop 1 → correct. The library
+  raises **no error** on the wrong one; `multiply_matrix` just slices the
+  diagonal buffer at the wrong stride.
+* **The diagonals are level-locked**, which makes the fast path correct only for
+  an island in which nothing was spent — i.e. useless. `slots_to_coeff_at_level`
+  builds a second set at the caller's level, cached, at the same `StoC_piece` and
+  `less_key_mode` so `key_indexs_` is unchanged and **the existing boot key still
+  covers it**.
+
+**What the reversal does and does not cost.** Worked out on the index and then
+confirmed: the rect encoding puts token `i` of block `t` at coefficient `i + d*t`
+— token in the low `log2(d)` bits. `to_slots` transposes to slot `t + (k/2)*i`.
+Reversing the whole index reverses the bit string, which swaps the two fields
+*and* reverses each, giving slot `revbits(t) + (k/2)*revbits(i)`. **The field
+assignment is therefore the same as `to_slots`'; only the order within each field
+differs.** So:
+
+* a reduction over one **whole** field is unchanged — `sum_blocked` of span `k/2`
+  sums an aligned run of slot *positions*, and a block's positions are the same
+  set however the data inside them is ordered. RMSNorm's one reduction is exactly
+  that and needed **no reformulation**;
+* a plaintext constant that varies along a field is written at the reversed
+  index — host-side relabelling, free, and it is the single line `island_slot()`;
+* a rotation by **less** than a whole field — a token shift, the SoftMax's row
+  alignment — is *not* preserved, because rotation is additive on the index and
+  bit reversal is not. Those stay on `to_slots`.
+
+Measured: `island_slot(b, u, island=true)` matches the decoded island to
+**7.2e-6**, the natural reading to rel **25** (garbage), and `to_slots` matches
+the natural reading to **7.3e-13**.
+
+#### A whole RMSNorm through the island, against the plaintext answer
+
+`RectRMSNormConfig::fused_refresh` puts the norm on the island: `refresh_to_slots`
+in place of `bootstrap()` + `to_slots()`, the same reduction and the same fit
+untouched, weights placed through `island_slot()`, and `slots_to_rect_at_level`
+in place of `from_slots()`. 2048 channels, degree-15 fit, 36 limbs:
+
+| path | result |
+|---|---|
+| **B, the island** | depth out **33**, 15710 ms, **gain 1.000000, rel 1.99e-5** vs the plaintext norm |
+| **A, today's** | **does not fit in 36 limbs** |
+
+Path A needs `25 (bootstrap) + 2 (to_slots) + 8 (norm) + 2 (from_slots) = 37`.
+It runs out of chain mid-transform, and HEonGPU reports that as a CUDA launch
+failure from the NTT rather than as a level error — worth knowing, because it
+does not look like what it is. Path B needs `21 + 8 + 4 = 33`.
+
+So on this shape the six levels of headroom are not an optimisation, they are
+**the difference between the sublayer fitting and not fitting**. And the
+reduction needed no reformulation, which is the part of the index argument above
+that was load-bearing.
 
 ### The five boundaries
 
@@ -684,13 +765,20 @@ Item 3 is an afternoon. Item 2 is a week. Item 1 is the project.
 
 ## 10. Minimum modifications, in dependency order
 
-| # | change | size | unblocks |
-|---|---|---|---|
-| 1 | expose `BlockAxis` on `Llama3RectOperator::project` | trivial | `C_s2h = 1` instead of 2 |
-| 2 | move the low ring to **logN = 13** | parameter | 128-bit security; 58 → 16 Alg 5 calls |
-| 3 | decide the bootstrap model: **v2 at (41,33) for 12-bit**, or **regular at (60,56) for 20-bit** with a different low ring | decision | resolves the §7.4 conflict |
-| 4 | bootstrap without SlotToCoeff + stride permutation | new algorithm | the one free fusion, `+3` levels |
-| 5 | ring switch down (`Tr`) and up (embed + compose), with keys | new subsystem | the whole flow |
+| # | change | size | unblocks | status |
+|---|---|---|---|---|
+| 1 | expose `BlockAxis` on `Llama3RectOperator::project` | trivial | `C_s2h = 1` instead of 2 | open |
+| 2 | move the low ring to **logN = 13**, or split Stage 3 and stay at 12 | parameter | 128-bit security | open, see §7bis |
+| 3 | decide the bootstrap model: **v2 at (41,33) for 12-bit**, or **regular at (60,56) for 20-bit** with a different low ring | decision | resolves the §7.4 conflict | open |
+| 4 | bootstrap without SlotToCoeff, and a way back that consumes its order | new algorithm | 4 levels on the crossing, 6 of headroom | **done, measured** |
+| 5 | ring switch down (`Tr`) and up (embed + compose), with keys | new subsystem | the whole flow | open |
+
+Item 4 landed as `coeff_to_slot_bootstrapping` / `refresh_to_slots` on the way in
+and `slots_to_coeff_at_level` / `slots_to_rect_at_level` on the way out, wired
+into `RectRMSNormConfig::fused_refresh` and measured by
+`benchmark/profile_slot_island.cpp`; see §5. Its shape changed from the plan: the
+"stride permutation" it was going to need does not exist, because the return
+transform consumes the forward transform's own order.
 
 Until 5 exists, this flow cannot run. Everything above it is worth doing anyway:
-1 and 2 are improvements to the path that runs today.
+1 and 2 are improvements to the path that runs today, and 4 already is one.

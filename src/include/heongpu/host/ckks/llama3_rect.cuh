@@ -487,19 +487,41 @@ namespace heongpu
              * 21 against 27 for bootstrap() plus to_slots(), so SIX levels
              * back, and 221 ms against 526 ms per column.
              *
-             * THE CATCH, AND IT IS NOT RESOLVED HERE. The slot ORDER is
-             * BIT REVERSED, which is what a decimation-in-time factorisation
-             * leaves behind and which to_slots() does not do.
-             * slot_reading_permutation() returns it. That is free for anything
-             * slot-wise -- a Chebyshev fit, a plaintext mask, a product -- as
-             * long as the plaintext constants are permuted to match, which is
-             * a host-side relabelling and costs nothing. It is NOT free for
-             * anything that rotates: sum_blocked, the strided sums inside
-             * RMSNorm and the SoftMax, and from_slots all read a slot geometry
-             * that bit reversal destroys. Consuming this output therefore
-             * needs either those reductions reformulated on the reversed
-             * index, or the reversal folded into Vandermonde's CtoS diagonals,
-             * which is where it belongs and where it is not yet.
+             * THE CATCH. The slot ORDER is BIT REVERSED, which is what a
+             * decimation-in-time factorisation leaves behind and which
+             * to_slots() does not do. slot_reading_permutation() returns it.
+             * Do not hand this output to from_slots(): that crossing reads the
+             * natural order and would silently return a scrambled activation.
+             *
+             * What the reversal does and does not cost, worked out on the
+             * index and confirmed by profile_slot_island:
+             *
+             *   The rect encoding puts token i of block t at coefficient
+             *   i + d*t -- token in the LOW log2(d) bits, block in the high
+             *   ones. to_slots() transposes that to slot t + (k/2)*i, so the
+             *   BLOCK axis becomes the fast one. Bit reversal of the whole
+             *   index reverses the bit string, which swaps the two fields AND
+             *   reverses each: slot revbits(t) + (k/2)*revbits(i). The field
+             *   assignment is therefore the SAME as to_slots' -- block fast,
+             *   token slow -- and only the order within each field differs.
+             *
+             * That distinction is the whole story:
+             *
+             *   * A reduction over one whole field is UNCHANGED. sum_blocked
+             *     of span k/2 sums an aligned run of slot POSITIONS, and the
+             *     positions of a block are the same set however the data
+             *     inside them is ordered. RMSNorm's one reduction is exactly
+             *     that, so it needs no reformulation. Same for the mask, whose
+             *     kept set is the multiples of k/2 either way.
+             *   * A plaintext constant that varies along a field must be
+             *     written at the reversed index. Host-side relabelling, free;
+             *     island_slot() is it.
+             *   * A rotation by less than a whole field -- a token shift, the
+             *     SoftMax's row alignment -- is NOT preserved, because
+             *     rotation is additive on the index and bit reversal is not.
+             *     Those stay on to_slots().
+             *
+             * Close the island with slots_to_rect(), never with from_slots().
              *
              * Same key and parameter requirements as bootstrap().
              */
@@ -507,6 +529,63 @@ namespace heongpu
             bootstrap_to_slots(Ciphertext<Scheme::CKKS>& ct,
                                Galoiskey<Scheme::CKKS>& boot_key,
                                Relinkey<Scheme::CKKS>& relin_key);
+
+            /**
+             * @brief Refresh a whole activation into the island's slot form.
+             *
+             * bootstrap_to_slots column by column, in the order to_slots()
+             * returns, so the two are drop-in alternatives for a caller that
+             * respects the reversed index. The refresh is not an extra cost
+             * here: this entry point is for the seams where the chain has run
+             * out and a bootstrap was going to happen anyway.
+             */
+            std::vector<Ciphertext<Scheme::CKKS>>
+            refresh_to_slots(RectActivation& x,
+                             Galoiskey<Scheme::CKKS>& boot_key,
+                             Relinkey<Scheme::CKKS>& relin_key);
+
+            /**
+             * @brief Close the island: island slots back to a rect activation.
+             *
+             * The inverse of refresh_to_slots, and inverse by construction
+             * rather than by convention -- it is the same Vandermonde run
+             * backwards, so the bit reversal cancels without anyone having to
+             * name it. See Llama3Operator::slots_to_coeff.
+             *
+             * This REPLACES from_slots() on the island path and is cheaper:
+             * from_slots is block_map then the row bridge, two homomorphic
+             * linear maps and two levels, and this is one map of StoC_piece
+             * levels. It is also the only correct way back, since from_slots
+             * reads the natural order.
+             *
+             * @param align_drop See Llama3Operator::slots_to_coeff. The
+             *                   encoded diagonals live at exactly one level
+             *                   and there is no check, so this has to be
+             *                   right; one is right straight out of
+             *                   refresh_to_slots.
+             */
+            RectActivation
+            slots_to_rect(std::vector<Ciphertext<Scheme::CKKS>>& in,
+                          int channels, Galoiskey<Scheme::CKKS>& boot_key,
+                          int align_drop = 1);
+
+            /**
+             * @brief The same close, after the island has actually spent
+             *        levels.
+             *
+             * slots_to_rect above is level-locked to the bootstrap's own StoC
+             * diagonals, which makes it correct only for an island in which
+             * nothing happened -- and there is no reason to open one of those.
+             * This builds the diagonals at whatever level the ciphertexts have
+             * reached, so a norm, a fit or a product can sit inside the
+             * island. Same keys, same cost per call; see
+             * Llama3Operator::slots_to_coeff_at_level.
+             */
+            RectActivation
+            slots_to_rect_at_level(std::vector<Ciphertext<Scheme::CKKS>>& in,
+                                   int channels,
+                                   Galoiskey<Scheme::CKKS>& boot_key,
+                                   int pieces = 0);
 
             /**
              * @brief Where bootstrap_to_slots leaves each coefficient.
@@ -518,6 +597,18 @@ namespace heongpu
              * d x (k/2) stride transpose.
              */
             std::vector<int> slot_reading_permutation() const;
+
+            /**
+             * @brief Slot holding block @p block of token @p token.
+             *
+             * The one index map the island needs. @p island false gives
+             * to_slots' reading, block + (k/2)*token; true gives
+             * bootstrap_to_slots', the same with each field bit reversed.
+             * Everything a caller has to relabel -- RMSNorm's learned scales,
+             * a channel mask, a token mask -- goes through here, and then the
+             * two paths differ nowhere else.
+             */
+            int island_slot(int block, int token, bool island) const;
 
             /** @brief Refresh every ciphertext, in place. */
             void bootstrap(std::vector<Ciphertext<Scheme::CKKS>>& ct,
@@ -788,6 +879,26 @@ namespace heongpu
                 /// moves the fit's levels above the wide track. Needs the
                 /// boot key at the call and no Newton step.
                 bool refresh_sum = false;
+                /// Enter through the bootstrap's own CoeffToSlot and leave
+                /// through its SlotToCoeff, instead of crossing either way.
+                ///
+                /// Set this at a seam where the stream was going to be
+                /// refreshed anyway -- which is every seam this norm sits on,
+                /// since the norm is what the refresh is for. The refresh then
+                /// hands back the slot reading directly and the crossing
+                /// disappears rather than being fused: refresh_to_slots
+                /// instead of bootstrap() then to_slots(), and slots_to_rect
+                /// instead of from_slots().
+                ///
+                /// Do NOT also bootstrap the input before the call; this
+                /// consumes the refresh. Needs the boot key at the call.
+                ///
+                /// The reduction inside is untouched by the reversed order --
+                /// it is a whole-field sum, see the note on
+                /// bootstrap_to_slots -- and the learned scales are placed
+                /// through island_slot(), so nothing else about the norm
+                /// changes.
+                bool fused_refresh = false;
             };
 
             /**
@@ -1063,6 +1174,13 @@ namespace heongpu
             rectangular_weight(const std::vector<double>& weight,
                                int in_channels, int out_channels, int in_group,
                                int out_group, double scale) const;
+
+            /// The shape checks and the empty result the two slots_to_rect
+            /// overloads share. Validates that @p in is a whole number of
+            /// groups covering @p channels.
+            RectActivation
+            empty_rect_for(const std::vector<Ciphertext<Scheme::CKKS>>& in,
+                           int channels) const;
 
             /// One group's columns borrowed as a BatchActivation, so a bridge
             /// call never deep copies a ciphertext just to name its operands.

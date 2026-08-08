@@ -19,6 +19,7 @@ set(EXECUTABLES
     boot_precision_sweep profile_boot_precision.cpp
     ring_cost_profile profile_ring_cost.cpp
     boot_to_slots_profile profile_boot_to_slots.cpp
+    slot_island_profile profile_slot_island.cpp
 )
 
 function(add_benchmark exe source)

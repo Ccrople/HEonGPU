@@ -57,6 +57,7 @@
 #include <heongpu/host/ckks/plaintext.cuh>
 
 #include <functional>
+#include <map>
 #include <vector>
 
 namespace heongpu
@@ -1259,6 +1260,86 @@ namespace heongpu
                                Galoiskey<Scheme::CKKS>& boot_key,
                                Relinkey<Scheme::CKKS>& relin_key);
 
+            /**
+             * @brief Close what bootstrap_to_slots opened: slots back to
+             *        coefficients, in one homomorphic DFT.
+             *
+             * This is the bootstrap's own SlotToCoeff, the stage
+             * coeff_to_slot_bootstrapping declines to run, exposed on its own.
+             * It matters because it is the EXACT inverse of the CoeffToSlot
+             * that opened the island -- same Vandermonde, same factorisation,
+             * same twiddles, same order. Whatever relabelling the forward
+             * transform applied, including the bit reversal a
+             * decimation-in-time factorisation leaves behind, this undoes by
+             * construction and not by agreement about conventions.
+             *
+             * That is the whole point. The alternative way back is the
+             * module's own crossing -- block_map then the row bridge, two
+             * levels -- and that one reads the natural slot order, so it needs
+             * the reversal removed first. This one does not, because it never
+             * sees a natural order to disagree with.
+             *
+             * Costs the StoC_piece levels of the bootstrapping configuration
+             * and no bootstrap: there is no ModRaise here and no EvalMod, only
+             * the linear map. generate_bootstrapping_params must have run, and
+             * @p boot_key must hold bootstrapping_key_indexs.
+             *
+             * @param align_drop Levels to drop before the transform, so the
+             *                   ciphertext meets the encoded diagonals at the
+             *                   one level they were built for. One is right
+             *                   straight out of coeff_to_slot_bootstrapping
+             *                   under REGULAR parameters, because the pair
+             *                   form of this transform spends a level on the
+             *                   imaginary half that the solo form does not.
+             *                   There is no check on this inside the library:
+             *                   the wrong value returns noise rather than an
+             *                   error, which is why it is a parameter and was
+             *                   measured rather than assumed.
+             *
+             * @throws std::invalid_argument if @p x is not slot-encoded.
+             */
+            Ciphertext<Scheme::CKKS>
+            slots_to_coeff(Ciphertext<Scheme::CKKS>& x,
+                           Galoiskey<Scheme::CKKS>& boot_key,
+                           int align_drop = 1);
+
+            /**
+             * @brief The same transform, at whatever level the caller is at.
+             *
+             * The overload above is level-locked and that is not a detail: the
+             * bootstrap's StoC diagonals are encoded once, for the one level
+             * the bootstrap reaches them at, and multiply_matrix slices that
+             * buffer by the ciphertext's own live limb count. So the fast path
+             * closes an island in which NOTHING was spent -- and an island
+             * where nothing is spent is not worth opening.
+             *
+             * This one builds a second set of diagonals at the caller's level,
+             * on first use, and keeps it. After that the cost is the same
+             * transform. The level is read from @p x, so a caller does not
+             * have to know it; the price is that a circuit reaching this at
+             * many different levels pays for many sets, which is why the
+             * cache is keyed and reported rather than hidden.
+             *
+             * The extra diagonals need no extra KEYS. They come from the same
+             * Vandermonde factorisation, at the same StoC_piece and the same
+             * less_key_mode as the bootstrap's own, so key_indexs_ is
+             * identical and @p boot_key already holds every index. Change the
+             * piece count and that stops being true.
+             *
+             * @param pieces Stages to split the transform into, or 0 for the
+             *               bootstrap's own StoC_piece -- which is the value
+             *               that keeps the key set unchanged. Each stage costs
+             *               a level; one more than that goes on the alignment
+             *               drop the pair form takes internally.
+             */
+            Ciphertext<Scheme::CKKS>
+            slots_to_coeff_at_level(Ciphertext<Scheme::CKKS>& x,
+                                    Galoiskey<Scheme::CKKS>& boot_key,
+                                    int pieces = 0);
+
+            /** @brief Levels a transform context has been built for so far. */
+            std::vector<int> slot_transform_levels() const;
+
             /** @brief Plaintext weights of one whole transformer block. */
             struct TransformerBlockWeights
             {
@@ -1597,6 +1678,11 @@ namespace heongpu
             std::vector<Modulus64> primes_;
             int slot_count_;
             double default_scale_;
+            /// Standalone slot -> coefficient transforms, keyed by the level
+            /// their diagonals were encoded for. Built on demand by
+            /// slots_to_coeff_at_level and kept, because the encoding is a
+            /// host-side matrix generation and the level repeats.
+            std::map<int, CKKSEncodingTransformContext> slot_transforms_;
         };
 
     } // namespace llama

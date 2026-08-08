@@ -627,6 +627,128 @@ namespace heongpu
             return p;
         }
 
+        int Llama3RectOperator::island_slot(int block, int token,
+                                            bool island) const
+        {
+            const int step = layout_.batch;
+            const int d = layout_.d;
+            if (block < 0 || block >= step || token < 0 || token >= d)
+            {
+                throw std::invalid_argument(
+                    "A slot of this encoding is a block of a token, and both "
+                    "have to be in range");
+            }
+            if (!island)
+            {
+                // to_slots' reading: the stride transpose, block on the fast
+                // axis.
+                return block + step * token;
+            }
+
+            // The island's: the same two fields, each bit reversed. Reversing
+            // the WHOLE index of coefficient token + d*block gives exactly
+            // this, which is why the fields do not move.
+            auto reverse = [](int v, int width)
+            {
+                int bits = 0;
+                while ((1 << bits) < width)
+                {
+                    bits++;
+                }
+                unsigned r = 0;
+                for (int b = 0; b < bits; ++b)
+                {
+                    r |= ((static_cast<unsigned>(v) >> b) & 1u)
+                         << (bits - 1 - b);
+                }
+                return static_cast<int>(r);
+            };
+            return reverse(block, step) + step * reverse(token, d);
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>>
+        Llama3RectOperator::refresh_to_slots(RectActivation& x,
+                                             Galoiskey<Scheme::CKKS>& boot_key,
+                                             Relinkey<Scheme::CKKS>& relin_key)
+        {
+            require_uniform(x, "refresh_to_slots");
+
+            Range _r("bridge.refresh_to_slots");
+
+            std::vector<Ciphertext<Scheme::CKKS>> out;
+            out.reserve(x.column.size());
+            for (auto& column : x.column)
+            {
+                out.push_back(bootstrap_to_slots(column, boot_key, relin_key));
+            }
+            return out;
+        }
+
+        RectActivation Llama3RectOperator::slots_to_rect_at_level(
+            std::vector<Ciphertext<Scheme::CKKS>>& in, int channels,
+            Galoiskey<Scheme::CKKS>& boot_key, int pieces)
+        {
+            RectActivation out = empty_rect_for(in, channels);
+
+            Range _r("bridge.slots_to_rect");
+            for (auto& c : in)
+            {
+                out.column.push_back(
+                    batch_.arith().slots_to_coeff_at_level(c, boot_key,
+                                                           pieces));
+            }
+            return out;
+        }
+
+        RectActivation Llama3RectOperator::empty_rect_for(
+            const std::vector<Ciphertext<Scheme::CKKS>>& in, int channels) const
+        {
+            const int d = layout_.d;
+            if (in.empty() || in.size() % static_cast<size_t>(d) != 0)
+            {
+                throw std::invalid_argument(
+                    "A rectangular group is exactly layout.d slot ciphertexts, "
+                    "because d is the rank of the module and not a free "
+                    "parameter");
+            }
+            const int groups = static_cast<int>(in.size()) / d;
+            if (groups != groups_for(channels))
+            {
+                throw std::invalid_argument(
+                    "The slot ciphertexts do not cover the channel count they "
+                    "are said to carry");
+            }
+
+            RectActivation out;
+            out.rows = d;
+            out.groups = groups;
+            out.channels = channels;
+            out.column.reserve(in.size());
+            return out;
+        }
+
+        RectActivation Llama3RectOperator::slots_to_rect(
+            std::vector<Ciphertext<Scheme::CKKS>>& in, int channels,
+            Galoiskey<Scheme::CKKS>& boot_key, int align_drop)
+        {
+            RectActivation out = empty_rect_for(in, channels);
+
+            Range _r("bridge.slots_to_rect");
+
+            // Column by column and nothing else. from_slots has to gather a
+            // whole group because block_map mixes the d ciphertexts of it;
+            // this way back does not mix them, because the block axis was
+            // never separated out -- CoeffToSlot took the whole N/2-point
+            // transform in one piece and SlotToCoeff gives it back the same
+            // way.
+            for (auto& c : in)
+            {
+                out.column.push_back(
+                    batch_.arith().slots_to_coeff(c, boot_key, align_drop));
+            }
+            return out;
+        }
+
         void Llama3RectOperator::bootstrap(
             std::vector<Ciphertext<Scheme::CKKS>>& ct, const char* name,
             Galoiskey<Scheme::CKKS>& boot_key,
@@ -919,7 +1041,22 @@ namespace heongpu
             // themselves. bridge.* aggregates every crossing in the circuit,
             // which is the number worth knowing about this path; these say
             // which sublayer paid it.
+            const bool island = config.fused_refresh;
+            if (island && boot_key == nullptr)
+            {
+                throw std::invalid_argument(
+                    "The fused refresh IS the crossing, so it needs the boot "
+                    "key at the call and not merely a Galois key wide enough "
+                    "for the bridge");
+            }
+
             std::vector<Ciphertext<Scheme::CKKS>> slots;
+            if (island)
+            {
+                Range _r_in("rms_norm.refresh_to_slots");
+                slots = refresh_to_slots(x, *boot_key, relin_key);
+            }
+            else
             {
                 Range _r_in("rms_norm.to_slots");
                 slots = to_slots(x, galois_key);
@@ -948,7 +1085,14 @@ namespace heongpu
                                 (c < channels) ? weight[c] : 0.0;
                             for (int u = 0; u < d; ++u)
                             {
-                                flat[b + u * step] = w;
+                                // The one line the island changes. The two
+                                // readings put the same two fields on the same
+                                // two axes and differ only in the order inside
+                                // each, so a learned scale that varies along
+                                // the block axis has to be written at the
+                                // reversed position -- and that is the whole
+                                // of the relabelling.
+                                flat[island_slot(b, u, island)] = w;
                             }
                         }
                         Plaintext<Scheme::CKKS> plain(context_);
@@ -984,6 +1128,20 @@ namespace heongpu
             std::vector<Ciphertext<Scheme::CKKS>> normalised =
                 batch_.arith().rms_norm(slots, weights, slot_config, galois_key,
                                         relin_key, boot_key);
+
+            if (island)
+            {
+                // Never from_slots() here: that crossing reads the natural
+                // order, and this one is reversed. slots_to_rect is the same
+                // Vandermonde the refresh ran forwards, run backwards, so the
+                // reversal cancels rather than having to be undone.
+                //
+                // The at_level form and not the locked one, because the norm
+                // has just spent levels and the locked form's diagonals sit
+                // where the refresh left off.
+                Range _r_out("rms_norm.slots_to_rect");
+                return slots_to_rect_at_level(normalised, channels, *boot_key);
+            }
 
             Range _r_out("rms_norm.from_slots");
             return from_slots(normalised, channels, galois_key);

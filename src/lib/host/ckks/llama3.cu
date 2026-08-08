@@ -3211,6 +3211,107 @@ namespace heongpu
             return coeff_to_slot_bootstrapping(x, boot_key, relin_key);
         }
 
+        Ciphertext<Scheme::CKKS>
+        Llama3Operator::slots_to_coeff(Ciphertext<Scheme::CKKS>& x,
+                                       Galoiskey<Scheme::CKKS>& boot_key,
+                                       int align_drop)
+        {
+            Range _r("slots_to_coeff");
+            if (align_drop < 0)
+            {
+                throw std::invalid_argument(
+                    "A level alignment drops levels or leaves them alone; it "
+                    "cannot invent them");
+            }
+
+            // No drop_to_depth here, and the asymmetry with bootstrap_to_slots
+            // is deliberate: that one has to start from the bottom of the
+            // chain because ModRaise does, this one is a linear map and spends
+            // levels like any other.
+            //
+            // The alignment drop is a different matter and is not optional.
+            // The encoded StoC diagonals live at ONE level -- see
+            // generate_encoding_transform_context, which encodes them at
+            // StoC_start_level + 1 -- and multiply_matrix slices that buffer
+            // by the ciphertext's own live limb count. Hand it a ciphertext
+            // one level too shallow and it reads the diagonals misaligned and
+            // returns noise, without complaining: there is no level check on
+            // this path. The +1 is there because the PAIR form of the
+            // transform spends a level before its matrix multiply, on the i
+            // that folds the imaginary half in, and drops the real half to
+            // match. The solo form has no imaginary half to fold, so nothing
+            // has spent that level for it and it has to be spent here.
+            Ciphertext<Scheme::CKKS> aligned = x;
+            for (int i = 0; i < align_drop; i++)
+            {
+                mod_drop_inplace(aligned);
+            }
+            return solo_slot_to_coeff(aligned, boot_key);
+        }
+
+        std::vector<int> Llama3Operator::slot_transform_levels() const
+        {
+            std::vector<int> out;
+            out.reserve(slot_transforms_.size());
+            for (const auto& entry : slot_transforms_)
+            {
+                out.push_back(entry.first);
+            }
+            return out;
+        }
+
+        Ciphertext<Scheme::CKKS>
+        Llama3Operator::slots_to_coeff_at_level(Ciphertext<Scheme::CKKS>& x,
+                                                Galoiskey<Scheme::CKKS>& boot_key,
+                                                int pieces)
+        {
+            // No encoding check here: Ciphertext's encoding tag is private to
+            // the operator hierarchy and friendship does not inherit. It costs
+            // nothing to leave out, because slot_to_coeff below makes exactly
+            // that check and throws with exactly that message.
+            Range _r("slots_to_coeff_at_level");
+
+            const int level = x.depth();
+            const int stages = (pieces > 0) ? pieces : StoC_piece_;
+
+            auto found = slot_transforms_.find(level);
+            if (found == slot_transforms_.end())
+            {
+                SuffixRange _rb("slots_to_coeff_at_level", "build");
+                // CtoS_start_level is irrelevant here -- nothing calls the
+                // forward half of this context -- but it still has to be a
+                // legal level, so it goes at the top of the chain where it
+                // always is.
+                CKKSEncodingTransformConfig config(stages, stages,
+                                                   /*CtoS_start_level=*/0,
+                                                   /*StoC_start_level=*/level,
+                                                   less_key_mode_);
+                // Constructed in place and filled where it lives: the context
+                // owns device memory, and there is no reason to ask whether it
+                // survives a move.
+                found = slot_transforms_
+                            .emplace(std::piecewise_construct,
+                                     std::forward_as_tuple(level),
+                                     std::forward_as_tuple())
+                            .first;
+                generate_encoding_transform_context(found->second, scale_boot_,
+                                                    config);
+            }
+
+            // The pair form, with an encryption of zero for the half a rect
+            // column does not have. Two things come with it that the solo form
+            // does not offer: it CHECKS the level against the one its
+            // diagonals were built for, where the solo form silently returns
+            // noise; and it performs the alignment drop itself, which is the
+            // drop the other overload has to be told about. The zero costs a
+            // plaintext product and a rescale on a ciphertext that is
+            // identically zero, against a three-stage homomorphic DFT.
+            Ciphertext<Scheme::CKKS> zero(context_);
+            sub(x, x, zero);
+            Ciphertext<Scheme::CKKS> real = x;
+            return slot_to_coeff(real, zero, boot_key, found->second);
+        }
+
         std::vector<Ciphertext<Scheme::CKKS>>
         Llama3Operator::bootstrap(std::vector<Ciphertext<Scheme::CKKS>>& x,
                                   Galoiskey<Scheme::CKKS>& boot_key,
