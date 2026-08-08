@@ -65,6 +65,12 @@
 //   HEONGPU_RING_KEY_CAP  skip rect pcmm above this many
 //                         Galois keys                       20000
 //   HEONGPU_RING_CCMM_ONLY  1 to skip rect pcmm entirely    0
+//   HEONGPU_RING_SPECIAL  special primes in P: 1 is
+//                         KEYSWITCHING_METHOD_I, more is
+//                         METHOD_II with ceil(limbs/special)
+//                         digits, 0 means limbs (dnum = 1)   1
+//   HEONGPU_RING_CHECK    1 to decrypt each product and
+//                         print its max abs error            0
 
 #include <heongpu/heongpu.hpp>
 
@@ -74,6 +80,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
@@ -164,6 +171,15 @@ int main()
     const int reps = EnvInt("HEONGPU_RING_REPS", 3);
     const int key_cap = EnvInt("HEONGPU_RING_KEY_CAP", 20000);
     const bool ccmm_only = EnvInt("HEONGPU_RING_CCMM_ONLY", 0) != 0;
+    // How many special primes P carries, which is what selects the key-switch
+    // method: one is this file's original setting and HEonGPU's
+    // KEYSWITCHING_METHOD_I; more than one selects METHOD_II with
+    // ceil(limbs / special) digits, so special = limbs (or 0 as shorthand) is
+    // the dnum = 1 decomposition every Llama-3 target runs.
+    const int special_req = EnvInt("HEONGPU_RING_SPECIAL", 1);
+    // Decrypt each product and compare against the host, so a method that is
+    // faster by returning noise cannot win the comparison silently.
+    const bool check = EnvInt("HEONGPU_RING_CHECK", 0) != 0;
 
     std::cout << "[ring] d = " << d << ", reps = " << reps
               << ", rect pcmm skipped above " << key_cap << " Galois keys"
@@ -196,11 +212,26 @@ int main()
             const int prime_bits = 40;
             const double scale = std::pow(2.0, prime_bits);
             std::vector<int> q_bits(limbs, prime_bits);
-            // One special prime, which is HEonGPU's KEYSWITCHING_METHOD_I. It
-            // has to be at least as large as the biggest single Q prime,
-            // because coefficient_validator groups Q into chunks of P_size and
-            // demands each chunk fit inside P.
-            std::vector<int> p_bits(1, prime_bits + 5);
+            // Every P prime has to be at least as large as the biggest single
+            // Q prime, because coefficient_validator groups Q into chunks of
+            // P_size and demands each chunk fit inside P.
+            const int special =
+                std::min(limbs, special_req < 1 ? limbs : special_req);
+            std::vector<int> p_bits(special, prime_bits + 5);
+            const int digits = (limbs + special - 1) / special;
+            // A switching key holds one (a, b) pair over Q x P per digit,
+            // which is the size formula in evaluationkey.cu for both methods.
+            const double key_bytes =
+                2.0 * digits * (limbs + special) * n * 8.0;
+            std::cout << "[ring] logN " << log_n << " limbs " << limbs
+                      << ": method "
+                      << (special == 1 ? std::string("I")
+                                       : "II/dnum" + std::to_string(digits))
+                      << " (" << special << " special primes), "
+                      << std::fixed << std::setprecision(2)
+                      << (key_bytes / (1024.0 * 1024.0))
+                      << " MiB per switching key" << std::defaultfloat
+                      << std::endl;
 
             heongpu::HEContext<S> context =
                 heongpu::GenHEContext<S>(heongpu::sec_level_type::none);
@@ -214,6 +245,7 @@ int main()
             heongpu::Publickey<S> pub(context);
             keygen.generate_public_key(pub, secret);
             heongpu::HEEncryptor<S> encryptor(context, pub);
+            heongpu::HEDecryptor<S> decryptor(context, secret);
             heongpu::HEEncoder<S> encoder(context);
 
             heongpu::BatchMatrixLayout layout(n, d);
@@ -255,13 +287,45 @@ int main()
                 heongpu::llama::BatchActivation B =
                     batch.encrypt(bb, d, d, encryptor, scale);
 
+                std::unique_ptr<heongpu::llama::BatchActivation> C;
                 p.ccmm_ms = BestMs(
                     [&]()
                     {
-                        heongpu::llama::BatchActivation C = batch.matmul(
-                            A, B, "ring.ccmm", ccmm_galois, relin);
+                        C = std::make_unique<heongpu::llama::BatchActivation>(
+                            batch.matmul(A, B, "ring.ccmm", ccmm_galois,
+                                         relin));
                     },
                     reps);
+
+                if (check)
+                {
+                    const std::vector<std::vector<double>> got = batch.decrypt(
+                        *C, decryptor, C->column.front().scale());
+                    double err = 0.0;
+                    for (int t = 0; t < blocks; ++t)
+                        for (int i = 0; i < d; ++i)
+                            for (int j = 0; j < d; ++j)
+                            {
+                                double want = 0.0;
+                                for (int m = 0; m < d; ++m)
+                                    want += ba[t][static_cast<std::size_t>(i) *
+                                                      d +
+                                                  m] *
+                                            bb[t][static_cast<std::size_t>(m) *
+                                                      d +
+                                                  j];
+                                err = std::max(
+                                    err,
+                                    std::abs(
+                                        got[t][static_cast<std::size_t>(i) *
+                                                   d +
+                                               j] -
+                                        want));
+                            }
+                    std::cout << "[ring]   ccmm max abs error "
+                              << std::scientific << std::setprecision(3)
+                              << err << std::defaultfloat << std::endl;
+                }
             }
 
             // ---------------------------------------------------------------
@@ -280,6 +344,12 @@ int main()
                 std::vector<int> rect_shifts = rect.rotation_indices();
                 heongpu::Galoiskey<S> rect_galois(context, rect_shifts);
                 keygen.generate_galois_key(rect_galois, secret);
+                std::cout << "[ring]   rect galois keys: " << rect_keys
+                          << " indices, " << std::fixed
+                          << std::setprecision(2)
+                          << (rect_keys * key_bytes /
+                              (1024.0 * 1024.0 * 1024.0))
+                          << " GiB" << std::defaultfloat << std::endl;
 
                 const std::vector<double> x = RandomMatrix(
                     static_cast<std::size_t>(d) * half, 0.5, rng);
@@ -288,13 +358,40 @@ int main()
                 heongpu::llama::RectActivation X =
                     rect.encrypt(x, half, encryptor, scale);
 
+                std::unique_ptr<heongpu::llama::RectActivation> Y;
                 p.rect_ms = BestMs(
                     [&]()
                     {
-                        heongpu::llama::RectActivation Y = rect.project(
-                            X, w, half, half, "ring.rect", rect_galois);
+                        Y = std::make_unique<heongpu::llama::RectActivation>(
+                            rect.project(X, w, half, half, "ring.rect",
+                                         rect_galois));
                     },
                     reps);
+
+                if (check)
+                {
+                    const std::vector<double> got = rect.decrypt(
+                        *Y, decryptor, Y->column.front().scale());
+                    double err = 0.0;
+                    for (int i = 0; i < d; ++i)
+                        for (int o = 0; o < half; ++o)
+                        {
+                            double want = 0.0;
+                            for (int c = 0; c < half; ++c)
+                                want +=
+                                    x[static_cast<std::size_t>(i) * half + c] *
+                                    w[static_cast<std::size_t>(c) * half + o];
+                            err = std::max(
+                                err,
+                                std::abs(
+                                    got[static_cast<std::size_t>(i) * half +
+                                        o] -
+                                    want));
+                        }
+                    std::cout << "[ring]   rect max abs error "
+                              << std::scientific << std::setprecision(3)
+                              << err << std::defaultfloat << std::endl;
+                }
             }
 
             points.push_back(p);
