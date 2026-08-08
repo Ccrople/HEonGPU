@@ -492,3 +492,86 @@ TEST(CkksRingSwitch, Alg5OnSwitchedDataMatchesReference)
     std::cout << "Alg 5 on ring-switched data, worst error: " << worst
               << std::endl;
 }
+
+// The configuration the subsystem exists for: the small context carries a
+// STRICT bottom prefix of the big chain. At the top of the big chain the
+// switch must refuse (no corresponding small level exists); after dropping to
+// the shared window it must work, land at small depth 0, and return to the
+// matching big level.
+TEST(CkksRingSwitch, StrictPrefixChainGuardsAndSwitches)
+{
+    RingFixture f(13, 12, {60, 50, 50, 50}, 2);
+    const double scale = std::pow(2.0, 40);
+
+    const std::vector<double> m = f.random_message(f.n_big, 6);
+    heongpu::Ciphertext<S> ct = f.encrypt_big_coeff(m, scale);
+
+    // l = 4 > shared 2: outside the shared prefix, and it must throw BEFORE
+    // any key switch touches the data.
+    EXPECT_THROW(f.rs->switch_down(ct, *f.ops), std::invalid_argument);
+
+    heongpu::Ciphertext<S> d1(f.big);
+    f.ops->mod_drop(ct, d1);
+    heongpu::Ciphertext<S> d2(f.big);
+    f.ops->mod_drop(d1, d2);
+    ASSERT_EQ(d2.depth(), 2); // l = 2 = the whole small chain
+
+    std::vector<heongpu::Ciphertext<S>> parts =
+        f.rs->switch_down(d2, *f.ops);
+    ASSERT_EQ(parts[0].depth(), 0);
+
+    heongpu::Ciphertext<S> back = f.rs->compose_up(parts, *f.ops);
+    EXPECT_EQ(back.depth(), 2);
+
+    std::vector<double> got = f.decrypt_big_coeff(back);
+    EXPECT_LT(max_abs_diff(got, m, f.n_big), 1e-4);
+}
+
+// Every documented refusal, exercised once. These are the guards that keep a
+// context mix-up loud instead of silently producing noise.
+TEST(CkksRingSwitch, ValidationRejectsMisuse)
+{
+    RingFixture f(13, 12, {60, 50, 50}, 3);
+    const double scale = std::pow(2.0, 40);
+
+    const std::vector<double> m = f.random_message(f.n_big, 7);
+    heongpu::Ciphertext<S> ct = f.encrypt_big_coeff(m, scale);
+    std::vector<heongpu::Ciphertext<S>> parts =
+        f.rs->switch_down(ct, *f.ops);
+
+    // Wrong input count.
+    {
+        std::vector<heongpu::Ciphertext<S>> fewer = parts;
+        fewer.pop_back();
+        EXPECT_THROW(f.rs->compose_up(fewer, *f.ops), std::invalid_argument);
+    }
+
+    // Mismatched levels across the inputs.
+    {
+        std::vector<heongpu::Ciphertext<S>> bad = parts;
+        heongpu::Ciphertext<S> dropped(f.small);
+        f.small_ops->mod_drop(bad[0], dropped);
+        bad[0] = std::move(dropped);
+        EXPECT_THROW(f.rs->compose_up(bad, *f.ops), std::invalid_argument);
+    }
+
+    // Big-context ciphertexts offered as compose inputs: a big ciphertext is
+    // large enough to pass any size check, so only the ring-identity guard
+    // stands between this mistake and silent noise.
+    {
+        std::vector<heongpu::Ciphertext<S>> wrong_ring(
+            static_cast<size_t>(f.k), ct);
+        EXPECT_THROW(f.rs->compose_up(wrong_ring, *f.ops),
+                     std::invalid_argument);
+    }
+
+    // Keys not generated yet.
+    {
+        heongpu::HERingSwitchOperator<S> bare(f.big, f.small);
+        EXPECT_THROW(bare.switch_down(ct, *f.ops), std::logic_error);
+    }
+
+    // Contexts in the wrong order: the big ring must be the bigger one.
+    EXPECT_THROW(heongpu::HERingSwitchOperator<S>(f.small, f.big),
+                 std::invalid_argument);
+}

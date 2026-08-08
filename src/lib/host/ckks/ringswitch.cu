@@ -165,7 +165,7 @@ namespace heongpu
     }
 
     Ciphertext<Scheme::CKKS>
-    HERingSwitchOperator<Scheme::CKKS>::allocate_at_level(
+    HERingSwitchOperator<Scheme::CKKS>::metadata_at_level(
         const HEContext<Scheme::CKKS>& ctx, int limbs,
         const Ciphertext<Scheme::CKKS>& like) const
     {
@@ -182,9 +182,40 @@ namespace heongpu
         c.relinearization_required_ = false;
         c.ciphertext_generated_ = true;
         c.storage_type_ = storage_type::DEVICE;
-        c.memory_set(DeviceVector<Data64>(static_cast<size_t>(2) * limbs *
-                                          ctx->n));
         return c;
+    }
+
+    Ciphertext<Scheme::CKKS>
+    HERingSwitchOperator<Scheme::CKKS>::allocate_at_level(
+        const HEContext<Scheme::CKKS>& ctx, int limbs,
+        const Ciphertext<Scheme::CKKS>& like, cudaStream_t stream) const
+    {
+        Ciphertext<Scheme::CKKS> c = metadata_at_level(ctx, limbs, like);
+        c.memory_set(DeviceVector<Data64>(
+            static_cast<size_t>(2) * limbs * ctx->n, stream));
+        return c;
+    }
+
+    void HERingSwitchOperator<Scheme::CKKS>::validate_big_input(
+        const Ciphertext<Scheme::CKKS>& input, int active_primes) const
+    {
+        if (active_primes < 1 || active_primes > small_q_size_)
+            throw std::invalid_argument(
+                "active prime count must lie within the shared chain prefix");
+        if (input.ring_size_ != n_big_ ||
+            input.coeff_modulus_count_ != big_q_size_)
+            throw std::invalid_argument(
+                "input is not a big-context ciphertext");
+        if (!input.in_ntt_domain_)
+            throw std::invalid_argument("input must be in NTT domain");
+        if (input.rescale_required_ || input.relinearization_required_)
+            throw std::invalid_argument(
+                "spend the pending rescale/relinearisation before switching");
+        if (input.storage_type_ != storage_type::DEVICE)
+            throw std::invalid_argument("input must be device-resident");
+        if (input.device_locations_.size() <
+            static_cast<size_t>(2) * active_primes * n_big_)
+            throw std::invalid_argument("invalid ciphertext size");
     }
 
     std::vector<Ciphertext<Scheme::CKKS>>
@@ -197,13 +228,16 @@ namespace heongpu
             throw std::logic_error("ring switch keys are not generated");
 
         const int l = big_q_size_ - input.depth_;
-        if (l < 1 || l > small_q_size_)
-            throw std::invalid_argument(
-                "active prime count must lie within the shared chain prefix");
+        // Validate BEFORE the key switch: keyswitch itself never checks the
+        // NTT-domain flag and would happily key-switch a coefficient-domain
+        // input into garbage first.
+        validate_big_input(input, l);
 
         // Step 1: sk_big -> s'(X^k), the only step that touches the algebra.
+        // The output ciphertext carries metadata only — the switchkey
+        // pipeline installs its own right-sized buffer.
         Ciphertext<Scheme::CKKS> under_embedded =
-            allocate_at_level(big_, l, input);
+            metadata_at_level(big_, l, input);
         big_operators.keyswitch(input, under_embedded, *swk_down_, options);
 
         return split_embedded(under_embedded, options);
@@ -214,19 +248,7 @@ namespace heongpu
         const Ciphertext<Scheme::CKKS>& input, const ExecutionOptions& options)
     {
         const int l = big_q_size_ - input.depth_;
-        if (l < 1 || l > small_q_size_)
-            throw std::invalid_argument(
-                "active prime count must lie within the shared chain prefix");
-        if (!input.in_ntt_domain_)
-            throw std::invalid_argument("input must be in NTT domain");
-        if (input.rescale_required_ || input.relinearization_required_)
-            throw std::invalid_argument(
-                "spend the pending rescale/relinearisation before switching");
-        if (input.storage_type_ != storage_type::DEVICE)
-            throw std::invalid_argument("input must be device-resident");
-        if (input.device_locations_.size() <
-            static_cast<size_t>(2) * l * n_big_)
-            throw std::invalid_argument("invalid ciphertext size");
+        validate_big_input(input, l);
 
         const cudaStream_t stream = options.stream_;
         const size_t total = static_cast<size_t>(2) * l * n_big_;
@@ -266,7 +288,7 @@ namespace heongpu
         std::vector<Data64*> ptrs(k_);
         for (int j = 0; j < k_; j++)
         {
-            outs.push_back(allocate_at_level(small_, l, input));
+            outs.push_back(allocate_at_level(small_, l, input, stream));
             ptrs[j] = outs[static_cast<size_t>(j)].data();
         }
 
@@ -293,7 +315,7 @@ namespace heongpu
         Ciphertext<Scheme::CKKS> under_embedded =
             interleave_embedded(inputs, options);
 
-        Ciphertext<Scheme::CKKS> output = allocate_at_level(
+        Ciphertext<Scheme::CKKS> output = metadata_at_level(
             big_, big_q_size_ - under_embedded.depth_, under_embedded);
         big_operators.keyswitch(under_embedded, output, *swk_up_, options);
         // switch_down returns with its stream drained (its temporaries force
@@ -316,6 +338,10 @@ namespace heongpu
         const double scale = inputs[0].scale_;
         for (const auto& ct : inputs)
         {
+            if (ct.ring_size_ != n_small_ ||
+                ct.coeff_modulus_count_ != small_q_size_)
+                throw std::invalid_argument(
+                    "compose input is not a small-context ciphertext");
             if (ct.depth_ != depth)
                 throw std::invalid_argument(
                     "all inputs must sit at one level");
@@ -363,7 +389,7 @@ namespace heongpu
         HEONGPU_CUDA_CHECK(cudaGetLastError());
 
         Ciphertext<Scheme::CKKS> composed =
-            allocate_at_level(big_, l, inputs[0]);
+            allocate_at_level(big_, l, inputs[0], stream);
 
         ringswitch_interleave_kernel<<<dim3((n_big_ >> 8), l, 2), 256, 0,
                                        stream>>>(

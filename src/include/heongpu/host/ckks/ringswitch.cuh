@@ -196,11 +196,28 @@ namespace heongpu
                                 ExecutionOptions());
 
       private:
-        /// allocate a ciphertext of `ctx` at the level holding `limbs` active
-        /// primes, metadata copied from `like`, device memory uninitialised.
+        /// Stamp a ciphertext of `ctx` at the level holding `limbs` active
+        /// primes, metadata copied from `like`, with NO device buffer. Used
+        /// for keyswitch outputs: the switchkey pipeline installs its own
+        /// right-sized buffer via memory_set, so pre-allocating one is waste.
+        Ciphertext<Scheme::CKKS>
+        metadata_at_level(const HEContext<Scheme::CKKS>& ctx, int limbs,
+                          const Ciphertext<Scheme::CKKS>& like) const;
+
+        /// metadata_at_level plus an uninitialised device buffer of
+        /// 2·limbs·n words, allocated stream-ordered on `stream` — the same
+        /// stream every kernel that touches it runs on.
         Ciphertext<Scheme::CKKS>
         allocate_at_level(const HEContext<Scheme::CKKS>& ctx, int limbs,
-                          const Ciphertext<Scheme::CKKS>& like) const;
+                          const Ciphertext<Scheme::CKKS>& like,
+                          cudaStream_t stream) const;
+
+        /// The shared entry validation for the big-to-small direction; called
+        /// by switch_down BEFORE its key switch so a bad input cannot be
+        /// key-switched into garbage first, and again by split_embedded for
+        /// direct callers.
+        void validate_big_input(const Ciphertext<Scheme::CKKS>& input,
+                                int active_primes) const;
 
         HEContext<Scheme::CKKS> big_;
         HEContext<Scheme::CKKS> small_;
