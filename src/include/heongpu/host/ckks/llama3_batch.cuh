@@ -100,6 +100,8 @@
 
 #include <complex>
 #include <cstdint>
+#include <map>
+#include <tuple>
 #include <vector>
 
 namespace heongpu
@@ -530,6 +532,7 @@ namespace heongpu
             bridge(std::vector<Ciphertext<Scheme::CKKS>>& in, bool inverse,
                    const char* name, Galoiskey<Scheme::CKKS>& galois_key);
 
+
             /// Refuse columns that have drifted apart in level or scale.
             void require_uniform(const BatchActivation& in,
                                  const char* name) const;
@@ -573,6 +576,60 @@ namespace heongpu
             /// the nodes psi^{i 5^s} are.
             std::vector<std::vector<Complex64>> forward_diagonal_;
             std::vector<std::vector<Complex64>> inverse_diagonal_;
+
+            /// The same diagonals ENCODED, keyed by what an encoding depends
+            /// on: direction, the level it was dropped to, and the prime the
+            /// rescale after it will divide by.
+            ///
+            /// A bridge call converts every column of an activation, and
+            /// require_uniform has already established that they share a level
+            /// and a scale -- so all d columns want the same d plaintexts and
+            /// the uncached code encoded them d times over. That is d^2 full
+            /// encodes per crossing, each one an NTT over the whole live chain,
+            /// and at d = 64 it measured 20.1 s of a 26.6 s QK stage: more than
+            /// the CMT, Algorithm 4 and the SoftMax put together. The arithmetic
+            /// is unchanged; only the number of times it is performed is.
+            ///
+            /// Bounded, because a plaintext is Q_size * N * 8 bytes per limb
+            /// and d of them is not small. The key that matters is the one the
+            /// current call uses, so a handful of entries holds every level a
+            /// block actually visits.
+            std::map<std::tuple<bool, int, uint64_t>,
+                     std::vector<Plaintext<Scheme::CKKS>>>
+                bridge_plain_;
+
+            /// Encoded diagonal sets kept at once, over all levels and both
+            /// directions. Eviction is whole-set and the set is rebuilt on the
+            /// next call, so this trades memory for encodes and never for
+            /// correctness.
+            std::size_t bridge_plain_capacity_ = 4;
+
+            /// Baby steps for the bridge's BSGS split; 0 takes sqrt(d). One
+            /// forces the whole split onto the giant side, which is the
+            /// d - 1 rotations the bridge used to take and is here so the two
+            /// can be measured against each other rather than argued about.
+            /// Must divide d. Changes cost, never the result.
+            int bridge_baby_steps_ = 0;
+
+          public:
+            /// Baby steps the bridge splits its d diagonals into, n1, with
+            /// n2 = d / n1 giant steps; the crossing costs n1 + n2 - 2 key
+            /// switches per column instead of d - 1.
+            int baby_steps() const;
+
+            /// @see bridge_baby_steps_. Set before a crossing; a change
+            /// invalidates the encoded diagonals, which are rebuilt on demand.
+            void set_bridge_baby_steps(int n1)
+            {
+                if (n1 < 0 || (n1 > 0 && layout_.d % n1 != 0))
+                {
+                    throw std::invalid_argument(
+                        "The baby step count must divide d, because the two "
+                        "index sets have to cover the d diagonals exactly");
+                }
+                bridge_baby_steps_ = n1;
+                bridge_plain_.clear();
+            }
         };
 
     } // namespace llama

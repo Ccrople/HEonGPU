@@ -250,6 +250,19 @@ namespace heongpu
             const std::vector<std::vector<Complex64>>& diagonal =
                 inverse ? inverse_diagonal_ : forward_diagonal_;
 
+            // Baby-step / giant-step over the d diagonals. Writing
+            // delta = i*n1 + j splits the one sum into n1 shifts of the SOURCE
+            // and n2 shifts of an accumulator, so the key switches fall from
+            // d - 1 to n1 + n2 - 2 -- 63 to 14 at d = 64, 127 to 22 at d = 128.
+            // The plaintext count is unchanged at d, which is the point: a
+            // plaintext multiply is not what this costs.
+            //
+            // Both index sets are multiples of step and smaller than d*step, so
+            // they are a SUBSET of the shifts bridge_rotation_indices() already
+            // asks for. No new Galois key, at any n1.
+            const int n1 = baby_steps();
+            const int n2 = d / n1;
+
             Range _r_bridge(name);
 
             std::vector<Ciphertext<Scheme::CKKS>> out;
@@ -257,62 +270,162 @@ namespace heongpu
 
             for (auto& source : in)
             {
-                // The d shifted copies are shared by every diagonal of this
-                // column, so they are taken once. This is the only key
-                // switching the bridge does, and it does not grow with the
-                // width of the model.
-                std::vector<Ciphertext<Scheme::CKKS>> rotated;
-                rotated.reserve(d);
+                // The n1 baby shifts are shared by every giant step of this
+                // column, so they are taken once.
+                std::vector<Ciphertext<Scheme::CKKS>> baby;
+                baby.reserve(n1);
                 {
                     SuffixRange _r(name, "rotations");
-                    for (int delta = 0; delta < d; ++delta)
+                    for (int j = 0; j < n1; ++j)
                     {
-                        if (delta == 0)
+                        if (j == 0)
                         {
-                            rotated.push_back(source);
+                            baby.push_back(source);
                         }
                         else
                         {
                             Ciphertext<Scheme::CKKS> shifted(context_);
                             arith_.rotate_rows(source, shifted, galois_key,
-                                               delta * step);
-                            rotated.push_back(std::move(shifted));
+                                               j * step);
+                            baby.push_back(std::move(shifted));
                         }
                     }
                 }
 
                 const double plain_scale = rescale_prime(source);
 
-                Ciphertext<Scheme::CKKS> acc(context_);
-                bool started = false;
+                // The d diagonals depend on the direction, the level and the
+                // prime -- never on the data -- so every column of this call
+                // wants the same d plaintexts. Encoding them once instead of
+                // once per column is where this crossing's cost lived; see the
+                // note on bridge_plain_. rescale_prime returns a modulus, so
+                // its double is an exact integer and safe to key on.
+                const auto plain_key =
+                    std::make_tuple(inverse, source.depth(),
+                                    static_cast<uint64_t>(plain_scale));
+                auto encoded = bridge_plain_.find(plain_key);
+                if (encoded == bridge_plain_.end())
+                {
+                    SuffixRange _r(name, "encode");
+                    if (bridge_plain_.size() >= bridge_plain_capacity_)
+                    {
+                        // Whole-set eviction. The next call that wants this
+                        // level pays the encode again and gets the same
+                        // plaintexts, so the only thing at stake is time.
+                        bridge_plain_.erase(bridge_plain_.begin());
+                    }
+                    // Stored in BSGS order and PRE-ROTATED: entry i*n1 + j is
+                    // diagonal[i*n1 + j] shifted back by the giant step that
+                    // will be applied to the accumulator, which is what makes
+                    // the two shifts compose to the one the diagonal wanted.
+                    // A shift of a known vector is a relabelling on the host.
+                    std::vector<Plaintext<Scheme::CKKS>> plains;
+                    plains.reserve(d);
+                    std::vector<Complex64> shifted(
+                        static_cast<std::size_t>(slot_count_));
+                    for (int i = 0; i < n2; ++i)
+                    {
+                        const int giant = i * n1 * step;
+                        for (int j = 0; j < n1; ++j)
+                        {
+                            const std::vector<Complex64>& src =
+                                diagonal[static_cast<std::size_t>(i) * n1 + j];
+                            for (int p = 0; p < slot_count_; ++p)
+                            {
+                                // rot(v, -giant)[p] = v[p - giant], the inverse
+                                // of the accumulator shift below.
+                                const int q =
+                                    ((p - giant) % slot_count_ + slot_count_) %
+                                    slot_count_;
+                                shifted[static_cast<std::size_t>(p)] =
+                                    src[static_cast<std::size_t>(q)];
+                            }
+                            plains.push_back(
+                                encode(shifted, plain_scale, source.depth()));
+                        }
+                    }
+                    encoded =
+                        bridge_plain_.emplace(plain_key, std::move(plains))
+                            .first;
+                }
+
+                Ciphertext<Scheme::CKKS> total(context_);
+                bool total_started = false;
                 {
                     SuffixRange _r(name, "diagonals");
-                    for (int delta = 0; delta < d; ++delta)
+                    for (int i = 0; i < n2; ++i)
                     {
-                        Plaintext<Scheme::CKKS> plain =
-                            encode(diagonal[delta], plain_scale,
-                                   source.depth());
-
-                        Ciphertext<Scheme::CKKS> term(context_);
-                        arith_.multiply_plain(rotated[delta], plain, term);
-
-                        if (!started)
+                        Ciphertext<Scheme::CKKS> acc(context_);
+                        bool started = false;
+                        for (int j = 0; j < n1; ++j)
                         {
-                            acc = std::move(term);
-                            started = true;
+                            Plaintext<Scheme::CKKS>& plain =
+                                encoded->second[static_cast<std::size_t>(i) *
+                                                    n1 +
+                                                j];
+
+                            Ciphertext<Scheme::CKKS> term(context_);
+                            arith_.multiply_plain(baby[j], plain, term);
+
+                            if (!started)
+                            {
+                                acc = std::move(term);
+                                started = true;
+                            }
+                            else
+                            {
+                                arith_.add_inplace(acc, term);
+                            }
+                        }
+
+                        // The giant shift is a rotation and rotate_rows refuses
+                        // a ciphertext that still owes a rescale, so the rescale
+                        // moves inside the loop. It commutes with the rotation
+                        // and every group is at the same level, so this is n2
+                        // rescales instead of one and not a change of result.
+                        arith_.rescale_inplace(acc);
+
+                        if (i != 0)
+                        {
+                            Ciphertext<Scheme::CKKS> moved(context_);
+                            arith_.rotate_rows(acc, moved, galois_key,
+                                               i * n1 * step);
+                            acc = std::move(moved);
+                        }
+
+                        if (!total_started)
+                        {
+                            total = std::move(acc);
+                            total_started = true;
                         }
                         else
                         {
-                            arith_.add_inplace(acc, term);
+                            arith_.add_inplace(total, acc);
                         }
                     }
-                    arith_.rescale_inplace(acc);
                 }
 
-                out.push_back(std::move(acc));
+                out.push_back(std::move(total));
             }
 
             return out;
+        }
+
+        int Llama3BatchOperator::baby_steps() const
+        {
+            if (bridge_baby_steps_ > 0)
+            {
+                return bridge_baby_steps_;
+            }
+            // d is a power of two, so the balanced split is too. sqrt is the
+            // minimum of n1 + d/n1, and rounding down keeps n1 <= n2 which
+            // puts the cheaper half on the shifts of the accumulator.
+            int n1 = 1;
+            while (n1 * n1 * 2 <= layout_.d)
+            {
+                n1 <<= 1;
+            }
+            return n1;
         }
 
         std::vector<Ciphertext<Scheme::CKKS>>

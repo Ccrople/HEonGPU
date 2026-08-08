@@ -102,7 +102,8 @@ is identically zero.**
 | ring switching logN 16 → 12 | **does not exist** | no `Tr`, no ring-switch key, no embedding anywhere in `src/` |
 | ring-up / composition 12 → 16 | **does not exist** | same |
 | any logN = 16 context on this path | **does not exist** | the rect path is logN = 12 throughout |
-| conversion fused into a bootstrap | **does not exist** | `Llama3RectOperator::bootstrap` is a bare call to stock `regular_bootstrapping` |
+| conversion fused into a bootstrap, RECT | **exists, measured** | `bootstrap_to_slots` / `slots_to_rect_at_level`; §5 |
+| conversion fused into a bootstrap, BATCH | **impossible without the hook below** | measured: the truncated bootstrap returns *coefficients*, and a Kang matrix entry is an R_k **slot**, not a coefficient; §11 |
 | a hook to compose a linear map into CtoS/StoC | **does not exist** | `Vandermonde` (`operator.cuh:1793`) is a fixed FFT factorisation with fixed diagonal index tables |
 
 So the flow as written is **not runnable today**. §7 gives the minimum
@@ -782,3 +783,199 @@ transform consumes the forward transform's own order.
 
 Until 5 exists, this flow cannot run. Everything above it is worth doing anyway:
 1 and 2 are improvements to the path that runs today, and 4 already is one.
+
+---
+
+## 11. The QK → SoftMax seam, traced and measured
+
+Target: `benchmark/profile_attention_layout.cpp`. Parameters: A6000, logN 12,
+d = 64, 36 limbs (60 + 35 × 50), scale 2^50, CtoS 3 / StoC 3 / taylor 11,
+78 rotation indices. Everything below is a reading of the decryption, not of a
+function name.
+
+### 11.1 The layout, boundary by boundary
+
+Shape at logN 12, d = 64: **k/2 = 32 heads of 64 × 64 in one Algorithm 4 call**,
+64 ciphertexts, 2048 useful values each. At logN 13, d = 128 the same call
+carries **32 heads of 128 × 128** — the real 8B attention shape exactly, in one
+call, 128 ciphertexts of 4096 values.
+
+| boundary | ring | encoding | cts | useful/ct | depth | permutation |
+|---|---|---|---|---|---|---|
+| RMSNorm out | logN 12 | RECT | `heads·d / (N/2)` groups × d | N/2 | ⊥ | — |
+| Q, K, V (Alg 5) | logN 12 | RECT | same | N/2 | +1 | — |
+| `to_batch` | logN 12 | BATCH | d per group | (k/2)·d | +3 | — |
+| K^T (Alg 3, CMT) | logN 12 | BATCH | d | (k/2)·d | +0 | — |
+| S = Q K^T (Alg 4) | logN 12 | BATCH | d | (k/2)·d | +1 | — |
+| `to_slots` (bridge) | logN 12 | SLOT | d | (k/2)·d | +1 | **identity, 2048/2048** |
+| post-QK bootstrap | logN 12 | SLOT | d | (k/2)·d | → 25 | none (full BTS is an identity) |
+| SoftMax | logN 12 | SLOT | d | (k/2)·d | +11 | — |
+
+Secret key never changes: there is one context and one ring on this whole path.
+
+**The score index, measured.** Slot `b + (k/2)·u` of part `j` holds
+`S[head b][query u][key j]`, exactly as `to_slots` documents and to
+**worst 1.5e-12** against the host `Q K^T`. The map is **the identity** —
+2048/2048 — and it is **independent of the column**, which is the load-bearing
+part.
+
+### 11.2 The SoftMax invariant: satisfied, and for free
+
+The key axis is **the ciphertext axis**, not a slot axis. Both attention paths
+set `strided = true, stride = slot_count, count = 1`, so the in-ciphertext
+reduction is a no-op and the denominator is a slot-wise sum of the `d` parts.
+Measured consequences:
+
+```
+rows 2048, distinct reduction slots 2048,
+one slot per row YES, no two rows share a group YES
+reduction group of (h, r) = { part j : j in [0, d) } at one fixed slot
+```
+
+So the invariant *all `d` values `S[h][r][:]` lie in one reduction group* holds,
+each group is one slot index across `d` ciphertexts, the groups are disjoint,
+and the reduction costs **zero rotations** — cheaper than the `sum_blocked<128>`
+tree the proposal assumes, which would cost 7 rotations, a mask and 7 more.
+
+A whole causal SoftMax through it, against the host answer: **gain 0.999468,
+worst 4.54e-4**, depth 31 out.
+
+**Any slot permutation applied to every part alike is therefore harmless here**,
+because nothing rotates. Only the causal mask and the row shift are indexed by
+slot, and both are host-side plaintext vectors.
+
+### 11.3 The fused crossing does **not** cross this encoding
+
+`bootstrap_to_slots` — §5's island, which crosses a RECT column at 8.8e-6 —
+returns garbage on a BATCH column: **1978 of 2048 slots do not decode to
+anything that was put in**, the reading is **not** column independent, and it
+matches identity, full bit reversal and per-field reversal **0/2048** apiece.
+
+The diagnosis is exact, not plausible. Make the batch axis constant and the
+transform collapses:
+
+```
+batch axis made constant: live slots 64 of 2048 (expect 64)
+the d values at bit-reversed indices   gain 1.000001   worst 3.68e-06
+```
+
+So `bootstrap_to_slots` returns **the plaintext polynomial's coefficients,
+bit reversed** — which is what it does for RECT too. The difference is what a
+coefficient *means*:
+
+* **RECT** puts value `X[token i][block t]` at coefficient `i + d·t`. A
+  coefficient is a value, so CoeffToSlot is the crossing.
+* **BATCH** (Kang, Definition 2) holds a matrix over `R_k` whose entries are
+  `R_k` **slots**. The `k`-point transform along the batch axis sits between the
+  coefficients and the values, so CoeffToSlot lands one transform short.
+
+The island is therefore exactly the **k = 2** case — Algorithm 5's regime, where
+the batch axis is trivial. Algorithm 4 with k/2 = 32 heads is precisely where it
+fails. Closing that gap needs the batch transform composed into the CtoS
+diagonals, which is the same missing `Vandermonde` hook §3 already lists.
+
+**Consequence: the post-QK refresh must stay a full bootstrap, and the bridge
+must stay a separate map.** The order in the code — bridge, then bootstrap — is
+the right one.
+
+### 11.4 Where the seam's time actually goes, and a 4.4× on it
+
+Measured. Left: logN 12, d = 64, 32 heads of 64 × 64. Right: **logN 13,
+d = 128, 32 heads of 128 × 128 — the real 8B attention shape, one call.**
+
+| stage | 12/64 before | 12/64 after | 13/128 before | 13/128 after | share after |
+|---|---:|---:|---:|---:|---:|
+| K transpose (Alg 3, CMT) | 354.9 | 354.9 | 1301.3 | 1301.3 | 1.1% |
+| **S = Q K^T (Alg 4, CCMM)** | 1332.4 | 1332.4 | 5142.9 | 5142.9 | **4.3%** |
+| `to_slots` bridge | 19920.4 | **4517.3** | 149769.5 | **26805.2** | 22.5% |
+| post-QK bootstrap | 22176.0 | 22176.0 | 85639.0 | 85639.0 | **72.0%** |
+| **stage total** | **43731.2** | **28380.7** | **241852.7** | **118888.3** | |
+| (SoftMax, after) | 4923.7 | 4923.7 | 17947.1 | 17947.1 | |
+
+All times ms. The bridge is **4.41×** at d = 64 and **5.59×** at d = 128 —
+against the 63/14 = 4.5 and 127/22 = 5.8 the key-switch count predicts. The
+whole stage is **1.54×** and **2.03×**.
+
+At the real shape the invariant is unchanged and the arithmetic is exact:
+scores worst **4.00e-12**, rows 4096, distinct reduction slots 4096, one slot
+per row YES, no two rows share a group YES, SoftMax rel **5.98e-3**.
+
+Two changes, both in `Llama3BatchOperator::bridge`:
+
+1. **Baby-step / giant-step over the d diagonals.** Writing `delta = i·n1 + j`
+   splits one sum into `n1` shifts of the source and `n2 = d/n1` shifts of an
+   accumulator: **d − 1 → n1 + n2 − 2 key switches per column**, 63 → 14 at
+   d = 64 and 127 → 22 at d = 128. Both index sets are multiples of `k/2`
+   smaller than `d·(k/2)`, so they are a **subset of the shifts the bridge
+   already holds keys for — no new Galois key at any n1**. The diagonals are
+   pre-rotated on the host, which is a relabelling. `rotate_rows` refuses a
+   ciphertext that still owes a rescale, so the rescale moves inside the giant
+   loop: `n2` rescales instead of one, and they commute with the rotation.
+   Verified equivalent in the same run — n1 = 1 gives worst 3.5e-12 against the
+   host scores and n1 = 8 gives 1.5e-12.
+2. **The encoded diagonals cached** by (direction, level, prime). A crossing
+   converts every column at one level, so all `d` columns wanted the same `d`
+   plaintexts and the old code encoded them `d` times. **Worth 0.4%** — the
+   hypothesis that encoding dominated was wrong, and the rotations are the cost.
+   Kept because it is correct and free, and reported as measured rather than
+   as the win it was expected to be.
+
+**Ring switching targets the 4.7% row.** The bootstrap is 78%.
+
+### 11.5 Parameter feasibility, from the library not from arithmetic
+
+`benchmark/profile_low_ring_params.cpp` builds real contexts at
+`sec_level_type::sec128` and reports what survives `generate()`.
+
+| N | plain chain, best scale per level | with `q0 = scale + 10` (bootstrap-compatible) |
+|---|---|---|
+| **4096** | 1 level @ 2^36 (log PQ 108); **2+ levels: nothing ≥ 2^20** | **nothing, at any level, down to 2^15** |
+| **8192** | 1 @ 2^60, 2 @ 2^54, 3 @ 2^43, 4 @ 2^36, 5 @ 2^31 | 1 @ **2^50, q0 2^60** (log PQ 170); 2 @ 2^49; 3 @ 2^39; 4 @ 2^33 |
+
+The pipeline's own precision `(60, 50, 50 | 60)` is **rejected at both** — it is
+two levels, and two levels at 2^50 need 220 > 218.
+
+So:
+
+* **`N_L = 2^12` is not implementable.** It holds the one Kang level at 2^36,
+  but it cannot produce a ciphertext HEonGPU's bootstrap will accept at all,
+  and the bootstrap is the whole point of composing back up. This is a
+  feasibility result, not a tuning one.
+* **`N_L = 2^13` is.** One Kang level at **exactly the 2^50 the rest of the
+  pipeline runs at**, with `q0/scale = 2^10` — the ratio the CKKS bootstrap is
+  built around — and 48 bits of budget spare.
+
+This agrees with §7bis from the other direction: the CCMM is measured at
+**1.64 ns/MAC at logN 12 and 0.97 at logN 13**, so logN 13 is ~1.7× *faster*
+per MAC as well. And it agrees with the code's own constraint — `attention()`
+requires `heads·d ≡ 0 (mod N/2)`, which at 32 heads of d = 128 means
+**N ≤ 8192**, with 8192 the unique ring that fits all 32 heads in exactly one
+Algorithm 4 call and wastes none of the batch axis.
+
+Every argument points at **2^13**, and none at **2^12**.
+
+### 11.6 Variant table
+
+At the real 8B attention shape — 32 heads, T = 128, d_h = 128, one Algorithm 4
+call, 128 ciphertexts of 4096 values:
+
+| variant | low ring | QK CCMM | RingSwitch | Compose | BTS + conversion | SoftMax prep | total | status |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| **current, before** | none (logN 13 throughout) | 5143 ms | — | — | 149770 + 85639 ms | 17947 ms | **259.8 s** | ran |
+| **current, after** | none | 5143 ms | — | — | **26805** + 85639 ms | 17947 ms | **136.8 s** | ran |
+| Sylph-12 | 2^12 | — | — | — | — | — | — | **not implementable**: no ring switch, no compose, **and no bootstrap-compatible chain exists at 128-bit** |
+| Sylph-13 | 2^13 | — | — | — | — | — | — | **not implementable today**: parameters are fine, the two operations do not exist |
+
+Peak GPU memory is not the binding constraint at this shape: the Galois key is
+**138 rotation indices** (bridge ∪ CMT ∪ bootstrap) — the bridge and the CMT ask
+for the same `d − 1` multiples of `k/2`, and BSGS adds none — which at 36 limbs
+and N = 8192 is about **0.65 GiB**. Contrast Algorithm 5's `N/2 − 1`.
+
+Sylph-12 and Sylph-13 cannot be benchmarked end to end because
+`ring switch` and `compose` do not exist in this library in either direction
+(§3), and neither is a small change: compose is cheap arithmetic —
+`A(X) = Σ_j X^j a_j(X^16)` is coefficient interleaving, no level, no key switch
+— but it lands under the **embedded key `s̃_L(X) = s_L(X^16)`**, and reaching the
+bootstrap key needs a switching key between two *different ring degrees*, which
+`HEKeyGenerator` cannot produce: every key it makes lives in one context, and a
+context owns one `n`.

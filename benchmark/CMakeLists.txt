@@ -20,6 +20,8 @@ set(EXECUTABLES
     ring_cost_profile profile_ring_cost.cpp
     boot_to_slots_profile profile_boot_to_slots.cpp
     slot_island_profile profile_slot_island.cpp
+    attention_layout_profile profile_attention_layout.cpp
+    low_ring_params_profile profile_low_ring_params.cpp
 )
 
 function(add_benchmark exe source)
