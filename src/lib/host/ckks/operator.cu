@@ -10,6 +10,9 @@
 
 #include <nvtx3/nvToolsExt.h>
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace heongpu
 {
     namespace
