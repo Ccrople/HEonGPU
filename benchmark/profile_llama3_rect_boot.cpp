@@ -509,6 +509,10 @@ int main(int argc, char* argv[])
     // HEONGPU_BOOT_LIMBS drop below the staged schedule's floor.
     const bool fused_crossings = EnvFlag("HEONGPU_BOOT_FUSED_CROSSINGS", false);
     op.set_fused_crossings(fused_crossings);
+    // A block visits about eight (map, depth) pairs; holding them all trades
+    // ~2 GiB a set against re-encoding N/2 plaintexts per crossing call.
+    op.set_fused_plain_capacity(
+        static_cast<std::size_t>(EnvInt("HEONGPU_BOOT_FUSED_SETS", 8)));
     std::cout << "[boot] crossings       : "
               << (fused_crossings ? "fused, one level each"
                                   : "staged, 2/2/3/3 levels")

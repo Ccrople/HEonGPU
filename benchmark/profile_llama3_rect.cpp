@@ -269,6 +269,8 @@ int main(int argc, char* argv[])
     // BSGS map, so the same stages measure the trade against the staged path.
     const bool fused_crossings = EnvInt("HEONGPU_RECT_FUSED", 0) != 0;
     op.set_fused_crossings(fused_crossings);
+    op.set_fused_plain_capacity(
+        static_cast<std::size_t>(EnvInt("HEONGPU_RECT_FUSED_SETS", 8)));
     std::cout << "[rect] crossings       : "
               << (fused_crossings ? "fused, one level each"
                                   : "staged, 2/2/3/3 levels")

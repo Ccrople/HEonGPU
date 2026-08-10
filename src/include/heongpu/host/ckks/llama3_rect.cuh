@@ -851,6 +851,21 @@ namespace heongpu
             /// rotation is one limb cheaper. Must divide N/2.
             void set_fused_baby_steps(int n1);
 
+            /// Encoded diagonal sets kept at once. A transformer block visits
+            /// about eight (map, depth) pairs -- two per crossing site -- and a
+            /// set is N/2 plaintexts, so this is a real memory knob: a set at
+            /// depth D costs (N/2) * N * live_limbs * 8 bytes. Size it to the
+            /// distinct pairs of the circuit or accept re-encodes; either is
+            /// correct.
+            void set_fused_plain_capacity(std::size_t sets)
+            {
+                fused_plain_capacity_ = sets;
+                while (fused_plain_.size() > fused_plain_capacity_)
+                {
+                    fused_plain_.erase(fused_plain_.begin());
+                }
+            }
+
             // ---------------------------------------------------------------
             // The products
             // ---------------------------------------------------------------
