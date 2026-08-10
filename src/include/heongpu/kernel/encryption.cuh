@@ -33,6 +33,23 @@ namespace heongpu
                                               int n_power, int Q_prime_size,
                                               int Q_size, int P_size);
 
+    // Staged CKKS encryption mod-down, stage one: run the special-prime
+    // removal chain over pk+e once per (coefficient, component) and stage the
+    // per-step scalars, instead of rerunning the O(P_size^2) chain in every
+    // output-limb thread. Dispatches over a template bound on P_size; throws
+    // std::invalid_argument beyond 64 special primes.
+    __host__ void enc_div_lastq_ckks_p_chain(
+        Data64* pk, Data64* e, Data64* staged, Modulus64* modulus, Data64* half,
+        Data64* half_mod, Data64* last_q_modinv, int n, int n_power,
+        int Q_prime_size, int Q_size, int P_size, cudaStream_t stream);
+
+    // Staged CKKS encryption mod-down, stage two: per-output-limb tail of
+    // enc_div_lastq_ckks_kernel consuming the staged chain scalars.
+    __global__ void enc_div_lastq_ckks_stage_two_kernel(
+        Data64* pk, Data64* e, Data64* staged, Data64* ct, Modulus64* modulus,
+        Data64* half_mod, Data64* last_q_modinv, int n_power, int Q_prime_size,
+        int Q_size, int P_size);
+
     __global__ void cipher_message_add_kernel(Data64* ciphertext,
                                               Data64* plaintext,
                                               Modulus64* modulus, int n_power);

@@ -5,6 +5,8 @@
 
 #include <heongpu/kernel/switchkey.cuh>
 
+#include <stdexcept>
+
 namespace heongpu
 {
 
@@ -1045,6 +1047,82 @@ namespace heongpu
         }
     }
 
+    // Staged D -> Q~ conversion, stage one. The legacy kernel keeps the
+    // scaled digit residues in a fixed partial[20] array that a dnum = 1
+    // digit (I_j = Q_size) overflows, and one thread serially produces every
+    // output limb. Staging the residues removes the array and lets stage two
+    // spread the limbs across the grid. The float accumulation order is
+    // unchanged, so r_ and every output word stay bit-identical.
+    __global__ void base_conversion_DtoQtilde_partial_leveled_kernel(
+        Data64* ciphertext, Data64* partial_out, Data64* r_out,
+        Modulus64* modulus, Data64* Mi_inv_D_to_Qtilda, int* I_j_,
+        int* I_location_, int n_power)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // Ring Sizes
+        int block_y = blockIdx.y; // d
+
+        const int I_j = I_j_[block_y];
+        int I_location = I_location_[block_y];
+
+        int location = idx + (I_location << n_power);
+
+        float r = 0;
+        float div;
+        float mod;
+        for (int i = 0; i < I_j; i++)
+        {
+            Data64 temp = ciphertext[location + (i << n_power)];
+            Data64 partial_i =
+                OPERATOR_GPU_64::mult(temp, Mi_inv_D_to_Qtilda[I_location + i],
+                                      modulus[I_location + i]);
+            partial_out[location + (i << n_power)] = partial_i;
+            div = static_cast<float>(partial_i);
+            mod = static_cast<float>(modulus[I_location + i].value);
+            r += (div / mod);
+        }
+
+        r = round(r);
+        r_out[idx + (block_y << n_power)] = static_cast<Data64>(r);
+    }
+
+    __global__ void base_conversion_DtoQtilde_gather_leveled_kernel(
+        Data64* partial_in, Data64* r_in, Data64* output, Modulus64* modulus,
+        Data64* base_change_matrix_D_to_Qtilda, Data64* prod_D_to_Qtilda,
+        int* I_j_, int* I_location_, int n_power, int current_Qtilda_size,
+        int current_Q_size, int level)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // Ring Sizes
+        int i = blockIdx.y; // Qtilda limb
+        int block_z = blockIdx.z; // d
+
+        const int I_j = I_j_[block_z];
+        int I_location = I_location_[block_z];
+
+        int location = idx + (I_location << n_power);
+        int location_out = idx + ((block_z * current_Qtilda_size) << n_power);
+        int matrix_index = I_location * current_Qtilda_size;
+        int mod_location = (i < current_Q_size) ? i : (i + level);
+
+        Data64 temp = 0;
+        for (int j = 0; j < I_j; j++)
+        {
+            Data64 mult = OPERATOR_GPU_64::reduce_forced(
+                partial_in[location + (j << n_power)], modulus[mod_location]);
+            mult = OPERATOR_GPU_64::mult(
+                mult,
+                base_change_matrix_D_to_Qtilda[j + (i * I_j) + matrix_index],
+                modulus[mod_location]);
+            temp = OPERATOR_GPU_64::add(temp, mult, modulus[mod_location]);
+        }
+
+        Data64 r_mul = OPERATOR_GPU_64::mult(
+            r_in[idx + (block_z << n_power)],
+            prod_D_to_Qtilda[i + (block_z * current_Qtilda_size)],
+            modulus[mod_location]);
+        r_mul = OPERATOR_GPU_64::sub(temp, r_mul, modulus[mod_location]);
+        output[location_out + (i << n_power)] = r_mul;
+    }
+
     __global__ void multiply_accumulate_extended_kernel(
         Data64* input, Data64* relinkey, Data64* output, Modulus64* B_prime,
         int n_power, int d_tilda, int d, int r_prime)
@@ -1279,6 +1357,209 @@ namespace heongpu
 
         output[idx + (block_y << n_power) + (((Q_size) << n_power) * block_z)] =
             input_;
+    }
+
+    // Staged mod-down, stage one. The legacy CKKS mod-down kernels rerun the
+    // O(P_size^2) special-prime removal chain in every output-limb thread even
+    // though the chain never depends on the output limb. This kernel runs the
+    // chain once per (coefficient, component) and stages the one scalar each
+    // removal step hands to every output limb. The chain state needs P_size
+    // residues per thread, so the array is a template bound checked by the
+    // host dispatcher instead of the legacy fixed 15.
+    template <int MAX_P>
+    __global__ void divide_round_lastq_p_chain_leveled_kernel(
+        Data64* input, Data64* staged, Modulus64* modulus, Data64* half,
+        Data64* half_mod, Data64* last_q_modinv, int n_power, int Q_prime_size,
+        int Q_size, int first_Q_prime_size, int first_Q_size, int P_size)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // Ring Sizes
+        int block_z = blockIdx.z; // Cipher Size (2)
+
+        Data64 last_ct[MAX_P];
+        for (int i = 0; i < P_size; i++)
+        {
+            last_ct[i] = input[idx + ((Q_size + i) << n_power) +
+                               ((Q_prime_size << n_power) * block_z)];
+        }
+
+        int location_ = 0;
+        for (int i = 0; i < P_size; i++)
+        {
+            Data64 last_ct_add_half_ = last_ct[(P_size - 1 - i)];
+            last_ct_add_half_ =
+                OPERATOR_GPU_64::add(last_ct_add_half_, half[i],
+                                     modulus[(first_Q_prime_size - 1 - i)]);
+            for (int j = 0; j < (P_size - 1 - i); j++)
+            {
+                Data64 temp1 = OPERATOR_GPU_64::reduce_forced(
+                    last_ct_add_half_, modulus[first_Q_size + j]);
+
+                temp1 = OPERATOR_GPU_64::sub(
+                    temp1, half_mod[location_ + first_Q_size + j],
+                    modulus[first_Q_size + j]);
+
+                temp1 = OPERATOR_GPU_64::sub(last_ct[j], temp1,
+                                             modulus[first_Q_size + j]);
+
+                last_ct[j] = OPERATOR_GPU_64::mult(
+                    temp1, last_q_modinv[location_ + first_Q_size + j],
+                    modulus[first_Q_size + j]);
+            }
+
+            staged[idx + (i << n_power) + ((P_size << n_power) * block_z)] =
+                last_ct_add_half_;
+
+            location_ = location_ + (first_Q_prime_size - 1 - i);
+        }
+    }
+
+    __host__ void divide_round_lastq_p_chain_leveled(
+        Data64* input, Data64* staged, Modulus64* modulus, Data64* half,
+        Data64* half_mod, Data64* last_q_modinv, int n, int n_power,
+        int Q_prime_size, int Q_size, int first_Q_prime_size, int first_Q_size,
+        int P_size, int components, cudaStream_t stream)
+    {
+        dim3 grid((n >> 8), 1, components);
+        if (P_size <= 16)
+        {
+            divide_round_lastq_p_chain_leveled_kernel<16>
+                <<<grid, 256, 0, stream>>>(input, staged, modulus, half,
+                                           half_mod, last_q_modinv, n_power,
+                                           Q_prime_size, Q_size,
+                                           first_Q_prime_size, first_Q_size,
+                                           P_size);
+        }
+        else if (P_size <= 32)
+        {
+            divide_round_lastq_p_chain_leveled_kernel<32>
+                <<<grid, 256, 0, stream>>>(input, staged, modulus, half,
+                                           half_mod, last_q_modinv, n_power,
+                                           Q_prime_size, Q_size,
+                                           first_Q_prime_size, first_Q_size,
+                                           P_size);
+        }
+        else if (P_size <= 64)
+        {
+            divide_round_lastq_p_chain_leveled_kernel<64>
+                <<<grid, 256, 0, stream>>>(input, staged, modulus, half,
+                                           half_mod, last_q_modinv, n_power,
+                                           Q_prime_size, Q_size,
+                                           first_Q_prime_size, first_Q_size,
+                                           P_size);
+        }
+        else
+        {
+            throw std::invalid_argument(
+                "divide_round_lastq_p_chain_leveled supports at most 64 "
+                "special primes");
+        }
+    }
+
+    // Staged mod-down, stage two: identical arithmetic to the tail of
+    // divide_round_lastq_extended_leveled_kernel, but the chain scalars come
+    // from the staged buffer, so no thread keeps a P_size-long array.
+    __global__ void divide_round_lastq_extended_leveled_stage_two_kernel(
+        Data64* input, Data64* staged, Data64* output, Modulus64* modulus,
+        Data64* half_mod, Data64* last_q_modinv, int n_power, int Q_prime_size,
+        int Q_size, int first_Q_prime_size, int first_Q_size, int P_size)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // Ring Sizes
+        int block_y = blockIdx.y; // Decomposition Modulus Count (Q_size)
+        int block_z = blockIdx.z; // Cipher Size (2)
+
+        Data64 input_ = input[idx + (block_y << n_power) +
+                              ((Q_prime_size << n_power) * block_z)];
+
+        int location_ = 0;
+        for (int i = 0; i < P_size; i++)
+        {
+            Data64 last_ct_add_half_ =
+                staged[idx + (i << n_power) + ((P_size << n_power) * block_z)];
+
+            Data64 temp1 = OPERATOR_GPU_64::reduce_forced(last_ct_add_half_,
+                                                          modulus[block_y]);
+
+            temp1 = OPERATOR_GPU_64::sub(temp1, half_mod[location_ + block_y],
+                                         modulus[block_y]);
+
+            temp1 = OPERATOR_GPU_64::sub(input_, temp1, modulus[block_y]);
+
+            input_ = OPERATOR_GPU_64::mult(
+                temp1, last_q_modinv[location_ + block_y], modulus[block_y]);
+
+            location_ = location_ + (first_Q_prime_size - 1 - i);
+        }
+
+        output[idx + (block_y << n_power) + (((Q_size) << n_power) * block_z)] =
+            input_;
+    }
+
+    // Staged mod-down, stage two with the fused Galois permutation of
+    // divide_round_lastq_permute_ckks_kernel. index_raw is widened to 64 bits;
+    // the legacy 32-bit product wraps, which happens to leave the used low
+    // bits intact, but only by accident of two's-complement wrapping.
+    __global__ void divide_round_lastq_permute_ckks_stage_two_kernel(
+        Data64* input, Data64* staged, Data64* input2, Data64* output,
+        Modulus64* modulus, Data64* half_mod, Data64* last_q_modinv,
+        int galois_elt, int n_power, int Q_prime_size, int Q_size,
+        int first_Q_prime_size, int first_Q_size, int P_size)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // Ring Sizes
+        int block_y = blockIdx.y; // Decomposition Modulus Count (Q_size)
+        int block_z = blockIdx.z; // Cipher Size (2)
+
+        Data64 input_ = input[idx + (block_y << n_power) +
+                              ((Q_prime_size << n_power) * block_z)];
+
+        int location_ = 0;
+        for (int i = 0; i < P_size; i++)
+        {
+            Data64 last_ct_add_half_ =
+                staged[idx + (i << n_power) + ((P_size << n_power) * block_z)];
+
+            Data64 temp1 = OPERATOR_GPU_64::reduce_forced(last_ct_add_half_,
+                                                          modulus[block_y]);
+
+            temp1 = OPERATOR_GPU_64::sub(temp1, half_mod[location_ + block_y],
+                                         modulus[block_y]);
+
+            temp1 = OPERATOR_GPU_64::sub(input_, temp1, modulus[block_y]);
+
+            input_ = OPERATOR_GPU_64::mult(
+                temp1, last_q_modinv[location_ + block_y], modulus[block_y]);
+
+            location_ = location_ + (first_Q_prime_size - 1 - i);
+        }
+
+        int coeff_count_minus_one = (1 << n_power) - 1;
+        Data64 index_raw =
+            static_cast<Data64>(idx) * static_cast<Data64>(galois_elt);
+        int index = static_cast<int>(index_raw & coeff_count_minus_one);
+
+        if (block_z == 0)
+        {
+            Data64 ct_in = input2[idx + (block_y << n_power)];
+
+            ct_in = OPERATOR_GPU_64::add(ct_in, input_, modulus[block_y]);
+
+            if ((index_raw >> n_power) & 1)
+            {
+                ct_in = (modulus[block_y].value - ct_in);
+            }
+
+            output[index + (block_y << n_power) +
+                   (((Q_size) << n_power) * block_z)] = ct_in;
+        }
+        else
+        {
+            if ((index_raw >> n_power) & 1)
+            {
+                input_ = (modulus[block_y].value - input_);
+            }
+
+            output[index + (block_y << n_power) +
+                   (((Q_size) << n_power) * block_z)] = input_;
+        }
     }
 
     __global__ void global_memory_replace_kernel(Data64* input, Data64* output,

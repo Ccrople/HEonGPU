@@ -5,6 +5,8 @@
 
 #include <heongpu/kernel/encryption.cuh>
 
+#include <stdexcept>
+
 namespace heongpu
 {
     __global__ void pk_u_kernel(Data64* pk, Data64* u, Data64* pk_u,
@@ -233,6 +235,140 @@ namespace heongpu
 
             // Data64 temp1 = OPERATOR_GPU_64::reduce(last_pk_add_half_,
             // modulus[block_y]);
+            Data64 temp1 = OPERATOR_GPU_64::reduce_forced(last_pk_add_half_,
+                                                          modulus[block_y]);
+
+            temp1 = OPERATOR_GPU_64::sub(temp1, half_mod[location_ + block_y],
+                                         modulus[block_y]);
+
+            temp1 = OPERATOR_GPU_64::sub(input_, temp1, modulus[block_y]);
+
+            input_ = OPERATOR_GPU_64::mult(
+                temp1, last_q_modinv[location_ + block_y], modulus[block_y]);
+
+            location_ = location_ + (Q_prime_size - 1 - i);
+        }
+
+        ct[idx + (block_y << n_power) + (((Q_size) << n_power) * block_z)] =
+            input_;
+    }
+
+    // Staged encryption mod-down, stage one: the legacy kernel reruns the
+    // O(P_size^2) special-prime chain over pk+e in every output-limb thread
+    // and keeps its state in a fixed last_pk[15]. Run the chain once per
+    // (coefficient, component), stage the per-step scalars, and bound the
+    // state by a template checked in the host dispatcher. The chain keeps the
+    // legacy kernel's reduce (not reduce_forced) so outputs stay
+    // bit-identical.
+    template <int MAX_P>
+    __global__ void enc_div_lastq_ckks_p_chain_kernel(
+        Data64* pk, Data64* e, Data64* staged, Modulus64* modulus, Data64* half,
+        Data64* half_mod, Data64* last_q_modinv, int n_power, int Q_prime_size,
+        int Q_size, int P_size)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // Ring Sizes
+        int block_z = blockIdx.z; // Cipher Size (2)
+
+        Data64 last_pk[MAX_P];
+        for (int i = 0; i < P_size; i++)
+        {
+            Data64 last_pk_ = pk[idx + ((Q_size + i) << n_power) +
+                                 ((Q_prime_size << n_power) * block_z)];
+            Data64 last_e_ = e[idx + ((Q_size + i) << n_power) +
+                               ((Q_prime_size << n_power) * block_z)];
+            last_pk[i] =
+                OPERATOR_GPU_64::add(last_pk_, last_e_, modulus[Q_size + i]);
+        }
+
+        int location_ = 0;
+        for (int i = 0; i < P_size; i++)
+        {
+            Data64 last_pk_add_half_ = last_pk[(P_size - 1 - i)];
+            last_pk_add_half_ = OPERATOR_GPU_64::add(
+                last_pk_add_half_, half[i], modulus[(Q_prime_size - 1 - i)]);
+
+            for (int j = 0; j < (P_size - 1 - i); j++)
+            {
+                Data64 temp1 = OPERATOR_GPU_64::reduce(last_pk_add_half_,
+                                                       modulus[Q_size + j]);
+
+                temp1 = OPERATOR_GPU_64::sub(temp1,
+                                             half_mod[location_ + Q_size + j],
+                                             modulus[Q_size + j]);
+
+                temp1 = OPERATOR_GPU_64::sub(last_pk[j], temp1,
+                                             modulus[Q_size + j]);
+
+                last_pk[j] = OPERATOR_GPU_64::mult(
+                    temp1, last_q_modinv[location_ + Q_size + j],
+                    modulus[Q_size + j]);
+            }
+
+            staged[idx + (i << n_power) + ((P_size << n_power) * block_z)] =
+                last_pk_add_half_;
+
+            location_ = location_ + (Q_prime_size - 1 - i);
+        }
+    }
+
+    __host__ void enc_div_lastq_ckks_p_chain(
+        Data64* pk, Data64* e, Data64* staged, Modulus64* modulus, Data64* half,
+        Data64* half_mod, Data64* last_q_modinv, int n, int n_power,
+        int Q_prime_size, int Q_size, int P_size, cudaStream_t stream)
+    {
+        dim3 grid((n >> 8), 1, 2);
+        if (P_size <= 16)
+        {
+            enc_div_lastq_ckks_p_chain_kernel<16>
+                <<<grid, 256, 0, stream>>>(pk, e, staged, modulus, half,
+                                           half_mod, last_q_modinv, n_power,
+                                           Q_prime_size, Q_size, P_size);
+        }
+        else if (P_size <= 32)
+        {
+            enc_div_lastq_ckks_p_chain_kernel<32>
+                <<<grid, 256, 0, stream>>>(pk, e, staged, modulus, half,
+                                           half_mod, last_q_modinv, n_power,
+                                           Q_prime_size, Q_size, P_size);
+        }
+        else if (P_size <= 64)
+        {
+            enc_div_lastq_ckks_p_chain_kernel<64>
+                <<<grid, 256, 0, stream>>>(pk, e, staged, modulus, half,
+                                           half_mod, last_q_modinv, n_power,
+                                           Q_prime_size, Q_size, P_size);
+        }
+        else
+        {
+            throw std::invalid_argument(
+                "enc_div_lastq_ckks_p_chain supports at most 64 special "
+                "primes");
+        }
+    }
+
+    // Staged encryption mod-down, stage two: identical arithmetic to the tail
+    // of enc_div_lastq_ckks_kernel, consuming the staged chain scalars.
+    __global__ void enc_div_lastq_ckks_stage_two_kernel(
+        Data64* pk, Data64* e, Data64* staged, Data64* ct, Modulus64* modulus,
+        Data64* half_mod, Data64* last_q_modinv, int n_power, int Q_prime_size,
+        int Q_size, int P_size)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // Ring Sizes
+        int block_y = blockIdx.y; // Decomposition Modulus Count (Q_size)
+        int block_z = blockIdx.z; // Cipher Size (2)
+
+        Data64 input_ = pk[idx + (block_y << n_power) +
+                           ((Q_prime_size << n_power) * block_z)];
+        Data64 e_ = e[idx + (block_y << n_power) +
+                      ((Q_prime_size << n_power) * block_z)];
+        input_ = OPERATOR_GPU_64::add(input_, e_, modulus[block_y]);
+
+        int location_ = 0;
+        for (int i = 0; i < P_size; i++)
+        {
+            Data64 last_pk_add_half_ =
+                staged[idx + (i << n_power) + ((P_size << n_power) * block_z)];
+
             Data64 temp1 = OPERATOR_GPU_64::reduce_forced(last_pk_add_half_,
                                                           modulus[block_y]);
 

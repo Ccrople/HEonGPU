@@ -5,8 +5,26 @@
 
 #include <heongpu/host/ckks/encryptor.cuh>
 
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
 namespace heongpu
 {
+    namespace
+    {
+        /// Debug switch shared with the staged mod-down rewrite: when
+        /// HEONGPU_MODDOWN_CHECK is set, the staged encryption mod-down also
+        /// runs the legacy kernel and compares the outputs word for word.
+        bool enc_moddown_check_enabled()
+        {
+            static const bool enabled = [] {
+                const char* env = std::getenv("HEONGPU_MODDOWN_CHECK");
+                return (env != nullptr) && (std::atoi(env) != 0);
+            }();
+            return enabled;
+        }
+    } // namespace
     __host__
     HEEncryptor<Scheme::CKKS>::HEEncryptor(HEContext<Scheme::CKKS> context,
                                            Publickey<Scheme::CKKS>& public_key)
@@ -91,13 +109,63 @@ namespace heongpu
                                  ctx->modulus_->data(), cfg_intt,
                                  2 * Q_prime_size, Q_prime_size);
 
-        enc_div_lastq_ckks_kernel<<<dim3((n >> 8), Q_size, 2), 256, 0,
-                                    stream>>>(
-            pk_u_poly, error_poly, output_memory.data(), ctx->modulus_->data(),
+        // Staged mod-down: chain over pk+e once, then the per-limb tail.
+        DeviceVector<Data64> moddown_stage(
+            static_cast<size_t>(2) * ctx->P_size * n, stream);
+        enc_div_lastq_ckks_p_chain(
+            pk_u_poly, error_poly, moddown_stage.data(), ctx->modulus_->data(),
             ctx->half_p_->data(), ctx->half_mod_->data(),
+            ctx->last_q_modinv_->data(), n, n_power, Q_prime_size, Q_size,
+            ctx->P_size, stream);
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+        enc_div_lastq_ckks_stage_two_kernel<<<dim3((n >> 8), Q_size, 2), 256, 0,
+                                              stream>>>(
+            pk_u_poly, error_poly, moddown_stage.data(), output_memory.data(),
+            ctx->modulus_->data(), ctx->half_mod_->data(),
             ctx->last_q_modinv_->data(), n_power, Q_prime_size, Q_size,
             ctx->P_size);
         HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+        if (enc_moddown_check_enabled())
+        {
+            DeviceVector<Data64> legacy(static_cast<size_t>(2) * Q_size * n,
+                                        stream);
+            enc_div_lastq_ckks_kernel<<<dim3((n >> 8), Q_size, 2), 256, 0,
+                                        stream>>>(
+                pk_u_poly, error_poly, legacy.data(), ctx->modulus_->data(),
+                ctx->half_p_->data(), ctx->half_mod_->data(),
+                ctx->last_q_modinv_->data(), n_power, Q_prime_size, Q_size,
+                ctx->P_size);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+            const size_t count = static_cast<size_t>(2) * Q_size * n;
+            std::vector<Data64> host_legacy(count);
+            std::vector<Data64> host_staged(count);
+            HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                host_legacy.data(), legacy.data(), count * sizeof(Data64),
+                cudaMemcpyDeviceToHost, stream));
+            HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                host_staged.data(), output_memory.data(),
+                count * sizeof(Data64), cudaMemcpyDeviceToHost, stream));
+            HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+            for (size_t i = 0; i < count; i++)
+            {
+                if (host_legacy[i] != host_staged[i])
+                {
+                    std::fprintf(stderr,
+                                 "HEONGPU_MODDOWN_CHECK: enc_div_lastq_ckks "
+                                 "mismatch at word %zu: legacy %llu staged "
+                                 "%llu\n",
+                                 i,
+                                 static_cast<unsigned long long>(
+                                     host_legacy[i]),
+                                 static_cast<unsigned long long>(
+                                     host_staged[i]));
+                    throw std::runtime_error(
+                        "staged encryption mod-down diverged from the legacy "
+                        "kernel");
+                }
+            }
+        }
 
         gpuntt::GPU_NTT_Inplace(output_memory.data(), ctx->ntt_table_->data(),
                                 ctx->modulus_->data(), cfg_ntt, 2 * Q_size,
