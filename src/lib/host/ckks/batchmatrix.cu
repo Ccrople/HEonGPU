@@ -550,17 +550,31 @@ namespace heongpu
         const BatchSubringTables& t = tables_for(depth);
         const int num_limbs = t.num_limbs;
 
-        std::vector<Modulus64> all = context_->get_key_modulus();
-        std::vector<Data64> host(static_cast<size_t>(num_limbs) * per_limb);
-        for (int l = 0; l < num_limbs; ++l)
+        // The coefficients are the same for every limb, so the RNS expansion
+        // is done on the device: only the coefficients are uploaded, and the
+        // num_limbs copies of them are written straight into device memory.
+        // Building them host-side instead was the single most expensive thing
+        // in a real 8B block -- 58 projections x (a 960 MiB host buffer, 126 M
+        // host modular reductions and a 960 MiB pageable upload) came to 139 s
+        // of a 352 s block, against 2.5 s of GPU work in the same 58 calls.
+        // t.modulus is the first num_limbs primes of the key modulus, which is
+        // exactly what the host loop indexed, so the result is unchanged.
+        DeviceVector<int64_t> source(coeffs);
+        plain_ = DeviceVector<Data64>(static_cast<size_t>(num_limbs) *
+                                      per_limb);
         {
-            const Data64 p = all[l].value;
-            for (size_t i = 0; i < per_limb; ++i)
-                host[static_cast<size_t>(l) * per_limb + i] =
-                    centered_to_modular(coeffs[i], p);
+            const int expand_threads = 256;
+            const unsigned rows_of_limbs =
+                static_cast<unsigned>(num_limbs < 32 ? num_limbs : 32);
+            const dim3 expand_grid(
+                static_cast<unsigned>((per_limb + expand_threads - 1) /
+                                      expand_threads),
+                rows_of_limbs);
+            bm_crt_expand_kernel<<<expand_grid, expand_threads>>>(
+                plain_.data(), source.data(), t.modulus.data(), per_limb,
+                num_limbs);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
         }
-
-        plain_ = DeviceVector<Data64>(host);
 
         const int threads = (k < 256) ? k : 256;
         const size_t shared = static_cast<size_t>(k) * sizeof(Data64);
@@ -577,6 +591,12 @@ namespace heongpu
             plain_.data(), t.psi.data(), t.modulus.data(), k,
             static_cast<int>(per_limb / k));
         HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+        // The uploaded coefficients are freed when this returns, so as
+        // everywhere else in this file the launch that reads them has to have
+        // consumed them first. One drain per projection -- 58 in a block, in
+        // exchange for the 51 GiB of uploads the expansion above removes.
+        HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
 
         plain_rows_ = rows;
         plain_cols_ = cols;

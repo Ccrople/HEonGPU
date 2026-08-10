@@ -6,6 +6,36 @@
 
 namespace heongpu
 {
+    __global__ void bm_crt_expand_kernel(Data64* out, const int64_t* coeffs,
+                                         const Modulus64* modulus,
+                                         size_t per_limb, int num_limbs)
+    {
+        const size_t i =
+            static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (i >= per_limb)
+            return;
+
+        // One load of the coefficient serves every limb: the array is shared
+        // across the RNS base, which is exactly what made the host expansion
+        // write num_limbs copies of it.
+        const int64_t v = coeffs[i];
+        for (int limb = blockIdx.y; limb < num_limbs; limb += gridDim.y)
+        {
+            const Data64 p = modulus[limb].value;
+            Data64 r;
+            if (v >= 0)
+            {
+                r = static_cast<Data64>(v) % p;
+            }
+            else
+            {
+                const Data64 m = static_cast<Data64>(-v) % p;
+                r = (m == 0) ? 0 : p - m;
+            }
+            out[static_cast<size_t>(limb) * per_limb + i] = r;
+        }
+    }
+
     __global__ void bm_ntt_k_kernel(Data64* data, const Data64* psi,
                                     const Modulus64* modulus, int k,
                                     int transforms_per_limb)
