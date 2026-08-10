@@ -345,9 +345,12 @@
 #include <heongpu/host/ckks/operator.cuh>
 #include <heongpu/host/ckks/plaintext.cuh>
 
+#include <array>
 #include <complex>
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <tuple>
 #include <vector>
 
 namespace heongpu
@@ -803,6 +806,51 @@ namespace heongpu
                                       int channels,
                                       Galoiskey<Scheme::CKKS>& galois_key);
 
+            /**
+             * @brief Take every crossing in ONE level instead of two or three.
+             *
+             * Each crossing above is a composition of one-level blocked maps --
+             * the row bridge and the block transform -- and each stage spends a
+             * level because it rescales its own plaintext product. But the
+             * composition is itself a slot-linear map, so the stage matrices
+             * can be multiplied on the HOST and the product applied as a single
+             * BSGS diagonal map: one plaintext product per slot, one rescale,
+             * ONE level, whatever the stage count was. This is the N/2-diagonal
+             * trade the module comment calls "not taken here" -- taken.
+             *
+             * What changes and what does not:
+             *  - to_slots / from_slots spend 1 level instead of 2, and
+             *    to_batch / from_batch spend 1 instead of 3. On the measured
+             *    schedule that takes the QK stretch 6 -> 4, the PV stretch
+             *    7 -> 5 and both feed-forward stretches 8 -> 7, so the chain
+             *    floor drops by a limb.
+             *  - key switches per column go from 22 + 30 + 22 = 74 (to_batch,
+             *    d = 128) to about 2 sqrt(N/2): the merged map is DENSE -- the
+             *    bridge's stride-k/2 shifts plus the block map's +-eps reach
+             *    every residue -- so it is N/2 diagonals under a baby-step /
+             *    giant-step split. n1 + N/2/n1 - 2 = 94 at N = 4096.
+             *  - the baby shifts are 1 .. n1 - 1 and the giants multiples of
+             *    n1: a SUBSET of the N/2 - 1 indices Algorithm 5's CMT already
+             *    holds, so no new Galois key, ever.
+             *  - precision improves slightly: one plaintext quantisation and
+             *    one rescale instead of two or three.
+             *  - plaintext memory: N/2 diagonals per (map, level, prime),
+             *    cached with whole-set eviction like the bridge's. A set at
+             *    depth D is (N/2) * N * live_limbs * 8 bytes.
+             *
+             * The four staged entry points dispatch here when this is on; no
+             * call site changes. OFF by default so every existing measurement
+             * stays reproducible.
+             */
+            void set_fused_crossings(bool on) { fused_crossings_ = on; }
+            bool fused_crossings() const { return fused_crossings_; }
+
+            /// Baby steps of the fused map's BSGS split; 0 picks the balanced
+            /// power of two with the giant side no smaller than the baby side,
+            /// which puts the larger rotation count after the rescale where a
+            /// rotation is one limb cheaper. Must divide N/2.
+            void set_fused_baby_steps(int n1);
+
             // ---------------------------------------------------------------
             // The products
             // ---------------------------------------------------------------
@@ -1221,6 +1269,52 @@ namespace heongpu
             /// index is the diagonal offset shifted by k/2 - 1.
             std::vector<std::vector<Complex64>> forward_block_;
             std::vector<std::vector<Complex64>> inverse_block_;
+
+            // ---------------------------------------------------------------
+            // The fused one-level crossings
+            // ---------------------------------------------------------------
+
+            /// The four crossings as single linear maps. The value is the
+            /// stage order each conversion applies, composed on the host.
+            enum class FusedMap : int
+            {
+                ToSlots = 0, // block_inv o bridge_inv
+                FromSlots = 1, // bridge_fwd o block_fwd
+                ToBatch = 2, // bridge_fwd o block_inv o bridge_inv
+                FromBatch = 3 // bridge_fwd o block_fwd o bridge_inv
+            };
+
+            /// Composed diagonals of @p map, indexed by shift 0 .. N/2 - 1; an
+            /// empty inner vector is a structurally zero diagonal. Built
+            /// lazily: composing is a few seconds of host arithmetic and only
+            /// the maps a circuit uses should pay it.
+            const std::vector<std::vector<Complex64>>&
+            fused_table(FusedMap map);
+
+            /// Apply @p map to every ciphertext in @p ct in place: one BSGS
+            /// pass over the composed diagonals, one rescale, one level.
+            void fused_apply(std::vector<Ciphertext<Scheme::CKKS>>& ct,
+                             FusedMap map, const char* name,
+                             Galoiskey<Scheme::CKKS>& galois_key);
+
+            /// @see set_fused_baby_steps. The resolved n1 for the current
+            /// override, balanced when the override is 0.
+            int fused_baby_steps() const;
+
+            bool fused_crossings_ = false;
+            int fused_baby_steps_ = 0;
+
+            /// fused_table's results, one dense table per FusedMap value.
+            std::array<std::vector<std::vector<Complex64>>, 4> fused_diagonal_;
+
+            /// Encoded diagonal sets, keyed by (map, depth, prime) with
+            /// whole-set eviction, exactly the bridge's discipline. A set is
+            /// N/2 plaintexts pre-rotated by their giant step; entries absent
+            /// from the map are structurally zero diagonals.
+            std::map<std::tuple<int, int, uint64_t>,
+                     std::vector<Plaintext<Scheme::CKKS>>>
+                fused_plain_;
+            std::size_t fused_plain_capacity_ = 2;
         };
 
     } // namespace llama

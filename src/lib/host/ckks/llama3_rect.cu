@@ -289,6 +289,22 @@ namespace heongpu
                 all.push_back(r >= 0 ? r : slot_count_ + r);
             }
 
+            // The fused crossings' BSGS split: baby shifts 1 .. n1 - 1 and
+            // giant shifts i * n1. A subset of Algorithm 5's full group above,
+            // listed so the union stays honest if the rectangular product is
+            // ever taken out.
+            {
+                const int n1 = fused_baby_steps();
+                for (int j = 1; j < n1; ++j)
+                {
+                    all.push_back(j);
+                }
+                for (int i = 1; i < slot_count_ / n1; ++i)
+                {
+                    all.push_back(i * n1);
+                }
+            }
+
             std::sort(all.begin(), all.end());
             all.erase(std::unique(all.begin(), all.end()), all.end());
             return all;
@@ -430,6 +446,17 @@ namespace heongpu
 
             Range _r("bridge.rect_to_slots");
 
+            if (fused_crossings_)
+            {
+                // Both stages in one BSGS pass: one level instead of two. The
+                // map does not depend on the group, so the columns go through
+                // flat and come out in the order the staged loop would emit.
+                std::vector<Ciphertext<Scheme::CKKS>> fused = in.column;
+                fused_apply(fused, FusedMap::ToSlots, "bridge.fused_to_slots",
+                            galois_key);
+                return fused;
+            }
+
             std::vector<Ciphertext<Scheme::CKKS>> out;
             out.reserve(in.column.size());
             for (int g = 0; g < in.groups; ++g)
@@ -472,6 +499,18 @@ namespace heongpu
 
             Range _r("bridge.rect_from_slots");
 
+            if (fused_crossings_)
+            {
+                RectActivation fused;
+                fused.rows = d;
+                fused.groups = groups;
+                fused.channels = channels;
+                fused.column = std::move(in);
+                fused_apply(fused.column, FusedMap::FromSlots,
+                            "bridge.fused_from_slots", galois_key);
+                return fused;
+            }
+
             RectActivation out;
             out.rows = d;
             out.groups = groups;
@@ -510,6 +549,22 @@ namespace heongpu
             }
 
             Range _r("bridge.to_batch");
+
+            if (fused_crossings_)
+            {
+                // The three stages composed on the host: one level instead of
+                // three. The input group is copied, exactly as the staged path
+                // leaves the activation intact.
+                const int d = layout_.d;
+                BatchActivation fused;
+                fused.rows = d;
+                fused.column.assign(
+                    in.column.begin() + static_cast<size_t>(group) * d,
+                    in.column.begin() + static_cast<size_t>(group + 1) * d);
+                fused_apply(fused.column, FusedMap::ToBatch,
+                            "bridge.fused_to_batch", galois_key);
+                return fused;
+            }
 
             BatchActivation borrowed = borrow_group(in, group);
             std::vector<Ciphertext<Scheme::CKKS>> slots =
@@ -550,6 +605,18 @@ namespace heongpu
                         "A rectangular group comes from a matrix encryption "
                         "square at layout.d");
                 }
+                if (fused_crossings_)
+                {
+                    std::vector<Ciphertext<Scheme::CKKS>> fused =
+                        group.column;
+                    fused_apply(fused, FusedMap::FromBatch,
+                                "bridge.fused_from_batch", galois_key);
+                    for (auto& c : fused)
+                    {
+                        out.column.push_back(std::move(c));
+                    }
+                    continue;
+                }
                 std::vector<Ciphertext<Scheme::CKKS>> slots =
                     batch_.to_slots(group, galois_key);
                 block_map(slots, /*inverse=*/false, "bridge.block_forward",
@@ -561,6 +628,427 @@ namespace heongpu
                 }
             }
             return out;
+        }
+
+        // -------------------------------------------------------------------
+        // The fused one-level crossings
+        // -------------------------------------------------------------------
+
+        namespace
+        {
+            /// One stage of a crossing: (shift, diagonal) pairs over the slot
+            /// ring, exactly as the staged code applies them -- out[s] =
+            /// sum diag[s] * in[(s + shift) mod n].
+            using stage_t =
+                std::vector<std::pair<int, const std::vector<Complex64>*>>;
+
+            /// A dense map under composition: entry [shift] is the diagonal,
+            /// empty meaning structurally zero.
+            using dense_t = std::vector<std::vector<cd>>;
+
+            dense_t densify(const stage_t& stage, int n)
+            {
+                dense_t out(static_cast<size_t>(n));
+                for (const auto& entry : stage)
+                {
+                    std::vector<cd>& dst = out[static_cast<size_t>(entry.first)];
+                    if (dst.empty())
+                    {
+                        dst.assign(static_cast<size_t>(n), cd(0.0, 0.0));
+                    }
+                    const std::vector<Complex64>& src = *entry.second;
+                    for (int s = 0; s < n; ++s)
+                    {
+                        dst[static_cast<size_t>(s)] +=
+                            cd(src[static_cast<size_t>(s)].real(),
+                               src[static_cast<size_t>(s)].imag());
+                    }
+                }
+                return out;
+            }
+
+            /// The map that applies @p first and then @p second.
+            ///
+            /// If first is sum_a A_a[s] in[s + sh_a] and second is
+            /// sum_b B_b[s] mid[s + sh_b], the composition's diagonal at
+            /// sh_a + sh_b picks up B_b[s] * A_a[s + sh_b]: the second map's
+            /// shift walks over the first map's diagonal before the two shifts
+            /// add. The double loop is |second stages| * n * n complex
+            /// multiply-adds -- a few seconds of host arithmetic at N = 4096,
+            /// paid once per operator per direction.
+            dense_t compose(const dense_t& first, const stage_t& second, int n)
+            {
+                dense_t out(static_cast<size_t>(n));
+                for (const auto& entry : second)
+                {
+                    const int sb = entry.first;
+                    const std::vector<Complex64>& bv = *entry.second;
+                    for (int sa = 0; sa < n; ++sa)
+                    {
+                        const std::vector<cd>& av =
+                            first[static_cast<size_t>(sa)];
+                        if (av.empty())
+                        {
+                            continue;
+                        }
+                        std::vector<cd>& dst =
+                            out[static_cast<size_t>((sa + sb) % n)];
+                        if (dst.empty())
+                        {
+                            dst.assign(static_cast<size_t>(n), cd(0.0, 0.0));
+                        }
+                        // Split at the wrap so the inner loop carries no
+                        // modulus.
+                        const int head = n - sb;
+                        for (int s = 0; s < head; ++s)
+                        {
+                            dst[static_cast<size_t>(s)] +=
+                                cd(bv[static_cast<size_t>(s)].real(),
+                                   bv[static_cast<size_t>(s)].imag()) *
+                                av[static_cast<size_t>(s + sb)];
+                        }
+                        for (int s = head; s < n; ++s)
+                        {
+                            dst[static_cast<size_t>(s)] +=
+                                cd(bv[static_cast<size_t>(s)].real(),
+                                   bv[static_cast<size_t>(s)].imag()) *
+                                av[static_cast<size_t>(s + sb - n)];
+                        }
+                    }
+                }
+                return out;
+            }
+        } // namespace
+
+        void Llama3RectOperator::set_fused_baby_steps(int n1)
+        {
+            if (n1 < 0 || (n1 > 0 && slot_count_ % n1 != 0))
+            {
+                throw std::invalid_argument(
+                    "The fused baby step count must divide N/2, because the "
+                    "two index sets have to cover the N/2 diagonals exactly");
+            }
+            fused_baby_steps_ = n1;
+            fused_plain_.clear();
+        }
+
+        int Llama3RectOperator::fused_baby_steps() const
+        {
+            if (fused_baby_steps_ > 0)
+            {
+                return fused_baby_steps_;
+            }
+            // The largest power of two with n1 <= sqrt(N/2), so n2 >= n1 and
+            // the bigger half of the rotations lands on the accumulator, one
+            // limb below the source.
+            int n1 = 1;
+            while ((n1 * 2) * (n1 * 2) <= slot_count_)
+            {
+                n1 <<= 1;
+            }
+            return n1;
+        }
+
+        const std::vector<std::vector<Complex64>>&
+        Llama3RectOperator::fused_table(FusedMap map)
+        {
+            std::vector<std::vector<Complex64>>& slot =
+                fused_diagonal_[static_cast<size_t>(map)];
+            if (!slot.empty())
+            {
+                return slot;
+            }
+
+            const int n = slot_count_;
+            const int step = layout_.batch;
+
+            const auto bridge_stage = [&](bool inverse) {
+                const std::vector<std::vector<Complex64>>& diag =
+                    inverse ? batch_.bridge_inverse_diagonals()
+                            : batch_.bridge_forward_diagonals();
+                stage_t st;
+                st.reserve(diag.size());
+                for (size_t delta = 0; delta < diag.size(); ++delta)
+                {
+                    st.emplace_back(
+                        static_cast<int>(delta) * step % n, &diag[delta]);
+                }
+                return st;
+            };
+            const auto block_stage = [&](bool inverse) {
+                const std::vector<std::vector<Complex64>>& diag =
+                    inverse ? inverse_block_ : forward_block_;
+                stage_t st;
+                st.reserve(diag.size());
+                for (size_t e = 0; e < diag.size(); ++e)
+                {
+                    const int eps = static_cast<int>(e) - (step - 1);
+                    st.emplace_back(((eps % n) + n) % n, &diag[e]);
+                }
+                // Empty at step == 1, where the block transform is the
+                // identity and composing it would be a no-op anyway.
+                return st;
+            };
+
+            // The stages of each crossing in APPLICATION order, verbatim from
+            // the staged entry points below -- the fused map must be their
+            // product and nothing else.
+            std::vector<stage_t> stages;
+            switch (map)
+            {
+                case FusedMap::ToSlots:
+                    stages = {bridge_stage(true), block_stage(true)};
+                    break;
+                case FusedMap::FromSlots:
+                    stages = {block_stage(false), bridge_stage(false)};
+                    break;
+                case FusedMap::ToBatch:
+                    stages = {bridge_stage(true), block_stage(true),
+                              bridge_stage(false)};
+                    break;
+                case FusedMap::FromBatch:
+                    stages = {bridge_stage(true), block_stage(false),
+                              bridge_stage(false)};
+                    break;
+            }
+            stages.erase(std::remove_if(stages.begin(), stages.end(),
+                                        [](const stage_t& s)
+                                        { return s.empty(); }),
+                         stages.end());
+            if (stages.empty())
+            {
+                throw std::runtime_error(
+                    "A fused crossing with no stages has nothing to apply");
+            }
+
+            dense_t acc = densify(stages.front(), n);
+            for (size_t i = 1; i < stages.size(); ++i)
+            {
+                acc = compose(acc, stages[i], n);
+            }
+
+            // Keep every diagonal that is not structural zero. The threshold
+            // is relative to the largest entry, and the gap between a real
+            // diagonal and cancellation noise is many orders of magnitude, so
+            // its exact value does not matter.
+            double largest = 0.0;
+            for (const std::vector<cd>& v : acc)
+            {
+                for (const cd& z : v)
+                {
+                    largest = std::max(largest, std::abs(z));
+                }
+            }
+            const double cutoff = largest * 1e-12;
+
+            slot.assign(static_cast<size_t>(n), {});
+            int kept = 0;
+            for (int shift = 0; shift < n; ++shift)
+            {
+                const std::vector<cd>& v = acc[static_cast<size_t>(shift)];
+                if (v.empty())
+                {
+                    continue;
+                }
+                double peak = 0.0;
+                for (const cd& z : v)
+                {
+                    peak = std::max(peak, std::abs(z));
+                }
+                if (peak <= cutoff)
+                {
+                    continue;
+                }
+                std::vector<Complex64>& dst =
+                    slot[static_cast<size_t>(shift)];
+                dst.resize(static_cast<size_t>(n));
+                for (int s = 0; s < n; ++s)
+                {
+                    dst[static_cast<size_t>(s)] =
+                        Complex64(v[static_cast<size_t>(s)].real(),
+                                  v[static_cast<size_t>(s)].imag());
+                }
+                ++kept;
+            }
+            if (kept == 0)
+            {
+                throw std::runtime_error(
+                    "The fused crossing composed to zero, which means a stage "
+                    "convention above is wrong");
+            }
+            return slot;
+        }
+
+        void Llama3RectOperator::fused_apply(
+            std::vector<Ciphertext<Scheme::CKKS>>& ct, FusedMap map,
+            const char* name, Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            if (ct.empty())
+            {
+                return;
+            }
+
+            const int n = slot_count_;
+            const std::vector<std::vector<Complex64>>& table =
+                fused_table(map);
+            const int n1 = fused_baby_steps();
+            const int n2 = n / n1;
+
+            const int depth = ct.front().depth();
+            const double scale = ct.front().scale();
+            for (const auto& c : ct)
+            {
+                if (c.depth() != depth || c.scale() != scale)
+                {
+                    throw std::invalid_argument(
+                        "The fused crossing adds its diagonals together, so "
+                        "every ciphertext in one call has to share a level "
+                        "and a scale");
+                }
+            }
+
+            const double plain_scale = rescale_prime(ct.front());
+
+            // The encoded set, cached exactly the way the bridge caches its
+            // own: keyed by what an encoding depends on, evicted whole.
+            // Entries are stored in BSGS order for the PRESENT diagonals only,
+            // pre-rotated by their giant step; presence is read off the table,
+            // so the cursor below walks the two in lockstep.
+            const auto plain_key = std::make_tuple(
+                static_cast<int>(map), depth,
+                static_cast<uint64_t>(plain_scale));
+            auto encoded = fused_plain_.find(plain_key);
+            if (encoded == fused_plain_.end())
+            {
+                SuffixRange _r(name, "encode");
+                if (fused_plain_.size() >= fused_plain_capacity_)
+                {
+                    fused_plain_.erase(fused_plain_.begin());
+                }
+                std::vector<Plaintext<Scheme::CKKS>> plains;
+                plains.reserve(static_cast<size_t>(n));
+                std::vector<Complex64> shifted(static_cast<size_t>(n));
+                for (int i = 0; i < n2; ++i)
+                {
+                    const int giant = i * n1;
+                    for (int j = 0; j < n1; ++j)
+                    {
+                        const std::vector<Complex64>& src =
+                            table[static_cast<size_t>(giant + j)];
+                        if (src.empty())
+                        {
+                            continue;
+                        }
+                        for (int p = 0; p < n; ++p)
+                        {
+                            // rot(v, -giant)[p] = v[p - giant], the inverse of
+                            // the accumulator shift below.
+                            const int q = ((p - giant) % n + n) % n;
+                            shifted[static_cast<size_t>(p)] =
+                                src[static_cast<size_t>(q)];
+                        }
+                        plains.push_back(
+                            encode(shifted, plain_scale, depth));
+                    }
+                }
+                encoded =
+                    fused_plain_.emplace(plain_key, std::move(plains)).first;
+            }
+
+            for (auto& source : ct)
+            {
+                // The n1 baby shifts are shared by every giant step of this
+                // column, so they are taken once.
+                std::vector<Ciphertext<Scheme::CKKS>> baby;
+                baby.reserve(static_cast<size_t>(n1));
+                {
+                    SuffixRange _r(name, "rotations");
+                    for (int j = 0; j < n1; ++j)
+                    {
+                        if (j == 0)
+                        {
+                            baby.push_back(source);
+                        }
+                        else
+                        {
+                            Ciphertext<Scheme::CKKS> shifted(context_);
+                            batch_.arith().rotate_rows(source, shifted,
+                                                       galois_key, j);
+                            baby.push_back(std::move(shifted));
+                        }
+                    }
+                }
+
+                Ciphertext<Scheme::CKKS> total(context_);
+                bool total_started = false;
+                {
+                    SuffixRange _r(name, "diagonals");
+                    size_t cursor = 0;
+                    for (int i = 0; i < n2; ++i)
+                    {
+                        Ciphertext<Scheme::CKKS> acc(context_);
+                        bool started = false;
+                        for (int j = 0; j < n1; ++j)
+                        {
+                            if (table[static_cast<size_t>(i * n1 + j)].empty())
+                            {
+                                continue;
+                            }
+                            Plaintext<Scheme::CKKS>& plain =
+                                encoded->second[cursor++];
+
+                            Ciphertext<Scheme::CKKS> term(context_);
+                            batch_.arith().multiply_plain(baby[j], plain,
+                                                          term);
+
+                            if (!started)
+                            {
+                                acc = std::move(term);
+                                started = true;
+                            }
+                            else
+                            {
+                                batch_.arith().add_inplace(acc, term);
+                            }
+                        }
+                        if (!started)
+                        {
+                            continue;
+                        }
+
+                        // rotate_rows refuses a ciphertext that still owes a
+                        // rescale, so the rescale moves inside the loop, as in
+                        // the bridge: it commutes with the rotation and every
+                        // group is at the same level.
+                        batch_.arith().rescale_inplace(acc);
+
+                        if (i != 0)
+                        {
+                            Ciphertext<Scheme::CKKS> moved(context_);
+                            batch_.arith().rotate_rows(acc, moved, galois_key,
+                                                       i * n1);
+                            acc = std::move(moved);
+                        }
+
+                        if (!total_started)
+                        {
+                            total = std::move(acc);
+                            total_started = true;
+                        }
+                        else
+                        {
+                            batch_.arith().add_inplace(total, acc);
+                        }
+                    }
+                }
+                if (!total_started)
+                {
+                    throw std::runtime_error(
+                        "The fused crossing multiplied no diagonal at all, "
+                        "which the table build above should have refused");
+                }
+                source = std::move(total);
+            }
         }
 
         // -------------------------------------------------------------------

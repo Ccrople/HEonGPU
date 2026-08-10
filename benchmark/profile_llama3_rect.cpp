@@ -265,6 +265,15 @@ int main(int argc, char* argv[])
     heongpu::llama::Llama3BatchOperator batch(context, encoder, layout, scale);
     Rect op(context, encoder, layout, scale);
 
+    // HEONGPU_RECT_FUSED=1 takes every crossing in one level via the composed
+    // BSGS map, so the same stages measure the trade against the staged path.
+    const bool fused_crossings = EnvInt("HEONGPU_RECT_FUSED", 0) != 0;
+    op.set_fused_crossings(fused_crossings);
+    std::cout << "[rect] crossings       : "
+              << (fused_crossings ? "fused, one level each"
+                                  : "staged, 2/2/3/3 levels")
+              << std::endl;
+
     std::vector<int> shifts = op.rotation_indices();
     heongpu::Galoiskey<S> galois(context, shifts);
     keygen.generate_galois_key(galois, secret);

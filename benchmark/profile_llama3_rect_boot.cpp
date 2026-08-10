@@ -504,6 +504,16 @@ int main(int argc, char* argv[])
     heongpu::llama::Llama3BatchOperator batch(context, encoder, layout, scale);
     Rect op(context, encoder, layout, scale);
 
+    // The one-level crossings: every to_slots / from_slots / to_batch /
+    // from_batch spends one level instead of two or three, which is what lets
+    // HEONGPU_BOOT_LIMBS drop below the staged schedule's floor.
+    const bool fused_crossings = EnvFlag("HEONGPU_BOOT_FUSED_CROSSINGS", false);
+    op.set_fused_crossings(fused_crossings);
+    std::cout << "[boot] crossings       : "
+              << (fused_crossings ? "fused, one level each"
+                                  : "staged, 2/2/3/3 levels")
+              << std::endl;
+
     // The bootstrapping context is per operator, so it is generated on the very
     // arithmetic half that will run the refresh and not on a second one.
     heongpu::BootstrappingConfig boot_config(ctos, stoc, taylor, less_key);

@@ -299,6 +299,137 @@ TEST(HEonGPU, CKKS_Llama3Rect_ToBatchGivesOneHeadPerBatchSlot)
 }
 
 // ---------------------------------------------------------------------------
+// The fused one-level crossings
+// ---------------------------------------------------------------------------
+
+// The fused map must land on the SAME documented layout as the staged one --
+// checked against the layout, not against the staged output, so a shared
+// convention mistake cannot pass -- while spending ONE level where the staged
+// path spends two.
+TEST(HEonGPU, CKKS_Llama3Rect_FusedSlotCrossingIsOneLevelEachWay)
+{
+    Fixture fx(6, 3);
+    const int d = Fixture::d;
+    const int step = fx.blocks();
+    const int channels = fx.half();
+
+    const std::vector<double> x = random_matrix(d, channels, 34343u);
+    heongpu::llama::RectActivation ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+
+    std::vector<heongpu::Ciphertext<S>> staged =
+        fx.op->to_slots(ct, *fx.galois);
+
+    fx.op->set_fused_crossings(true);
+    std::vector<heongpu::Ciphertext<S>> fused =
+        fx.op->to_slots(ct, *fx.galois);
+    ASSERT_EQ(fused.size(), static_cast<size_t>(d));
+
+    EXPECT_EQ(staged.front().depth(), 2);
+    EXPECT_EQ(fused.front().depth(), 1);
+
+    auto layout_error = [&](std::vector<heongpu::Ciphertext<S>>& slots) {
+        double worst = 0.0;
+        for (int j = 0; j < d; ++j)
+        {
+            heongpu::Plaintext<S> plain(fx.context);
+            fx.decryptor->decrypt(plain, slots[j]);
+            std::vector<double> values;
+            fx.encoder->decode(values, plain);
+            for (int b = 0; b < step; ++b)
+                for (int u = 0; u < d; ++u)
+                {
+                    const double want =
+                        x[static_cast<size_t>(u) * channels + b * d + j];
+                    worst = std::max(
+                        worst, std::abs(values[b + u * step] - want));
+                }
+        }
+        return worst;
+    };
+
+    const double staged_err = layout_error(staged);
+    const double fused_err = layout_error(fused);
+    std::cout << "to_slots layout worst error, staged " << staged_err
+              << " fused " << fused_err << std::endl;
+    EXPECT_LT(fused_err, 1e-3);
+
+    // And back: one more level, not two, onto the rectangular layout.
+    heongpu::llama::RectActivation back =
+        fx.op->from_slots(fused, channels, *fx.galois);
+    EXPECT_EQ(back.column.front().depth(), 2);
+
+    const std::vector<double> got =
+        fx.op->decrypt(back, *fx.decryptor, back.column.front().scale());
+    const double round = worst_diff(x, got);
+    std::cout << "fused slot round trip worst error: " << round << std::endl;
+    EXPECT_LT(round, 1e-3);
+}
+
+// Same discipline for the batch crossing: the fused to_batch must hand
+// Algorithm 4 the same head-per-batch-slot matrix encryption, at depth 1
+// instead of 3, and the fused round trip must come back at depth 2 instead of
+// the staged path's 6.
+TEST(HEonGPU, CKKS_Llama3Rect_FusedBatchCrossingIsOneLevelEachWay)
+{
+    Fixture fx(8, 4);
+    const int d = Fixture::d;
+    const int step = fx.blocks();
+    const int channels = fx.half();
+
+    const std::vector<double> x = random_matrix(d, channels, 56565u);
+    heongpu::llama::RectActivation ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+
+    heongpu::llama::BatchActivation staged =
+        fx.op->to_batch(ct, 0, *fx.galois);
+
+    fx.op->set_fused_crossings(true);
+    heongpu::llama::BatchActivation fused = fx.op->to_batch(ct, 0, *fx.galois);
+    ASSERT_EQ(fused.column.size(), static_cast<size_t>(d));
+    ASSERT_EQ(fused.rows, d);
+
+    EXPECT_EQ(staged.column.front().depth(), 3);
+    EXPECT_EQ(fused.column.front().depth(), 1);
+
+    auto head_error = [&](heongpu::llama::BatchActivation& batch) {
+        const std::vector<std::vector<double>> got = fx.batch->decrypt(
+            batch, *fx.decryptor, batch.column.front().scale());
+        double worst = 0.0;
+        for (int b = 0; b < step; ++b)
+            for (int u = 0; u < d; ++u)
+                for (int j = 0; j < d; ++j)
+                {
+                    const double want =
+                        x[static_cast<size_t>(u) * channels + b * d + j];
+                    worst = std::max(
+                        worst,
+                        std::abs(got[b][static_cast<size_t>(u) * d + j] -
+                                 want));
+                }
+        return worst;
+    };
+
+    const double staged_err = head_error(staged);
+    const double fused_err = head_error(fused);
+    std::cout << "to_batch worst error, staged " << staged_err << " fused "
+              << fused_err << std::endl;
+    EXPECT_LT(fused_err, 1e-3);
+
+    std::vector<heongpu::llama::BatchActivation> groups;
+    groups.push_back(std::move(fused));
+    heongpu::llama::RectActivation back =
+        fx.op->from_batch(groups, channels, *fx.galois);
+    EXPECT_EQ(back.column.front().depth(), 2);
+
+    const std::vector<double> got =
+        fx.op->decrypt(back, *fx.decryptor, back.column.front().scale());
+    const double round = worst_diff(x, got);
+    std::cout << "fused batch round trip worst error: " << round << std::endl;
+    EXPECT_LT(round, 1e-3);
+}
+
+// ---------------------------------------------------------------------------
 // Algorithm 5 as the projection
 // ---------------------------------------------------------------------------
 
