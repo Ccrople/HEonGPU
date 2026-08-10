@@ -1185,3 +1185,22 @@ runs single-ring; wiring it onto these proven pieces is the remaining
 engineering. (5) Generating the 62-key wide set exhausts a cold 40.9 GiB
 RMM pool (keygen transients); a short-chain context for standalone key
 generation, or a warmed pool, works around it.
+
+### 13.1 The dnum decision record (folded from the untracked Doing.md, 2026-08-10)
+
+The key-switch memory investigation that fixed dnum = 4 for the single-ring
+block, in brief: Galois keys are always allocated at the top-of-chain width
+(16*ceil(|Q|/|P|)*(|Q|+|P|)*N per element, no leveling); the 42.9 GiB
+"peak" in §12.1 is the RMM pool's 0.9-of-free reservation, not a working
+set (live use ~13-15 GiB), so key memory was never the binding constraint
+it appeared to be. The dnum sweep model puts the knee at **dnum = 4
+(|P| = 10)**: mod-down 84.6% -> ~5%, ~5.4x on the block, 25 GiB of keys,
+and |P| <= 15 also clears two fixed-size local-array overruns in
+switchkey.cu (`last_ct[15]`, `partial[20]`) that |P| = 40 and |P| = 20
+silently exceed. The staged mod-down kernel merged from
+`HEonGPU_LLama3_8B_moddown` attacks the same P^2 term at dnum = 1 with no
+key cost — the two are substitutes; measure them together before stacking.
+Still open from that investigation: a rotate-after-mod-drop test (the
+leveled key-switch path has no coverage), pointing ReportMemory at the
+pool's live counter, and level-truncated Galois keys (~30% off any dnum
+choice).
