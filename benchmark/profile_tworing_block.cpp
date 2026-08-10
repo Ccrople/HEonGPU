@@ -1029,22 +1029,43 @@ int main()
     std::vector<double> p_host;     // masked softmax result, per head
     std::vector<double> scores_dbg; // gain-scaled scores, pre-shift
 
+    // Every wide bridge runs on the CHEAP side: up-crossings at l = 2
+    // (pre-boot; a slot-form boot is clean at exact scale), down-crossings
+    // standardized at l = 5 -- so the bridge's plaintext-diagonal cache
+    // holds exactly two small sets (l=2 up, l=5 down) instead of the
+    // ~8.6 GiB a single high-level set costs. Only the 63-diagonal block
+    // map runs high.
+    const int FROM_L = 5;
+    auto drop_big_to = [&](std::vector<Ct>& cts, int l) {
+        for (auto& c : cts)
+            while (tr.L_hi - c.depth() > l)
+                tr.arith_hi->mod_drop_inplace(c);
+    };
+    auto from_slots_low = [&](std::vector<Ct>& slots) {
+        drop_big_to(slots, FROM_L);
+        return tr.wide_from_slots(slots);
+    };
+
     // ---- RMSNorm at the big ring, on an island RECT activation. --------
-    // One ascend + boot serves TWO consumers: the norm path (bridge +
-    // block map -> rms_norm -> block map + bridge -> descend) and the
-    // residual "skip" copy (the same refreshed big cts, dropped and
-    // descended untouched). Both come back as island RECT at l = shared-.
+    // One ascend + boot serves TWO consumers: the norm path (block map ->
+    // rms_norm -> block map -> bridge down) and the residual "skip" copy
+    // (the same refreshed slots bridged straight back down, untouched).
     const int nct_wide = d / tr.k;
     const double eps_norm = 1e-5;
     auto wide_rms_norm = [&](RectActivation& x, const std::vector<double>& g,
                              double s_lo, double s_hi, RectActivation& normed,
                              RectActivation& skip) {
         std::vector<Ct> big = tr.ascend(x.column);
-        tr.refresh(big, "norm");
+        drop_big_to(big, 2);
+        std::vector<Ct> slots = tr.wide_to_slots(big); // l = 1
+        tr.refresh(slots, "norm");                     // boot -> 17
 
-        // The skip copy first, while `big` is untouched at l = 17.
+        // The skip copy: the raw bridged slots go straight back down --
+        // from_slots(to_slots(x)) is the identity, so this IS the
+        // refreshed stream.
         {
-            std::vector<Ct> skip_big = big;
+            std::vector<Ct> skip_slots = slots;
+            std::vector<Ct> skip_big = from_slots_low(skip_slots);
             std::vector<Ct> cols = tr.descend(skip_big, shared);
             skip.column = std::move(cols);
             skip.rows = d;
@@ -1052,7 +1073,11 @@ int main()
             skip.channels = model;
         }
 
-        std::vector<Ct> slots = tr.rect_cross_up(big);
+        // The block map completes the RECT crossing at the top.
+        ledger.charge("wide.block_map", [&]() {
+            tr.wide_rect->block_map(slots, true, "wide.block_inverse",
+                                    *tr.galois_hi);
+        });
 
         heongpu::llama::Llama3Operator::RMSNormConfig cfg;
         cfg.stride = slots_hi;
@@ -1087,7 +1112,11 @@ int main()
             for (auto& c : slots)
                 tr.arith_hi->match_scale(c, tr.scale);
         });
-        std::vector<Ct> big_out = tr.rect_cross_down(slots);
+        ledger.charge("wide.block_map", [&]() {
+            tr.wide_rect->block_map(slots, false, "wide.block_forward",
+                                    *tr.galois_hi);
+        });
+        std::vector<Ct> big_out = from_slots_low(slots);
         std::vector<Ct> cols = tr.descend(big_out, shared);
         normed.column = std::move(cols);
         normed.rows = d;
@@ -1206,7 +1235,7 @@ int main()
                      [&](int b, int u, int key) {
                          return p_host[(std::size_t(b) * d + u) * d + key];
                      });
-        std::vector<Ct> pbig = tr.wide_from_slots(sslots);
+        std::vector<Ct> pbig = from_slots_low(sslots);
         // The PV window needs P at l = shared with 2 products ahead. If a
         // deeper-than-budgeted softmax fit ate the slack, refresh P here
         // (the D4 fallback); with the S = 12 budget this never fires.
@@ -1293,10 +1322,18 @@ int main()
             });
             std::vector<Ct> gbig = tr.ascend(gate.column);
             std::vector<Ct> ubig = tr.ascend(up.column);
-            tr.refresh(gbig, "ffn_gate");
-            tr.refresh(ubig, "ffn_up");
-            std::vector<Ct> gslots = tr.rect_cross_up(gbig);
-            std::vector<Ct> uslots = tr.rect_cross_up(ubig);
+            drop_big_to(gbig, 2);
+            drop_big_to(ubig, 2);
+            std::vector<Ct> gslots = tr.wide_to_slots(gbig);
+            std::vector<Ct> uslots = tr.wide_to_slots(ubig);
+            tr.refresh(gslots, "ffn_gate");
+            tr.refresh(uslots, "ffn_up");
+            ledger.charge("wide.block_map", [&]() {
+                tr.wide_rect->block_map(gslots, true, "wide.block_inverse",
+                                        *tr.galois_hi);
+                tr.wide_rect->block_map(uslots, true, "wide.block_inverse",
+                                        *tr.galois_hi);
+            });
             ledger.charge("swiglu", [&]() {
                 const int silu_degree = EnvInt("HEONGPU_TB_SILU_DEGREE", 31);
                 for (std::size_t j = 0; j < gslots.size(); ++j)
@@ -1311,7 +1348,11 @@ int main()
                         act, uslots[j], *tr.relin_hi);
                 }
             });
-            std::vector<Ct> hbig = tr.rect_cross_down(gslots);
+            ledger.charge("wide.block_map", [&]() {
+                tr.wide_rect->block_map(gslots, false, "wide.block_forward",
+                                        *tr.galois_hi);
+            });
+            std::vector<Ct> hbig = from_slots_low(gslots);
             std::vector<Ct> hcols = tr.descend(hbig, shared);
             RectActivation h;
             h.column = std::move(hcols);
