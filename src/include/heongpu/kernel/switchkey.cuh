@@ -95,6 +95,23 @@ namespace heongpu
         int d, int current_Qtilda_size, int current_Q_size, int level,
         int* mod_index);
 
+    // Staged D -> Q~ conversion, stage one: scale each digit residue by its
+    // inverse punctured product and stage it with the float overflow estimate
+    // r, replacing the legacy kernel's fixed partial[20] array, which a
+    // dnum = 1 digit (I_j = Q_size) overflows.
+    __global__ void base_conversion_DtoQtilde_partial_leveled_kernel(
+        Data64* ciphertext, Data64* partial_out, Data64* r_out,
+        Modulus64* modulus, Data64* Mi_inv_D_to_Qtilda, int* I_j_,
+        int* I_location_, int n_power);
+
+    // Staged D -> Q~ conversion, stage two: one thread per (coefficient,
+    // output limb, digit) consuming the staged residues.
+    __global__ void base_conversion_DtoQtilde_gather_leveled_kernel(
+        Data64* partial_in, Data64* r_in, Data64* output, Modulus64* modulus,
+        Data64* base_change_matrix_D_to_Qtilda, Data64* prod_D_to_Qtilda,
+        int* I_j_, int* I_location_, int n_power, int current_Qtilda_size,
+        int current_Q_size, int level);
+
     __global__ void multiply_accumulate_extended_kernel(
         Data64* input, Data64* relinkey, Data64* output, Modulus64* B_prime,
         int n_power, int d_tilda, int d, int r_prime);

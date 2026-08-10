@@ -171,6 +171,54 @@ namespace heongpu
                                      stream);
             }
         }
+
+        /// Staged replacement for base_conversion_DtoQtilde_relin_leveled:
+        /// stage each digit's scaled residues and overflow estimate once,
+        /// then gather with one thread per (coefficient, output limb, digit)
+        /// instead of one thread looping over every output limb. Arithmetic
+        /// and accumulation order are unchanged, so the output is
+        /// bit-identical.
+        void base_conversion_DtoQtilde_leveled_staged(
+            Data64* input, Data64* output, Modulus64* modulus,
+            Data64* base_change_matrix, Data64* Mi_inv, Data64* prod, int* I_j,
+            int* I_location, int n, int n_power, int d,
+            int current_rns_mod_count, int current_decomp_count, int level,
+            int* prime_location, cudaStream_t stream)
+        {
+            DeviceVector<Data64> staged(
+                static_cast<size_t>(current_decomp_count + d) * n, stream);
+            Data64* partial = staged.data();
+            Data64* r_values =
+                staged.data() + (static_cast<size_t>(current_decomp_count) * n);
+            base_conversion_DtoQtilde_partial_leveled_kernel<<<
+                dim3((n >> 8), d, 1), 256, 0, stream>>>(
+                input, partial, r_values, modulus, Mi_inv, I_j, I_location,
+                n_power);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+            base_conversion_DtoQtilde_gather_leveled_kernel<<<
+                dim3((n >> 8), current_rns_mod_count, d), 256, 0, stream>>>(
+                partial, r_values, output, modulus, base_change_matrix, prod,
+                I_j, I_location, n_power, current_rns_mod_count,
+                current_decomp_count, level);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+            if (moddown_check_enabled())
+            {
+                DeviceVector<Data64> legacy(
+                    static_cast<size_t>(d) * current_rns_mod_count * n, stream);
+                base_conversion_DtoQtilde_relin_leveled_kernel<<<
+                    dim3((n >> 8), d, 1), 256, 0, stream>>>(
+                    input, legacy.data(), modulus, base_change_matrix, Mi_inv,
+                    prod, I_j, I_location, n_power, d, current_rns_mod_count,
+                    current_decomp_count, level, prime_location);
+                HEONGPU_CUDA_CHECK(cudaGetLastError());
+                compare_device_words("base_conversion_DtoQtilde",
+                                     legacy.data(), output,
+                                     static_cast<size_t>(d) *
+                                         current_rns_mod_count * n,
+                                     stream);
+            }
+        }
     } // namespace
 
     __host__
@@ -1226,10 +1274,7 @@ namespace heongpu
         Data64* temp2_relin = temp1_relin + (context_->n * context_->Q_size *
                                              context_->Q_prime_size);
 
-        base_conversion_DtoQtilde_relin_leveled_kernel<<<
-            dim3((context_->n >> 8),
-                 context_->d_leveled->operator[](input1.depth_), 1),
-            256, 0, stream>>>(
+        base_conversion_DtoQtilde_leveled_staged(
             input1.data() + (current_decomp_count << (context_->n_power + 1)),
             temp1_relin, context_->modulus_->data(),
             context_->base_change_matrix_D_to_Qtilda_leveled
@@ -1242,10 +1287,10 @@ namespace heongpu
                 .data(),
             context_->I_j_leveled->operator[](input1.depth_).data(),
             context_->I_location_leveled->operator[](input1.depth_).data(),
-            context_->n_power, context_->d_leveled->operator[](input1.depth_),
+            context_->n, context_->n_power,
+            context_->d_leveled->operator[](input1.depth_),
             current_rns_mod_count, current_decomp_count, input1.depth_,
-            context_->prime_location_leveled->data() + location);
-        HEONGPU_CUDA_CHECK(cudaGetLastError());
+            context_->prime_location_leveled->data() + location, stream);
 
         gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
             .n_power = context_->n_power,
@@ -1783,10 +1828,7 @@ namespace heongpu
             counter--;
         }
 
-        base_conversion_DtoQtilde_relin_leveled_kernel<<<
-            dim3((context_->n >> 8),
-                 context_->d_leveled->operator[](input1.depth_), 1),
-            256, 0, stream>>>(
+        base_conversion_DtoQtilde_leveled_staged(
             temp0_rotation + (current_decomp_count << context_->n_power),
             temp3_rotation, context_->modulus_->data(),
             context_->base_change_matrix_D_to_Qtilda_leveled
@@ -1799,10 +1841,10 @@ namespace heongpu
                 .data(),
             context_->I_j_leveled->operator[](input1.depth_).data(),
             context_->I_location_leveled->operator[](input1.depth_).data(),
-            context_->n_power, context_->d_leveled->operator[](input1.depth_),
+            context_->n, context_->n_power,
+            context_->d_leveled->operator[](input1.depth_),
             current_rns_mod_count, current_decomp_count, input1.depth_,
-            context_->prime_location_leveled->data() + location);
-        HEONGPU_CUDA_CHECK(cudaGetLastError());
+            context_->prime_location_leveled->data() + location, stream);
 
         gpuntt::GPU_NTT_Modulus_Ordered_Inplace(
             temp3_rotation, context_->ntt_table_->data(),
@@ -2090,10 +2132,7 @@ namespace heongpu
             counter--;
         }
 
-        base_conversion_DtoQtilde_relin_leveled_kernel<<<
-            dim3((context_->n >> 8),
-                 context_->d_leveled->operator[](input1.depth_), 1),
-            256, 0, stream>>>(
+        base_conversion_DtoQtilde_leveled_staged(
             temp2_rotation, temp3_rotation, context_->modulus_->data(),
             context_->base_change_matrix_D_to_Qtilda_leveled
                 ->
@@ -2105,10 +2144,10 @@ namespace heongpu
                 .data(),
             context_->I_j_leveled->operator[](input1.depth_).data(),
             context_->I_location_leveled->operator[](input1.depth_).data(),
-            context_->n_power, context_->d_leveled->operator[](input1.depth_),
+            context_->n, context_->n_power,
+            context_->d_leveled->operator[](input1.depth_),
             current_rns_mod_count, current_decomp_count, input1.depth_,
-            context_->prime_location_leveled->data() + location);
-        HEONGPU_CUDA_CHECK(cudaGetLastError());
+            context_->prime_location_leveled->data() + location, stream);
 
         gpuntt::GPU_NTT_Modulus_Ordered_Inplace(
             temp3_rotation, context_->ntt_table_->data(),
@@ -2372,10 +2411,7 @@ namespace heongpu
             counter--;
         }
 
-        base_conversion_DtoQtilde_relin_leveled_kernel<<<
-            dim3((context_->n >> 8),
-                 context_->d_leveled->operator[](input1.depth_), 1),
-            256, 0, stream>>>(
+        base_conversion_DtoQtilde_leveled_staged(
             temp0_rotation + (current_decomp_count << context_->n_power),
             temp3_rotation, context_->modulus_->data(),
             context_->base_change_matrix_D_to_Qtilda_leveled
@@ -2388,10 +2424,10 @@ namespace heongpu
                 .data(),
             context_->I_j_leveled->operator[](input1.depth_).data(),
             context_->I_location_leveled->operator[](input1.depth_).data(),
-            context_->n_power, context_->d_leveled->operator[](input1.depth_),
+            context_->n, context_->n_power,
+            context_->d_leveled->operator[](input1.depth_),
             current_rns_mod_count, current_decomp_count, input1.depth_,
-            context_->prime_location_leveled->data() + location);
-        HEONGPU_CUDA_CHECK(cudaGetLastError());
+            context_->prime_location_leveled->data() + location, stream);
 
         gpuntt::GPU_NTT_Modulus_Ordered_Inplace(
             temp3_rotation, context_->ntt_table_->data(),
@@ -3161,8 +3197,7 @@ namespace heongpu
                                        stream);
 
             {
-                base_conversion_DtoQtilde_relin_leveled_kernel<<<
-                    dim3((n >> 8), d_level, 1), 256, 0, stream>>>(
+                base_conversion_DtoQtilde_leveled_staged(
                     temp0.data() + (current_decomp_count << context_->n_power),
                     temp3.data(), context_->modulus_->data(),
                     context_->base_change_matrix_D_to_Qtilda_leveled
@@ -3177,10 +3212,10 @@ namespace heongpu
                     context_->I_j_leveled->operator[](current_level).data(),
                     context_->I_location_leveled->operator[](current_level)
                         .data(),
-                    context_->n_power, d_level, current_rns_mod_count,
+                    n, context_->n_power, d_level, current_rns_mod_count,
                     current_decomp_count, current_level,
-                    context_->prime_location_leveled->data() + location);
-                HEONGPU_CUDA_CHECK(cudaGetLastError());
+                    context_->prime_location_leveled->data() + location,
+                    stream);
             }
 
             {
@@ -3395,8 +3430,7 @@ namespace heongpu
 
                 // Decompose u1_Q -> PQ_l coeff, then NTT
                 {
-                    base_conversion_DtoQtilde_relin_leveled_kernel<<<
-                        dim3((n >> 8), d_level, 1), 256, 0, stream>>>(
+                    base_conversion_DtoQtilde_leveled_staged(
                         u1_Q.data(), temp3_gs.data(),
                         context_->modulus_->data(),
                         context_->base_change_matrix_D_to_Qtilda_leveled
@@ -3411,10 +3445,10 @@ namespace heongpu
                         context_->I_j_leveled->operator[](current_level).data(),
                         context_->I_location_leveled->operator[](current_level)
                             .data(),
-                        context_->n_power, d_level, current_rns_mod_count,
+                        n, context_->n_power, d_level, current_rns_mod_count,
                         current_decomp_count, current_level,
-                        context_->prime_location_leveled->data() + location);
-                    HEONGPU_CUDA_CHECK(cudaGetLastError());
+                        context_->prime_location_leveled->data() + location,
+                        stream);
                 }
 
                 {
@@ -5333,11 +5367,7 @@ namespace heongpu
                     counter--;
                 }
 
-                base_conversion_DtoQtilde_relin_leveled_kernel<<<
-                    dim3((context_->n >> 8),
-                         context_->d_leveled->operator[](first_cipher.depth_),
-                         1),
-                    256, 0, stream>>>(
+                base_conversion_DtoQtilde_leveled_staged(
                     temp0_rotation +
                         (current_decomp_count << context_->n_power),
                     temp3_rotation, context_->modulus_->data(),
@@ -5358,12 +5388,12 @@ namespace heongpu
                     context_->I_location_leveled->operator[](
                                                     first_cipher.depth_)
                         .data(),
-                    context_->n_power,
+                    context_->n, context_->n_power,
                     context_->d_leveled->operator[](first_cipher.depth_),
                     current_rns_mod_count, current_decomp_count,
                     first_cipher.depth_,
-                    context_->prime_location_leveled->data() + location);
-                HEONGPU_CUDA_CHECK(cudaGetLastError());
+                    context_->prime_location_leveled->data() + location,
+                    stream);
 
                 gpuntt::GPU_NTT_Modulus_Ordered_Inplace(
                     temp3_rotation, context_->ntt_table_->data(),
@@ -5476,12 +5506,7 @@ namespace heongpu
                         counter--;
                     }
 
-                    base_conversion_DtoQtilde_relin_leveled_kernel<<<
-                        dim3((context_->n >> 8),
-                             context_->d_leveled->operator[](
-                                 first_cipher.depth_),
-                             1),
-                        256, 0, stream>>>(
+                    base_conversion_DtoQtilde_leveled_staged(
                         temp0_rotation +
                             (current_decomp_count << context_->n_power),
                         temp3_rotation, context_->modulus_->data(),
@@ -5503,12 +5528,12 @@ namespace heongpu
                             ->
                             operator[](first_cipher.depth_)
                             .data(),
-                        context_->n_power,
+                        context_->n, context_->n_power,
                         context_->d_leveled->operator[](first_cipher.depth_),
                         current_rns_mod_count, current_decomp_count,
                         first_cipher.depth_,
-                        context_->prime_location_leveled->data() + location);
-                    HEONGPU_CUDA_CHECK(cudaGetLastError());
+                        context_->prime_location_leveled->data() + location,
+                        stream);
 
                     gpuntt::GPU_NTT_Modulus_Ordered_Inplace(
                         temp3_rotation, context_->ntt_table_->data(),

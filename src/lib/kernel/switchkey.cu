@@ -1047,6 +1047,82 @@ namespace heongpu
         }
     }
 
+    // Staged D -> Q~ conversion, stage one. The legacy kernel keeps the
+    // scaled digit residues in a fixed partial[20] array that a dnum = 1
+    // digit (I_j = Q_size) overflows, and one thread serially produces every
+    // output limb. Staging the residues removes the array and lets stage two
+    // spread the limbs across the grid. The float accumulation order is
+    // unchanged, so r_ and every output word stay bit-identical.
+    __global__ void base_conversion_DtoQtilde_partial_leveled_kernel(
+        Data64* ciphertext, Data64* partial_out, Data64* r_out,
+        Modulus64* modulus, Data64* Mi_inv_D_to_Qtilda, int* I_j_,
+        int* I_location_, int n_power)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // Ring Sizes
+        int block_y = blockIdx.y; // d
+
+        const int I_j = I_j_[block_y];
+        int I_location = I_location_[block_y];
+
+        int location = idx + (I_location << n_power);
+
+        float r = 0;
+        float div;
+        float mod;
+        for (int i = 0; i < I_j; i++)
+        {
+            Data64 temp = ciphertext[location + (i << n_power)];
+            Data64 partial_i =
+                OPERATOR_GPU_64::mult(temp, Mi_inv_D_to_Qtilda[I_location + i],
+                                      modulus[I_location + i]);
+            partial_out[location + (i << n_power)] = partial_i;
+            div = static_cast<float>(partial_i);
+            mod = static_cast<float>(modulus[I_location + i].value);
+            r += (div / mod);
+        }
+
+        r = round(r);
+        r_out[idx + (block_y << n_power)] = static_cast<Data64>(r);
+    }
+
+    __global__ void base_conversion_DtoQtilde_gather_leveled_kernel(
+        Data64* partial_in, Data64* r_in, Data64* output, Modulus64* modulus,
+        Data64* base_change_matrix_D_to_Qtilda, Data64* prod_D_to_Qtilda,
+        int* I_j_, int* I_location_, int n_power, int current_Qtilda_size,
+        int current_Q_size, int level)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // Ring Sizes
+        int i = blockIdx.y; // Qtilda limb
+        int block_z = blockIdx.z; // d
+
+        const int I_j = I_j_[block_z];
+        int I_location = I_location_[block_z];
+
+        int location = idx + (I_location << n_power);
+        int location_out = idx + ((block_z * current_Qtilda_size) << n_power);
+        int matrix_index = I_location * current_Qtilda_size;
+        int mod_location = (i < current_Q_size) ? i : (i + level);
+
+        Data64 temp = 0;
+        for (int j = 0; j < I_j; j++)
+        {
+            Data64 mult = OPERATOR_GPU_64::reduce_forced(
+                partial_in[location + (j << n_power)], modulus[mod_location]);
+            mult = OPERATOR_GPU_64::mult(
+                mult,
+                base_change_matrix_D_to_Qtilda[j + (i * I_j) + matrix_index],
+                modulus[mod_location]);
+            temp = OPERATOR_GPU_64::add(temp, mult, modulus[mod_location]);
+        }
+
+        Data64 r_mul = OPERATOR_GPU_64::mult(
+            r_in[idx + (block_z << n_power)],
+            prod_D_to_Qtilda[i + (block_z * current_Qtilda_size)],
+            modulus[mod_location]);
+        r_mul = OPERATOR_GPU_64::sub(temp, r_mul, modulus[mod_location]);
+        output[location_out + (i << n_power)] = r_mul;
+    }
+
     __global__ void multiply_accumulate_extended_kernel(
         Data64* input, Data64* relinkey, Data64* output, Modulus64* B_prime,
         int n_power, int d_tilda, int d, int r_prime)
