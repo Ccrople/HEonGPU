@@ -25,6 +25,9 @@ namespace heongpu
      * copies of it through host memory and uploading all of them: 960 MiB per
      * projection at the 8B shape, against 64 MiB for the coefficients alone.
      *
+     * One thread per coefficient, walking every limb, so the coefficient is
+     * read once and the launch is one-dimensional.
+     *
      * @param out      [num_limbs][per_limb] destination.
      * @param coeffs   [per_limb] centred coefficients, shared by every limb.
      */

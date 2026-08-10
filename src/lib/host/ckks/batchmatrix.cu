@@ -581,12 +581,8 @@ namespace heongpu
                                       per_limb);
         {
             const int expand_threads = 256;
-            const unsigned rows_of_limbs =
-                static_cast<unsigned>(num_limbs < 32 ? num_limbs : 32);
-            const dim3 expand_grid(
-                static_cast<unsigned>((per_limb + expand_threads - 1) /
-                                      expand_threads),
-                rows_of_limbs);
+            const dim3 expand_grid(static_cast<unsigned>(
+                (per_limb + expand_threads - 1) / expand_threads));
             bm_crt_expand_kernel<<<expand_grid, expand_threads>>>(
                 plain_.data(), source.data(), t.modulus.data(), per_limb,
                 num_limbs);

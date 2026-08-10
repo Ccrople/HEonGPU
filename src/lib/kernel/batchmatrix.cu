@@ -17,9 +17,13 @@ namespace heongpu
 
         // One load of the coefficient serves every limb: the array is shared
         // across the RNS base, which is exactly what made the host expansion
-        // write num_limbs copies of it.
+        // write num_limbs copies of it. Walking the limbs inside the thread
+        // rather than across a grid dimension keeps that single load, and
+        // keeps this loop on the path every shape takes -- spreading limbs
+        // over blockIdx.y would leave it dead below 33 limbs, which is every
+        // shape the tests cover and none of the ones the Llama chain runs.
         const int64_t v = coeffs[i];
-        for (int limb = blockIdx.y; limb < num_limbs; limb += gridDim.y)
+        for (int limb = 0; limb < num_limbs; ++limb)
         {
             const Data64 p = modulus[limb].value;
             Data64 r;
