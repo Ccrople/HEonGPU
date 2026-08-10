@@ -866,6 +866,34 @@ namespace heongpu
                 }
             }
 
+            /**
+             * @brief Hoist the crossings' rotation trains.
+             *
+             * Every crossing stage rotates ONE source by many shifts -- the
+             * bridge's and the fused map's baby steps, and the block
+             * transform's whole +-eps walk -- and a key switch spends most
+             * of its time decomposing its input, which does not depend on
+             * the shift. With this on, each such train computes the
+             * decomposition once (hoisted_rotation_train) and each giant
+             * group's plaintext products and additions collapse into one
+             * fused launch (hoisted_bsgs_group_sum); the block transform,
+             * which has no giants, becomes two launches per ciphertext plus
+             * its rescale. The modular arithmetic is identical to the bit;
+             * what falls is the work and the launch count, on a block that
+             * is launch-bound since the mod-down rework.
+             *
+             * Applies to the staged and the fused paths alike, and forwards
+             * to the internal batch operator so the bridge inside every
+             * crossing follows. OFF by default so existing measurements stay
+             * reproducible.
+             */
+            void set_hoisted_crossings(bool on)
+            {
+                hoisted_crossings_ = on;
+                batch_.set_hoisted_crossings(on);
+            }
+            bool hoisted_crossings() const { return hoisted_crossings_; }
+
             // ---------------------------------------------------------------
             // The products
             // ---------------------------------------------------------------
@@ -1323,13 +1351,24 @@ namespace heongpu
             std::array<std::vector<std::vector<Complex64>>, 4> fused_diagonal_;
 
             /// Encoded diagonal sets, keyed by (map, depth, prime) with
-            /// whole-set eviction, exactly the bridge's discipline. A set is
-            /// N/2 plaintexts pre-rotated by their giant step; entries absent
-            /// from the map are structurally zero diagonals.
-            std::map<std::tuple<int, int, uint64_t>,
-                     std::vector<Plaintext<Scheme::CKKS>>>
+            /// whole-set eviction, exactly the bridge's discipline. plains is
+            /// DENSE in BSGS order -- entry i*n1 + j is the diagonal at shift
+            /// i*n1 + j, pre-rotated by its giant step, and a structurally
+            /// zero diagonal holds an encoded zero -- so the hoisted path can
+            /// address groups by arithmetic. packed is the same set laid out
+            /// contiguously at its level's limb count, built the first time
+            /// the hoisted path touches the entry.
+            struct EncodedDiagonalSet
+            {
+                std::vector<Plaintext<Scheme::CKKS>> plains;
+                DeviceVector<Data64> packed;
+            };
+            std::map<std::tuple<int, int, uint64_t>, EncodedDiagonalSet>
                 fused_plain_;
             std::size_t fused_plain_capacity_ = 2;
+
+            /// @see set_hoisted_crossings.
+            bool hoisted_crossings_ = false;
         };
 
     } // namespace llama

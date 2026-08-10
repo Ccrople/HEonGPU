@@ -430,6 +430,134 @@ TEST(HEonGPU, CKKS_Llama3Rect_FusedBatchCrossingIsOneLevelEachWay)
 }
 
 // ---------------------------------------------------------------------------
+// The hoisted rotation trains
+// ---------------------------------------------------------------------------
+
+// Hoisting shares one key-switch decomposition across every train of shifts
+// of the same source -- the bridge's babies, the block walk, the fused map's
+// babies -- and fuses each giant group's plaintext products into one launch.
+// The modular arithmetic is exact and identically ordered, so the hoisted
+// crossings must reproduce the unhoisted ones to the bit: same depths, same
+// decryptions, on the staged path first.
+TEST(HEonGPU, CKKS_Llama3Rect_HoistedStagedCrossingsMatch)
+{
+    Fixture fx(6, 3);
+    const int d = Fixture::d;
+    const int channels = fx.half();
+
+    const std::vector<double> x = random_matrix(d, channels, 90901u);
+    heongpu::llama::RectActivation ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+
+    // Two stages -- bridge babies plus the block walk.
+    std::vector<heongpu::Ciphertext<S>> plain_slots =
+        fx.op->to_slots(ct, *fx.galois);
+    fx.op->set_hoisted_crossings(true);
+    std::vector<heongpu::Ciphertext<S>> hoisted_slots =
+        fx.op->to_slots(ct, *fx.galois);
+    fx.op->set_hoisted_crossings(false);
+
+    ASSERT_EQ(hoisted_slots.size(), plain_slots.size());
+    EXPECT_EQ(hoisted_slots.front().depth(), plain_slots.front().depth());
+
+    double worst = 0.0;
+    for (size_t j = 0; j < plain_slots.size(); ++j)
+    {
+        heongpu::Plaintext<S> pa(fx.context), pb(fx.context);
+        fx.decryptor->decrypt(pa, plain_slots[j]);
+        fx.decryptor->decrypt(pb, hoisted_slots[j]);
+        std::vector<double> va, vb;
+        fx.encoder->decode(va, pa);
+        fx.encoder->decode(vb, pb);
+        for (size_t s = 0; s < va.size(); ++s)
+        {
+            worst = std::max(worst, std::abs(va[s] - vb[s]));
+        }
+    }
+    std::cout << "hoisted vs staged to_slots worst gap: " << worst
+              << std::endl;
+    EXPECT_LT(worst, 1e-9);
+
+    // And all three stages of the batch crossing.
+    heongpu::llama::BatchActivation plain_batch =
+        fx.op->to_batch(ct, 0, *fx.galois);
+    fx.op->set_hoisted_crossings(true);
+    heongpu::llama::BatchActivation hoisted_batch =
+        fx.op->to_batch(ct, 0, *fx.galois);
+    fx.op->set_hoisted_crossings(false);
+
+    EXPECT_EQ(hoisted_batch.column.front().depth(),
+              plain_batch.column.front().depth());
+    const std::vector<std::vector<double>> ga = fx.batch->decrypt(
+        plain_batch, *fx.decryptor, plain_batch.column.front().scale());
+    const std::vector<std::vector<double>> gb = fx.batch->decrypt(
+        hoisted_batch, *fx.decryptor, hoisted_batch.column.front().scale());
+    double worst_b = 0.0;
+    for (size_t s = 0; s < ga.size(); ++s)
+    {
+        for (size_t e = 0; e < ga[s].size(); ++e)
+        {
+            worst_b = std::max(worst_b, std::abs(ga[s][e] - gb[s][e]));
+        }
+    }
+    std::cout << "hoisted vs staged to_batch worst gap: " << worst_b
+              << std::endl;
+    EXPECT_LT(worst_b, 1e-9);
+}
+
+// The same discipline for the fused one-level maps, whose 31 stride-one
+// babies are the largest single train, plus a round trip against the data so
+// a matched pair of mistakes cannot pass.
+TEST(HEonGPU, CKKS_Llama3Rect_HoistedFusedCrossingsMatch)
+{
+    Fixture fx(6, 3);
+    const int d = Fixture::d;
+    const int channels = fx.half();
+
+    const std::vector<double> x = random_matrix(d, channels, 24240u);
+    heongpu::llama::RectActivation ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+
+    fx.op->set_fused_crossings(true);
+    std::vector<heongpu::Ciphertext<S>> plain_slots =
+        fx.op->to_slots(ct, *fx.galois);
+    fx.op->set_hoisted_crossings(true);
+    std::vector<heongpu::Ciphertext<S>> hoisted_slots =
+        fx.op->to_slots(ct, *fx.galois);
+
+    EXPECT_EQ(hoisted_slots.front().depth(), plain_slots.front().depth());
+    double worst = 0.0;
+    for (size_t j = 0; j < plain_slots.size(); ++j)
+    {
+        heongpu::Plaintext<S> pa(fx.context), pb(fx.context);
+        fx.decryptor->decrypt(pa, plain_slots[j]);
+        fx.decryptor->decrypt(pb, hoisted_slots[j]);
+        std::vector<double> va, vb;
+        fx.encoder->decode(va, pa);
+        fx.encoder->decode(vb, pb);
+        for (size_t s = 0; s < va.size(); ++s)
+        {
+            worst = std::max(worst, std::abs(va[s] - vb[s]));
+        }
+    }
+    std::cout << "hoisted vs fused to_slots worst gap: " << worst
+              << std::endl;
+    EXPECT_LT(worst, 1e-9);
+
+    // Hoisted fused round trip, checked against the data itself.
+    heongpu::llama::RectActivation back =
+        fx.op->from_slots(hoisted_slots, channels, *fx.galois);
+    const std::vector<double> got =
+        fx.op->decrypt(back, *fx.decryptor, back.column.front().scale());
+    const double round = worst_diff(x, got);
+    std::cout << "hoisted fused round trip worst error: " << round
+              << std::endl;
+    EXPECT_LT(round, 1e-3);
+    fx.op->set_hoisted_crossings(false);
+    fx.op->set_fused_crossings(false);
+}
+
+// ---------------------------------------------------------------------------
 // Algorithm 5 as the projection
 // ---------------------------------------------------------------------------
 
