@@ -528,50 +528,85 @@ int main()
     }
 
     // ==================================================================
-    // PHASE 3 -- the row bridge at logN 16 at dnum 4: the cost class of
-    // the SlotToSinC conversion the retargeted flow will pay.
+    // PHASE 3 -- the RETARGETED crossing at logN 16 at dnum 4: the row
+    // bridge at the WIDE layout (N_H, d*k), which test_ckks_tworing_bridge
+    // proves is the SlotToSinC map onto the descent contract. Keys are the
+    // BSGS subset -- n1 + n2 - 2 shifts, not d*k - 1.
     // ==================================================================
+    double bridge_up_ms = -1.0;
     if (leg_bridge)
     {
         try
         {
-            heongpu::BatchMatrixLayout layout_hi(int(n_hi), d);
-            heongpu::llama::Llama3BatchOperator batch_hi(big, encoder,
-                                                         layout_hi, scale);
-            std::vector<int> shifts = batch_hi.bridge_rotation_indices();
+            const int k = int(n_hi) / n_is;
+            const int d_wide = d * k;
+            heongpu::BatchMatrixLayout layout_wide(int(n_hi), d_wide);
+            heongpu::llama::Llama3BatchOperator wide(big, encoder,
+                                                     layout_wide, scale);
+            int n1 = 1;
+            while (n1 * n1 * 2 <= d_wide)
+                n1 <<= 1;
+            wide.set_bridge_baby_steps(n1);
+            const int n2 = d_wide / n1;
+            const int step = layout_wide.k / 2;
+            std::vector<int> shifts;
+            for (int j = 1; j < n1; ++j)
+                shifts.push_back(j * step);
+            for (int i = 1; i < n2; ++i)
+                shifts.push_back(i * n1 * step);
             bridge_keys_gib = key_bytes_hi * (shifts.size() + 1) /
                               (1024.0 * 1024.0 * 1024.0);
-            std::cout << "[t16] bridge keys at 16: " << shifts.size()
+            std::cout << "[t16] wide crossing keys (BSGS subset): "
+                      << shifts.size() << " of " << d_wide - 1
                       << " indices, " << std::setprecision(2)
                       << bridge_keys_gib << " GiB by formula at dnum "
                       << dnum << std::endl;
             heongpu::Galoiskey<S> bridge_galois(big, shifts);
             keygen.generate_galois_key(bridge_galois, secret);
 
-            const int blocks_hi = layout_hi.batch;
-            std::vector<std::vector<double>> mats(blocks_hi);
-            std::mt19937_64 rng2(7u);
-            for (auto& m : mats)
-                m = RandomMatrix(std::size_t(d) * d, 0.5, rng2);
-            heongpu::llama::BatchActivation Bh =
-                batch_hi.encrypt(mats, d, d, encryptor, scale);
-            // The bridge sits right before the descent: run it at l = 4.
-            for (auto& c : Bh.column)
-                while (L - c.depth() > 4)
-                    arith.mod_drop_inplace(c);
+            // The stage operand at the 8B shape is d/k big ciphertexts (128
+            // island columns interleaved 8 apiece). Values are irrelevant to
+            // the cost; the layout law is pinned by the test.
+            const int nct = d / k;
+            heongpu::llama::BatchActivation Bh;
+            Bh.rows = d_wide;
+            std::uniform_real_distribution<double> dist(-0.5, 0.5);
+            for (int c = 0; c < nct; ++c)
+            {
+                std::vector<double> msg(int(n_hi) / 2);
+                for (auto& v : msg)
+                    v = dist(rng);
+                heongpu::Plaintext<S> P1(big);
+                encoder.encode(P1, msg, scale);
+                heongpu::Ciphertext<S> C1(big);
+                encryptor.encrypt(C1, P1);
+                while (L - C1.depth() > 4)
+                    arith.mod_drop_inplace(C1);
+                Bh.column.push_back(std::move(C1));
+            }
 
             std::vector<heongpu::Ciphertext<S>> slots_out;
             bridge_ms = BestMs(
                 [&]()
                 {
                     heongpu::llama::BatchActivation work = Bh;
-                    slots_out = batch_hi.to_slots(work, bridge_galois);
+                    slots_out = wide.to_slots(work, bridge_galois);
                 },
                 reps);
-            std::cout << "[t16] row bridge at 16 (to_slots, " << d
-                      << " columns, BSGS, l = 4): " << std::fixed
-                      << std::setprecision(1) << bridge_ms << " ms ("
-                      << bridge_ms / d << " ms per column)" << std::endl;
+            heongpu::llama::BatchActivation back;
+            bridge_up_ms = BestMs(
+                [&]()
+                {
+                    std::vector<heongpu::Ciphertext<S>> work = slots_out;
+                    back = wide.from_slots(work, d_wide, bridge_galois);
+                },
+                reps);
+            std::cout << "[t16] wide crossing at 16 (l = 4, " << nct
+                      << " big cts): to_slots " << std::fixed
+                      << std::setprecision(1) << bridge_ms << " ms, "
+                      << "from_slots " << bridge_up_ms << " ms ("
+                      << (bridge_ms + bridge_up_ms) / nct
+                      << " ms per big ct both ways)" << std::endl;
         }
         catch (const std::exception& e)
         {
@@ -587,8 +622,12 @@ int main()
               << std::endl;
     std::cout << "[t16] softmax(16) per ct        : " << softmax_ms << " ms"
               << std::endl;
-    std::cout << "[t16] bridge(16) per column     : "
-              << (bridge_ms >= 0 ? bridge_ms / d : -1.0) << " ms" << std::endl;
+    const double wide_cts = double(d) * n_is / double(n_hi);
+    std::cout << "[t16] wide crossing per big ct  : "
+              << (bridge_ms >= 0 && bridge_up_ms >= 0
+                      ? (bridge_ms + bridge_up_ms) / wide_cts
+                      : -1.0)
+              << " ms (to_slots + from_slots)" << std::endl;
     std::cout << "[t16] crossing down per big ct  : "
               << (down_ms >= 0 ? down_ms / (2.0 * d * n_is / double(n_hi))
                                : -1.0)
