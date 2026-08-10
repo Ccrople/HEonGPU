@@ -322,9 +322,21 @@ namespace heongpu
             }
 
             // Every ciphertext in the call meets the same diagonals at the same
-            // level, so they are encoded once rather than once per column. The
-            // row bridge does not do this, and plaintext encoding is the single
-            // largest kernel in every profile of that path.
+            // level, so they are encoded once rather than once per column.
+            //
+            // That used to be the difference between this map and the row
+            // bridge, and it no longer is: the row bridge caches its encodings
+            // too, and encoding is 0.02% of a real 8B block. What separates
+            // them now is the OPPOSITE of what this comment used to claim.
+            // The loop below is 2*(k/2) - 1 = 31 diagonals walked one rotation
+            // at a time, and the row bridge's d = 128 are walked baby-step /
+            // giant-step. So the smaller map costs MORE: measured over one 8B
+            // block, this one is 16.5% of GPU time against the row bridge's
+            // 15.4%, 142080 rotations against 137984. BSGS applies here too --
+            // it would take 30 rotations per ciphertext to about 10 -- but the
+            // giant shifts run past the +-(k/2 - 1) window this map's Galois
+            // indices cover, so unlike the row bridge it is not free of new
+            // keys. That is the trade, and it has not been made yet.
             std::vector<Plaintext<Scheme::CKKS>> plain;
             std::vector<int> shift;
             {

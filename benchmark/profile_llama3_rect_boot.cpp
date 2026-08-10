@@ -59,15 +59,24 @@
 //
 //   HEONGPU_BOOT_D=128 HEONGPU_BOOT_CHANNEL_GROUPS=2
 //   HEONGPU_BOOT_HIDDEN_GROUPS=7 HEONGPU_BOOT_KV_HEADS=8
-//   HEONGPU_BOOT_HIDDEN_BLOCK_GROUPS=1 HEONGPU_BOOT_LIMBS=37
+//   HEONGPU_BOOT_HIDDEN_BLOCK_GROUPS=1 HEONGPU_BOOT_LIMBS=40
+//   HEONGPU_BOOT_WEIGHTS=<the fetch script's directory>
 //
 // -> d_model 4096, hidden 14336, 32 heads of 128 over 8 kv heads, 128 tokens.
-// Measured on one A6000: worst stretch 11 -- the same as at half the width,
-// since levels belong to the circuit and not to the model -- 14 refreshes,
-// 2048 Galois keys at 9.25 GiB, and 2964.6 s. LIMBS is the one number worth
-// getting right here: 38 runs the identical schedule in 3358.4 s, because a
-// refresh hands back CHAIN LESS 25 and so one limb off the chain is one limb
-// off a working window of 13, not of 38.
+// Measured on one A6000 with the REAL layer-2 weights: worst stretch 13 at
+// attention.softmaxed, 14 refreshes, 2048 Galois keys at 10.0 GiB, 2425.5 s,
+// and 5.91 bits on the private rows.
+//
+// LIMBS is the one number worth getting right, and 37 -- what this comment
+// used to say, against a stretch of 11 and 2964.6 s -- NO LONGER FITS. A
+// refresh hands back CHAIN LESS 25, so the chain has to cover the worst
+// stretch plus 26. That stretch was 11 while the SoftMax denominator was
+// calibrated without the causal mask's own weight; correcting that widened it
+// to [0.76, 105.7], which takes the reciprocal from degree 15 to degree 63 and
+// from 4 levels to 6. The stretch is now 13, the chain wants 39, and at 37 the
+// block dies inside the SoftMax with gpuntt's "invalid configuration
+// argument" -- which is what running out of chain looks like here, not a level
+// error. 40 is 39 with one to spare.
 // HIDDEN_BLOCK_GROUPS = 1 is what holds the SwiGLU inside the card:
 // it forms, activates, refreshes and projects down one group of 2048 hidden
 // channels at a time, so the 14336 never exists at once.

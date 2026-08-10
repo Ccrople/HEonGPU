@@ -979,3 +979,153 @@ Sylph-12 and Sylph-13 cannot be benchmarked end to end because
 bootstrap key needs a switching key between two *different ring degrees*, which
 `HEKeyGenerator` cannot produce: every key it makes lives in one context, and a
 context owns one `n`.
+
+## 12. One whole block at the real 8B shape, on real weights, by kernel
+
+Target `benchmark/profile_llama3_rect_boot.cpp`, stage `block`, with
+`HEONGPU_BOOT_WEIGHTS` pointing at the directory `fetch_llama3_weights.py`
+wrote: **Meta-Llama-3-8B layer 2**, its true residual stream, d_model 4096,
+hidden 14336, 32 heads of 128 over 8 KV heads, 128 tokens. One A6000.
+
+### 12.1 What it costs
+
+| | |
+|---|---|
+| block compute | **2,425,507 ms = 2425.5 s** |
+| the same block under nsys | 2,444,603 ms — **0.8%** overhead, so the capture is the run |
+| GPU kernel time | 2304.8 s of 2444.6 s = **94.3% busy** — this is *not* launch-bound |
+| kernel launches | 11,503,929 |
+| refreshes | 14 seams, 2432 ciphertext-bootstraps at 493.5 ms each |
+| output | max abs 1.058e-2 against a stream of max 0.6367 → **5.91 bits**, private rows |
+| peak memory | 42.9 GiB of 47.5, Galois key 2048 indices at **10.0 GiB** |
+
+Faster than the 2964.6 s this target's header used to document, and **at a
+longer chain** — 40x80 against 37x74 of key-switch work per switch, ~1.17x
+more. The BSGS row bridge of section 11 is what paid for that.
+
+### 12.2 The chain the schedule now needs: 39, not 37
+
+The header said 37 limbs and a worst stretch of 11. Both are stale, and the
+reason is a *correctness* fix, not a regression: the SoftMax denominator used
+to be calibrated without `causal_column_mask`'s own weight. Correcting it
+widens the range to `[0.7597, 105.7]`, and a Chebyshev `1/x` over a 139x
+spread wants **degree 63 — 6 levels, where degree 15 was 4**.
+
+```
+attention.refresh_post_qk   depth 25   limbs left 15   REFRESH
+attention.shifted           depth 25   spent  0
+attention.softmaxed         depth 38   spent 13        <- the worst stretch
+```
+
+exp deg 15 (4) + causal mask (1) + square (1) + reciprocal deg 63 (6) +
+normalise (1) = **13**. A refresh hands back `chain - 25`, so the chain wants
+`13 + 26 = 39`. At 37 the block dies inside the SoftMax with gpuntt's
+`invalid configuration argument` — which is what running out of chain looks
+like in HEonGPU, not a level error. Measured at 40: worst stretch 13, block
+leaves at depth 29 with 11 limbs unspent.
+
+### 12.3 Which kernel: the mod-down, and it is not close
+
+| kernel | ms | % | calls | role |
+|---|---:|---:|---:|---|
+| `divide_round_lastq_permute_ckks_kernel` | 1,574,750 | **68.32** | 566,030 | mod-down + Galois permute — the tail of every **rotation** |
+| `divide_round_lastq_extended_leveled_kernel` | 375,735 | **16.30** | 94,902 | mod-down — the tail of every **relinearization** |
+| `base_conversion_DtoQtilde_relin_leveled_kernel` | 231,529 | **10.04** | 660,932 | **BConv up**, the decomposition base extension |
+| all 5 NTT kernels together | 63,816 | **2.77** | ~6.2 M | forward + inverse NTT |
+| `bm_gemm_kernel` | 21,045 | 0.91 | 132 | **the actual modular GEMM** |
+| `keyswitch_multiply_accumulate_leveled_method_II_kernel` | 9,496 | 0.41 | 660,932 | the key inner product |
+
+**Key switching is 95.1% of GPU time** by kernel name, ~97.8% counting its
+NTTs. Inside it: **mod-down 84.6%, BConv 10.0%, NTT 2.8%, key product 0.4%.**
+
+So the answer to "is it the NTT for key switching, or the BConv" is **neither**.
+`|P| = |Q| = 40` gives dnum = 1, and the mod-down loops over all 40 special
+primes for each of the L output limbs — **O(L x |P|) = O(L^2) per rotation**.
+This target's own header predicted that ("dnum = 1 ... makes the mod-down
+O(L^2)"); the measurement is that the prediction is 84.6% of the block.
+dnum = 1 is a *key-budget* choice — Algorithm 5 needs N/2 - 1 = 2047 Galois
+keys and nothing else fits on one card — so this is a memory decision being
+paid for in time.
+
+Note the method: `keyswitching_type_` is METHOD_I only when `|P| == 1`, so 40
+special primes selects **METHOD_II**.
+
+### 12.4 Which layout conversion: there are two, and the smaller one costs more
+
+Every kernel charged to the innermost NVTX range open at its launch. nsys
+2022.4.2 has no `nvtx_gpu_proj_sum`, so the interval join is done by hand
+(`nvtx_kernel_join.py`, a stack sweep over range opens/closes and launches in
+timestamp order).
+
+| group | % of GPU time |
+|---|---:|
+| **bootstrapping** — CtoS 22.66, EvalMod 18.89, StoC 10.46 | **52.0** |
+| **layout conversion** | **31.9** |
+| **CMT automorphisms + tweaks** | **14.0** |
+| the matrix products themselves | **1.0** |
+| the non-linear fits | **~1.0** |
+
+The 31.9% is two different objects, and naming them separately is the point:
+
+| conversion | % | rotations | structure |
+|---|---:|---:|---|
+| `bridge.block_inverse` + `bridge.block_forward` | **16.5** | 142,080 | the **block-axis map**: `2(k/2) - 1 = 31` diagonals at unit shift, 30 rotations per ciphertext, **not BSGS'd** |
+| `bridge.to_slots` + `bridge.from_slots` | **15.4** | 137,984 | the **row bridge**, BATCH <-> SLOT: `d = 128` diagonals, BSGS'd to `n1 + n2 - 2 = 22` per column |
+
+**The 31-diagonal map costs more than the 128-diagonal one**, for exactly the
+reason section 11 fixed on the other side: one has baby-step/giant-step and one
+does not. It is the obvious next target — BSGS would take 30 rotations per
+ciphertext to about 10 — but unlike the row bridge it is **not free of new
+keys**: the giant shifts run past the `+-(k/2 - 1)` window this map's Galois
+indices cover.
+
+And `to_batch` / `from_batch` are not single conversions. Each is
+**row bridge -> block map -> row bridge**: three levels, three key-switch
+sweeps.
+
+Plaintext encoding, which the `block_map` comment used to call "the single
+largest kernel in every profile of that path", is now **0.02%**.
+
+### 12.5 Parameters and layout, per function
+
+Context is `sec_level_type::none` — a profiling context, not a secure one:
+N = 4096, log Q = 60 + 39x50 = 2010, log P = 40x60 = 2400, **log PQ = 4410**
+against the 128-bit table's 109 at this ring. Scale 2^50 under a 2^60 bottom
+(the ~2^10 ratio the bootstrap needs), sparse secret h = 16, CtoS 3 / StoC 3 /
+taylor 11, 2047 Algorithm-5 indices + 24 bootstrap indices.
+
+A RECT group is a 128x128 matrix over `R_32` held as 128 ciphertexts:
+ciphertext `j`, block `t`, row `i` is channel `g*2048 + t*128 + j` of token `i`.
+d_model 4096 is 2 groups, so the residual stream is **256 ciphertexts**.
+
+| function | encoding in -> out | cts | levels | dominant cost |
+|---|---|---:|---:|---|
+| `rms_norm` | RECT -> SLOT -> RECT | 256 | 11 | bridge + deg-15 `1/sqrt(x)` |
+| `project.*` (Algorithm 5) | RECT -> RECT | 128/grp | 1 | `CMT.automorphisms`; the GEMM is 6% of it |
+| `attention.to_batch` | RECT -> BATCH | 128 | 3 | row bridge x2 + block map |
+| `CMT` (K transpose) | BATCH -> BATCH | 128 | 0 | automorphisms |
+| `attention.scores` (Algorithm 4) | BATCH x BATCH -> BATCH | 128 | 1 | |
+| `attention.to_slots` | BATCH -> SLOT | 128 | 1 | row bridge |
+| `softmax` | SLOT -> SLOT | 128 | **13** | see 12.2 |
+| `attention.from_slots` | SLOT -> BATCH | 128 | 1 | |
+| `attention.value_product` (Algorithm 4) | BATCH x BATCH -> BATCH | 128 | 1 | |
+| `attention.from_batch` + `W_o` | BATCH -> RECT | 128 | 4 | row bridge x2 + block map + PCMM |
+| `ffn.to_slots` | RECT -> SLOT | 128 | 2 | row bridge + block map |
+| `ffn.silu` | SLOT -> SLOT | 128 | 4 | deg-15 fit |
+| `ffn.gate_product` | SLOT | 128 | 1 | |
+| `ffn.from_slots` | SLOT -> RECT | 128 | 2 | |
+
+Halves by wall time: attention 1001.1 s (41.0%), feed-forward 1315.5 s (53.9%),
+`bootstrap` 1200.1 s (49.1%) spread across both.
+
+### 12.6 What this says to do next
+
+1. **The mod-down is the block.** 84.6% of GPU time in one O(L^2) kernel that is
+   quadratic only because dnum = 1, and dnum = 1 only because Algorithm 5 wants
+   2047 Galois keys. The lever is the key count, not the kernel.
+2. **BSGS the block-axis map** — 16.5%, and the only conversion left walking its
+   diagonals one at a time. Costs new Galois indices, which is why it is a
+   trade and not a free win.
+3. **The arithmetic is 1%.** Every remaining optimisation on this path is an
+   optimisation of key switching, refreshing, or layout — not of the products
+   the layer exists to compute.
