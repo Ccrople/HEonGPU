@@ -276,6 +276,17 @@ int main(int argc, char* argv[])
                                   : "staged, 2/2/3/3 levels")
               << std::endl;
 
+    // HEONGPU_RECT_HOIST=1 shares one key-switch decomposition across every
+    // rotation train of a crossing and fuses each giant group's plaintext
+    // products into one launch. Bit-identical results; only the work and the
+    // launch count move.
+    const bool hoisted_crossings = EnvInt("HEONGPU_RECT_HOIST", 0) != 0;
+    op.set_hoisted_crossings(hoisted_crossings);
+    std::cout << "[rect] hoisting        : "
+              << (hoisted_crossings ? "on, one ModUp per rotation train"
+                                    : "off, one ModUp per rotation")
+              << std::endl;
+
     std::vector<int> shifts = op.rotation_indices();
     heongpu::Galoiskey<S> galois(context, shifts);
     keygen.generate_galois_key(galois, secret);

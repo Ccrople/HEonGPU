@@ -5312,6 +5312,81 @@ namespace heongpu
         //     first_cipher.data(), result.data(), context_->n_power);
         // HEONGPU_CUDA_CHECK(cudaGetLastError());
 
+        // The decomposition of c1 -- INTT, base conversion to Q~, NTT -- is
+        // the same for every shift in the train: the Galois permutation is
+        // applied by the mod-down tail AFTER the key product, so nothing
+        // before the key product depends on the shift. Building it once and
+        // reusing it is the hoist this function is named for; the loop below
+        // used to rebuild it per shift. The multi-hop fallback rotates
+        // through intermediate ciphertexts and clobbers these buffers, so it
+        // marks the digits stale on its way out.
+        gpuntt::ntt_rns_configuration<Data64> cfg_intt = {
+            .n_power = context_->n_power,
+            .ntt_type = gpuntt::INVERSE,
+            .ntt_layout = gpuntt::PerPolynomial,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding = false,
+            .mod_inverse = context_->n_inverse_->data(),
+            .stream = stream};
+
+        gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
+            .n_power = context_->n_power,
+            .ntt_type = gpuntt::FORWARD,
+            .ntt_layout = gpuntt::PerPolynomial,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding = false,
+            .stream = stream};
+
+        int counter = first_rns_mod_count;
+        int location = 0;
+        for (int i = 0; i < first_cipher.depth_; i++)
+        {
+            location += counter;
+            counter--;
+        }
+
+        bool digits_ready = false;
+        const auto build_digits = [&]()
+        {
+            gpuntt::GPU_INTT(
+                first_cipher.data(), temp0_rotation,
+                context_->intt_table_->data(), context_->modulus_->data(),
+                cfg_intt, 2 * current_decomp_count, current_decomp_count);
+
+            base_conversion_DtoQtilde_leveled_staged(
+                temp0_rotation + (current_decomp_count << context_->n_power),
+                temp3_rotation, context_->modulus_->data(),
+                context_->base_change_matrix_D_to_Qtilda_leveled
+                    ->
+                    operator[](first_cipher.depth_)
+                    .data(),
+                context_->Mi_inv_D_to_Qtilda_leveled
+                    ->
+                    operator[](first_cipher.depth_)
+                    .data(),
+                context_->prod_D_to_Qtilda_leveled
+                    ->
+                    operator[](first_cipher.depth_)
+                    .data(),
+                context_->I_j_leveled->operator[](first_cipher.depth_).data(),
+                context_->I_location_leveled->operator[](first_cipher.depth_)
+                    .data(),
+                context_->n, context_->n_power,
+                context_->d_leveled->operator[](first_cipher.depth_),
+                current_rns_mod_count, current_decomp_count,
+                first_cipher.depth_,
+                context_->prime_location_leveled->data() + location, stream);
+
+            gpuntt::GPU_NTT_Modulus_Ordered_Inplace(
+                temp3_rotation, context_->ntt_table_->data(),
+                context_->modulus_->data(), cfg_ntt,
+                context_->d_leveled->operator[](first_cipher.depth_) *
+                    current_rns_mod_count,
+                current_rns_mod_count, new_prime_locations + location);
+
+            digits_ready = true;
+        };
+
         for (int i = 0; i < n1; i++)
         {
             int offset = ((2 * current_decomp_count) << context_->n_power) * i;
@@ -5340,70 +5415,10 @@ namespace heongpu
             {
                 int galois_elt = galoiselt;
 
-                gpuntt::ntt_rns_configuration<Data64> cfg_intt = {
-                    .n_power = context_->n_power,
-                    .ntt_type = gpuntt::INVERSE,
-                    .ntt_layout = gpuntt::PerPolynomial,
-                    .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
-                    .zero_padding = false,
-                    .mod_inverse = context_->n_inverse_->data(),
-                    .stream = stream};
-
-                gpuntt::GPU_INTT(
-                    first_cipher.data(), temp0_rotation,
-                    context_->intt_table_->data(), context_->modulus_->data(),
-                    cfg_intt, 2 * current_decomp_count, current_decomp_count);
-
-                gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
-                    .n_power = context_->n_power,
-                    .ntt_type = gpuntt::FORWARD,
-                    .ntt_layout = gpuntt::PerPolynomial,
-                    .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
-                    .zero_padding = false,
-                    .stream = stream};
-
-                int counter = first_rns_mod_count;
-                int location = 0;
-                for (int i = 0; i < first_cipher.depth_; i++)
+                if (!digits_ready)
                 {
-                    location += counter;
-                    counter--;
+                    build_digits();
                 }
-
-                base_conversion_DtoQtilde_leveled_staged(
-                    temp0_rotation +
-                        (current_decomp_count << context_->n_power),
-                    temp3_rotation, context_->modulus_->data(),
-                    context_->base_change_matrix_D_to_Qtilda_leveled
-                        ->
-                        operator[](first_cipher.depth_)
-                        .data(),
-                    context_->Mi_inv_D_to_Qtilda_leveled
-                        ->
-                        operator[](first_cipher.depth_)
-                        .data(),
-                    context_->prod_D_to_Qtilda_leveled
-                        ->
-                        operator[](first_cipher.depth_)
-                        .data(),
-                    context_->I_j_leveled->operator[](first_cipher.depth_)
-                        .data(),
-                    context_->I_location_leveled->operator[](
-                                                    first_cipher.depth_)
-                        .data(),
-                    context_->n, context_->n_power,
-                    context_->d_leveled->operator[](first_cipher.depth_),
-                    current_rns_mod_count, current_decomp_count,
-                    first_cipher.depth_,
-                    context_->prime_location_leveled->data() + location,
-                    stream);
-
-                gpuntt::GPU_NTT_Modulus_Ordered_Inplace(
-                    temp3_rotation, context_->ntt_table_->data(),
-                    context_->modulus_->data(), cfg_ntt,
-                    context_->d_leveled->operator[](first_cipher.depth_) *
-                        current_rns_mod_count,
-                    current_rns_mod_count, new_prime_locations + location);
 
                 // MultSum
                 // TODO: make it efficient
@@ -5606,9 +5621,97 @@ namespace heongpu
 
                     in_data = result.data() + offset;
                 }
+
+                // The multi-hop fallback wrote its own decompositions into
+                // the shared buffers, so the hoisted digits are gone.
+                digits_ready = false;
             }
         }
         return result;
+    }
+
+    __host__ DeviceVector<Data64>
+    HEOperator<Scheme::CKKS>::pack_bsgs_plaintexts(
+        std::vector<Plaintext<Scheme::CKKS>>& plains, int depth,
+        const cudaStream_t stream)
+    {
+        if (plains.empty())
+        {
+            throw std::invalid_argument(
+                "There is no diagonal to pack for the hoisted group sum");
+        }
+
+        int current_decomp_count = context_->Q_size - depth;
+        const size_t poly = static_cast<size_t>(current_decomp_count)
+                            << context_->n_power;
+
+        DeviceVector<Data64> packed(plains.size() * poly, stream);
+        for (size_t i = 0; i < plains.size(); i++)
+        {
+            if (static_cast<size_t>(plains[i].size()) < poly)
+            {
+                throw std::invalid_argument(
+                    "A diagonal is shorter than the level it is packed for");
+            }
+            cudaMemcpyAsync(packed.data() + (i * poly), plains[i].data(),
+                            poly * sizeof(Data64), cudaMemcpyDeviceToDevice,
+                            stream);
+        }
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+        return packed;
+    }
+
+    __host__ Ciphertext<Scheme::CKKS>
+    HEOperator<Scheme::CKKS>::hoisted_bsgs_group_sum(
+        DeviceVector<Data64>& rotated_babies,
+        DeviceVector<Data64>& packed_plains, int first_diagonal, int count,
+        Ciphertext<Scheme::CKKS>& like, double plain_scale,
+        const cudaStream_t stream)
+    {
+        int current_decomp_count = context_->Q_size - like.depth_;
+        const size_t poly = static_cast<size_t>(current_decomp_count)
+                            << context_->n_power;
+
+        if (rotated_babies.size() < static_cast<size_t>(count) * 2 * poly)
+        {
+            throw std::invalid_argument(
+                "The hoisted rotation train holds fewer ciphertexts than the "
+                "group sums over");
+        }
+        if (packed_plains.size() <
+            (static_cast<size_t>(first_diagonal) + count) * poly)
+        {
+            throw std::invalid_argument(
+                "The packed diagonals end before the group does");
+        }
+
+        DeviceVector<Data64> output_memory(2 * poly, stream);
+
+        cipherplain_multiply_accumulate_kernel<<<
+            dim3((context_->n >> 8), current_decomp_count, 2), 256, 0,
+            stream>>>(rotated_babies.data(),
+                      packed_plains.data() +
+                          (static_cast<size_t>(first_diagonal) * poly),
+                      output_memory.data(), context_->modulus_->data(), count,
+                      current_decomp_count, current_decomp_count,
+                      context_->n_power);
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+        Ciphertext<Scheme::CKKS> out;
+        out.scheme_ = context_->scheme_;
+        out.ring_size_ = context_->n;
+        out.coeff_modulus_count_ = context_->Q_size;
+        out.cipher_size_ = 2;
+        out.depth_ = like.depth_;
+        out.scale_ = like.scale_ * plain_scale;
+        out.in_ntt_domain_ = like.in_ntt_domain_;
+        out.encoding_ = like.encoding_;
+        out.rescale_required_ = true;
+        out.relinearization_required_ = false;
+        out.storage_type_ = storage_type::DEVICE;
+        out.ciphertext_generated_ = true;
+        out.memory_set(std::move(output_memory));
+        return out;
     }
 
     // TODO: Fix it!

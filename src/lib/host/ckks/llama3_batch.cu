@@ -270,28 +270,6 @@ namespace heongpu
 
             for (auto& source : in)
             {
-                // The n1 baby shifts are shared by every giant step of this
-                // column, so they are taken once.
-                std::vector<Ciphertext<Scheme::CKKS>> baby;
-                baby.reserve(n1);
-                {
-                    SuffixRange _r(name, "rotations");
-                    for (int j = 0; j < n1; ++j)
-                    {
-                        if (j == 0)
-                        {
-                            baby.push_back(source);
-                        }
-                        else
-                        {
-                            Ciphertext<Scheme::CKKS> shifted(context_);
-                            arith_.rotate_rows(source, shifted, galois_key,
-                                               j * step);
-                            baby.push_back(std::move(shifted));
-                        }
-                    }
-                }
-
                 const double plain_scale = rescale_prime(source);
 
                 // The d diagonals depend on the direction, the level and the
@@ -344,9 +322,99 @@ namespace heongpu
                                 encode(shifted, plain_scale, source.depth()));
                         }
                     }
+                    EncodedDiagonalSet set;
+                    set.plains = std::move(plains);
                     encoded =
-                        bridge_plain_.emplace(plain_key, std::move(plains))
+                        bridge_plain_.emplace(plain_key, std::move(set))
                             .first;
+                }
+
+                if (hoisted_crossings_)
+                {
+                    // One decomposition serves every baby shift, and each
+                    // giant group is one fused multiply-accumulate launch.
+                    // The modular arithmetic is exact and identically
+                    // ordered, so this is the loop below to the bit, at a
+                    // fraction of the work and the launches.
+                    EncodedDiagonalSet& set = encoded->second;
+                    if (set.packed.size() == 0)
+                    {
+                        set.packed = arith_.pack_bsgs_plaintexts(
+                            set.plains, source.depth());
+                    }
+
+                    DeviceVector<Data64> babies;
+                    {
+                        SuffixRange _r(name, "rotations");
+                        std::vector<int> shifts(
+                            static_cast<std::size_t>(n1));
+                        for (int j = 0; j < n1; ++j)
+                        {
+                            shifts[static_cast<std::size_t>(j)] = j * step;
+                        }
+                        babies = arith_.hoisted_rotation_train(
+                            source, shifts, n1, galois_key);
+                    }
+
+                    Ciphertext<Scheme::CKKS> total(context_);
+                    bool total_started = false;
+                    {
+                        SuffixRange _r(name, "diagonals");
+                        for (int i = 0; i < n2; ++i)
+                        {
+                            Ciphertext<Scheme::CKKS> acc =
+                                arith_.hoisted_bsgs_group_sum(
+                                    babies, set.packed, i * n1, n1, source,
+                                    plain_scale);
+
+                            // The rescale before the giant shift, exactly as
+                            // below: it commutes with the rotation and takes
+                            // the rotation one limb cheaper.
+                            arith_.rescale_inplace(acc);
+
+                            if (i != 0)
+                            {
+                                Ciphertext<Scheme::CKKS> moved(context_);
+                                arith_.rotate_rows(acc, moved, galois_key,
+                                                   i * n1 * step);
+                                acc = std::move(moved);
+                            }
+
+                            if (!total_started)
+                            {
+                                total = std::move(acc);
+                                total_started = true;
+                            }
+                            else
+                            {
+                                arith_.add_inplace(total, acc);
+                            }
+                        }
+                    }
+                    out.push_back(std::move(total));
+                    continue;
+                }
+
+                // The n1 baby shifts are shared by every giant step of this
+                // column, so they are taken once.
+                std::vector<Ciphertext<Scheme::CKKS>> baby;
+                baby.reserve(n1);
+                {
+                    SuffixRange _r(name, "rotations");
+                    for (int j = 0; j < n1; ++j)
+                    {
+                        if (j == 0)
+                        {
+                            baby.push_back(source);
+                        }
+                        else
+                        {
+                            Ciphertext<Scheme::CKKS> shifted(context_);
+                            arith_.rotate_rows(source, shifted, galois_key,
+                                               j * step);
+                            baby.push_back(std::move(shifted));
+                        }
+                    }
                 }
 
                 Ciphertext<Scheme::CKKS> total(context_);
@@ -360,9 +428,9 @@ namespace heongpu
                         for (int j = 0; j < n1; ++j)
                         {
                             Plaintext<Scheme::CKKS>& plain =
-                                encoded->second[static_cast<std::size_t>(i) *
-                                                    n1 +
-                                                j];
+                                encoded->second
+                                    .plains[static_cast<std::size_t>(i) * n1 +
+                                            j];
 
                             Ciphertext<Scheme::CKKS> term(context_);
                             arith_.multiply_plain(baby[j], plain, term);
