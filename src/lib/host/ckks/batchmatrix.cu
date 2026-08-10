@@ -14,8 +14,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <stdexcept>
+#include <string>
 
 namespace heongpu
 {
@@ -105,6 +107,21 @@ namespace heongpu
         inline Data64 mulmod(Data64 a, Data64 b, Data64 p)
         {
             return static_cast<Data64>(static_cast<__uint128_t>(a) * b % p);
+        }
+
+        // HEONGPU_BM_ENCODE_CHECK=1 makes every device-side RNS expansion also
+        // run the host expansion it replaced and compare the two word for
+        // word, so a divergence names its own call site instead of surfacing
+        // later as a decode error. Off by default; the check allocates and
+        // reads back the whole expanded matrix.
+        inline bool bm_encode_check_enabled()
+        {
+            static const bool on = []
+            {
+                const char* e = std::getenv("HEONGPU_BM_ENCODE_CHECK");
+                return e != nullptr && e[0] == '1';
+            }();
+            return on;
         }
 
         // Minimal little-endian fixed-width unsigned integer, carrying just the
@@ -574,6 +591,34 @@ namespace heongpu
                 plain_.data(), source.data(), t.modulus.data(), per_limb,
                 num_limbs);
             HEONGPU_CUDA_CHECK(cudaGetLastError());
+        }
+
+        if (bm_encode_check_enabled())
+        {
+            const size_t total = static_cast<size_t>(num_limbs) * per_limb;
+            std::vector<Data64> got(total);
+            HEONGPU_CUDA_CHECK(cudaMemcpy(got.data(), plain_.data(),
+                                          total * sizeof(Data64),
+                                          cudaMemcpyDeviceToHost));
+            std::vector<Modulus64> all = context_->get_key_modulus();
+            for (int l = 0; l < num_limbs; ++l)
+            {
+                const Data64 p = all[l].value;
+                for (size_t i = 0; i < per_limb; ++i)
+                {
+                    const Data64 want = centered_to_modular(coeffs[i], p);
+                    const size_t at = static_cast<size_t>(l) * per_limb + i;
+                    if (got[at] != want)
+                    {
+                        throw std::runtime_error(
+                            "bm_crt_expand_kernel disagrees with the host "
+                            "expansion at limb " + std::to_string(l) +
+                            " index " + std::to_string(i) + ": device " +
+                            std::to_string(got[at]) + " host " +
+                            std::to_string(want));
+                    }
+                }
+            }
         }
 
         const int threads = (k < 256) ? k : 256;
