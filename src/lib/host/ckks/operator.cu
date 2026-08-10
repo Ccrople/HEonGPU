@@ -46,6 +46,131 @@ namespace heongpu
           private:
             bool open_ = true;
         };
+
+        /// Debug switch for the staged mod-down rewrite: when set, every
+        /// staged launch also runs the legacy kernel and compares the two
+        /// outputs word for word, so a divergence names its own call site.
+        bool moddown_check_enabled()
+        {
+            static const bool enabled = [] {
+                const char* env = std::getenv("HEONGPU_MODDOWN_CHECK");
+                return (env != nullptr) && (std::atoi(env) != 0);
+            }();
+            return enabled;
+        }
+
+        void compare_device_words(const char* tag, const Data64* legacy,
+                                  const Data64* staged, size_t count,
+                                  cudaStream_t stream)
+        {
+            std::vector<Data64> host_legacy(count);
+            std::vector<Data64> host_staged(count);
+            HEONGPU_CUDA_CHECK(cudaMemcpyAsync(host_legacy.data(), legacy,
+                                               count * sizeof(Data64),
+                                               cudaMemcpyDeviceToHost, stream));
+            HEONGPU_CUDA_CHECK(cudaMemcpyAsync(host_staged.data(), staged,
+                                               count * sizeof(Data64),
+                                               cudaMemcpyDeviceToHost, stream));
+            HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+            for (size_t i = 0; i < count; i++)
+            {
+                if (host_legacy[i] != host_staged[i])
+                {
+                    std::fprintf(stderr,
+                                 "HEONGPU_MODDOWN_CHECK: %s mismatch at word "
+                                 "%zu: legacy %llu staged %llu\n",
+                                 tag, i,
+                                 static_cast<unsigned long long>(
+                                     host_legacy[i]),
+                                 static_cast<unsigned long long>(
+                                     host_staged[i]));
+                    throw std::runtime_error(
+                        "staged mod-down diverged from the legacy kernel");
+                }
+            }
+        }
+
+        /// Staged replacement for divide_round_lastq_extended_leveled_kernel.
+        /// The legacy kernel reruns the O(P_size^2) special-prime chain in
+        /// every output-limb thread; the staged pair runs it once per
+        /// (coefficient, component). Arithmetic is unchanged, so the output
+        /// is bit-identical.
+        void moddown_extended_leveled_staged(
+            Data64* input, Data64* output, Modulus64* modulus, Data64* half,
+            Data64* half_mod, Data64* last_q_modinv, int n, int n_power,
+            int Q_prime_size, int Q_size, int first_Q_prime_size,
+            int first_Q_size, int P_size, int components, cudaStream_t stream)
+        {
+            DeviceVector<Data64> staged(
+                static_cast<size_t>(components) * P_size * n, stream);
+            divide_round_lastq_p_chain_leveled(
+                input, staged.data(), modulus, half, half_mod, last_q_modinv,
+                n, n_power, Q_prime_size, Q_size, first_Q_prime_size,
+                first_Q_size, P_size, components, stream);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+            divide_round_lastq_extended_leveled_stage_two_kernel<<<
+                dim3((n >> 8), Q_size, components), 256, 0, stream>>>(
+                input, staged.data(), output, modulus, half_mod, last_q_modinv,
+                n_power, Q_prime_size, Q_size, first_Q_prime_size, first_Q_size,
+                P_size);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+            if (moddown_check_enabled())
+            {
+                DeviceVector<Data64> legacy(
+                    static_cast<size_t>(components) * Q_size * n, stream);
+                divide_round_lastq_extended_leveled_kernel<<<
+                    dim3((n >> 8), Q_size, components), 256, 0, stream>>>(
+                    input, legacy.data(), modulus, half, half_mod,
+                    last_q_modinv, n_power, Q_prime_size, Q_size,
+                    first_Q_prime_size, first_Q_size, P_size);
+                HEONGPU_CUDA_CHECK(cudaGetLastError());
+                compare_device_words(
+                    "moddown_extended_leveled", legacy.data(), output,
+                    static_cast<size_t>(components) * Q_size * n, stream);
+            }
+        }
+
+        /// Staged replacement for divide_round_lastq_permute_ckks_kernel,
+        /// same contract as moddown_extended_leveled_staged plus the fused
+        /// Galois permutation (always two components).
+        void moddown_permute_ckks_staged(
+            Data64* input, Data64* input2, Data64* output, Modulus64* modulus,
+            Data64* half, Data64* half_mod, Data64* last_q_modinv,
+            int galois_elt, int n, int n_power, int Q_prime_size, int Q_size,
+            int first_Q_prime_size, int first_Q_size, int P_size,
+            cudaStream_t stream)
+        {
+            DeviceVector<Data64> staged(static_cast<size_t>(2) * P_size * n,
+                                        stream);
+            divide_round_lastq_p_chain_leveled(
+                input, staged.data(), modulus, half, half_mod, last_q_modinv,
+                n, n_power, Q_prime_size, Q_size, first_Q_prime_size,
+                first_Q_size, P_size, 2, stream);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+            divide_round_lastq_permute_ckks_stage_two_kernel<<<
+                dim3((n >> 8), Q_size, 2), 256, 0, stream>>>(
+                input, staged.data(), input2, output, modulus, half_mod,
+                last_q_modinv, galois_elt, n_power, Q_prime_size, Q_size,
+                first_Q_prime_size, first_Q_size, P_size);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+            if (moddown_check_enabled())
+            {
+                DeviceVector<Data64> legacy(static_cast<size_t>(2) * Q_size * n,
+                                            stream);
+                divide_round_lastq_permute_ckks_kernel<<<
+                    dim3((n >> 8), Q_size, 2), 256, 0, stream>>>(
+                    input, input2, legacy.data(), modulus, half, half_mod,
+                    last_q_modinv, galois_elt, n_power, Q_prime_size, Q_size,
+                    first_Q_prime_size, first_Q_size, P_size);
+                HEONGPU_CUDA_CHECK(cudaGetLastError());
+                compare_device_words("moddown_permute_ckks", legacy.data(),
+                                     output,
+                                     static_cast<size_t>(2) * Q_size * n,
+                                     stream);
+            }
+        }
     } // namespace
 
     __host__
@@ -1171,15 +1296,12 @@ namespace heongpu
             context_->modulus_->data(), cfg_intt, 2 * current_rns_mod_count,
             current_rns_mod_count, new_prime_locations + location);
 
-        divide_round_lastq_extended_leveled_kernel<<<
-            dim3((context_->n >> 8), current_decomp_count, 2), 256, 0,
-            stream>>>(temp2_relin, temp1_relin, context_->modulus_->data(),
-                      context_->half_p_->data(), context_->half_mod_->data(),
-                      context_->last_q_modinv_->data(), context_->n_power,
-                      current_rns_mod_count, current_decomp_count,
-                      first_rns_mod_count, first_decomp_count,
-                      context_->P_size);
-        HEONGPU_CUDA_CHECK(cudaGetLastError());
+        moddown_extended_leveled_staged(
+            temp2_relin, temp1_relin, context_->modulus_->data(),
+            context_->half_p_->data(), context_->half_mod_->data(),
+            context_->last_q_modinv_->data(), context_->n, context_->n_power,
+            current_rns_mod_count, current_decomp_count, first_rns_mod_count,
+            first_decomp_count, context_->P_size, 2, stream);
 
         gpuntt::GPU_NTT_Inplace(temp1_relin, context_->ntt_table_->data(),
                                 context_->modulus_->data(), cfg_ntt,
@@ -1725,17 +1847,14 @@ namespace heongpu
             context_->modulus_->data(), cfg_intt, 2 * current_rns_mod_count,
             current_rns_mod_count, new_prime_locations + location);
 
-        // ModDown + Permute
-        divide_round_lastq_permute_ckks_kernel<<<dim3((context_->n >> 8),
-                                                      current_decomp_count, 2),
-                                                 256, 0, stream>>>(
+        // ModDown + Permute (staged: chain once, then per-limb tail)
+        moddown_permute_ckks_staged(
             temp4_rotation, temp0_rotation, output_memory.data(),
             context_->modulus_->data(), context_->half_p_->data(),
             context_->half_mod_->data(), context_->last_q_modinv_->data(),
-            galois_elt, context_->n_power, current_rns_mod_count,
+            galois_elt, context_->n, context_->n_power, current_rns_mod_count,
             current_decomp_count, first_rns_mod_count, first_decomp_count,
-            context_->P_size);
-        HEONGPU_CUDA_CHECK(cudaGetLastError());
+            context_->P_size, stream);
 
         gpuntt::GPU_NTT_Inplace(output_memory.data(),
                                 context_->ntt_table_->data(),
@@ -2033,15 +2152,12 @@ namespace heongpu
             context_->modulus_->data(), cfg_intt, 2 * current_rns_mod_count,
             current_rns_mod_count, new_prime_locations + location);
 
-        divide_round_lastq_extended_leveled_kernel<<<
-            dim3((context_->n >> 8), current_decomp_count, 2), 256, 0,
-            stream>>>(
+        moddown_extended_leveled_staged(
             temp4_rotation, temp3_rotation, context_->modulus_->data(),
             context_->half_p_->data(), context_->half_mod_->data(),
-            context_->last_q_modinv_->data(), context_->n_power,
+            context_->last_q_modinv_->data(), context_->n, context_->n_power,
             current_rns_mod_count, current_decomp_count, first_rns_mod_count,
-            first_decomp_count, context_->P_size);
-        HEONGPU_CUDA_CHECK(cudaGetLastError());
+            first_decomp_count, context_->P_size, 2, stream);
 
         gpuntt::GPU_NTT_Inplace(temp3_rotation, context_->ntt_table_->data(),
                                 context_->modulus_->data(), cfg_ntt,
@@ -2320,17 +2436,14 @@ namespace heongpu
             context_->modulus_->data(), cfg_intt, 2 * current_rns_mod_count,
             current_rns_mod_count, new_prime_locations + location);
 
-        // ModDown + Permute
-        divide_round_lastq_permute_ckks_kernel<<<dim3((context_->n >> 8),
-                                                      current_decomp_count, 2),
-                                                 256, 0, stream>>>(
+        // ModDown + Permute (staged: chain once, then per-limb tail)
+        moddown_permute_ckks_staged(
             temp4_rotation, temp0_rotation, output_memory.data(),
             context_->modulus_->data(), context_->half_p_->data(),
             context_->half_mod_->data(), context_->last_q_modinv_->data(),
-            galois_elt, context_->n_power, current_rns_mod_count,
+            galois_elt, context_->n, context_->n_power, current_rns_mod_count,
             current_decomp_count, first_rns_mod_count, first_decomp_count,
-            context_->P_size);
-        HEONGPU_CUDA_CHECK(cudaGetLastError());
+            context_->P_size, stream);
 
         gpuntt::GPU_NTT_Inplace(output_memory.data(),
                                 context_->ntt_table_->data(),
@@ -3271,16 +3384,13 @@ namespace heongpu
                 // Input: u1 in PQ_l coeff (pql_count limbs)
                 // Output: u1_Q in Q_l coeff (current_decomp_count limbs)
                 {
-                    divide_round_lastq_extended_leveled_kernel<<<
-                        dim3((n >> 8), current_decomp_count, 1), 256, 0,
-                        stream>>>(
+                    moddown_extended_leveled_staged(
                         u_pql.data() + (pql_count * n), u1_Q.data(),
                         context_->modulus_->data(), context_->half_p_->data(),
                         context_->half_mod_->data(),
-                        context_->last_q_modinv_->data(), context_->n_power,
+                        context_->last_q_modinv_->data(), n, context_->n_power,
                         pql_count, current_decomp_count, first_rns_mod_count,
-                        Q_size, P_size);
-                    HEONGPU_CUDA_CHECK(cudaGetLastError());
+                        Q_size, P_size, 1, stream);
                 }
 
                 // Decompose u1_Q -> PQ_l coeff, then NTT
@@ -3391,15 +3501,13 @@ namespace heongpu
             // ModDown both components: PQ_l coeff -> Q_l coeff
             DeviceVector<Data64> final_ct(2 * current_decomp_count * n, stream);
             {
-                divide_round_lastq_extended_leveled_kernel<<<
-                    dim3((n >> 8), current_decomp_count, 2), 256, 0, stream>>>(
+                moddown_extended_leveled_staged(
                     gs_accum.data(), final_ct.data(),
                     context_->modulus_->data(), context_->half_p_->data(),
                     context_->half_mod_->data(),
-                    context_->last_q_modinv_->data(), context_->n_power,
+                    context_->last_q_modinv_->data(), n, context_->n_power,
                     pql_count, current_decomp_count, first_rns_mod_count,
-                    Q_size, P_size);
-                HEONGPU_CUDA_CHECK(cudaGetLastError());
+                    Q_size, P_size, 2, stream);
             }
 
             // NTT final_ct -> Q_l NTT domain
@@ -5305,18 +5413,15 @@ namespace heongpu
                     2 * current_rns_mod_count, current_rns_mod_count,
                     new_prime_locations + location);
 
-                // ModDown + Permute
-                divide_round_lastq_permute_ckks_kernel<<<
-                    dim3((context_->n >> 8), current_decomp_count, 2), 256, 0,
-                    stream>>>(
+                // ModDown + Permute (staged: chain once, then per-limb tail)
+                moddown_permute_ckks_staged(
                     temp4_rotation, temp0_rotation, result.data() + offset,
                     context_->modulus_->data(), context_->half_p_->data(),
                     context_->half_mod_->data(),
-                    context_->last_q_modinv_->data(), galois_elt,
+                    context_->last_q_modinv_->data(), galois_elt, context_->n,
                     context_->n_power, current_rns_mod_count,
                     current_decomp_count, first_rns_mod_count, context_->Q_size,
-                    context_->P_size);
-                HEONGPU_CUDA_CHECK(cudaGetLastError());
+                    context_->P_size, stream);
 
                 gpuntt::GPU_NTT_Inplace(
                     result.data() + offset, context_->ntt_table_->data(),
@@ -5455,18 +5560,16 @@ namespace heongpu
                         2 * current_rns_mod_count, current_rns_mod_count,
                         new_prime_locations + location);
 
-                    // ModDown + Permute
-                    divide_round_lastq_permute_ckks_kernel<<<
-                        dim3((context_->n >> 8), current_decomp_count, 2), 256,
-                        0, stream>>>(
+                    // ModDown + Permute (staged: chain once, then per-limb
+                    // tail)
+                    moddown_permute_ckks_staged(
                         temp4_rotation, temp0_rotation, result.data() + offset,
                         context_->modulus_->data(), context_->half_p_->data(),
                         context_->half_mod_->data(),
                         context_->last_q_modinv_->data(), galois_elt,
-                        context_->n_power, current_rns_mod_count,
+                        context_->n, context_->n_power, current_rns_mod_count,
                         current_decomp_count, first_rns_mod_count,
-                        context_->Q_size, context_->P_size);
-                    HEONGPU_CUDA_CHECK(cudaGetLastError());
+                        context_->Q_size, context_->P_size, stream);
 
                     gpuntt::GPU_NTT_Inplace(
                         result.data() + offset, context_->ntt_table_->data(),
