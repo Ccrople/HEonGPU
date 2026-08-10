@@ -312,15 +312,25 @@ int main(int argc, char* argv[])
     }
     else if (stage == "bridge")
     {
+        // HEONGPU_RECT_BRIDGE_REPS > 1 separates the one-time diagonal encode
+        // from the recurring cost: rep 0 is cold, later reps run on the cached
+        // plaintext sets, which is what a multi-block stack sees.
         Range _r("stage.bridge");
-        heongpu::llama::BatchActivation b = op.to_batch(x, 0, galois);
-        std::vector<heongpu::llama::BatchActivation> groups;
-        groups.push_back(std::move(b));
-        for (int g = 1; g < channel_groups; ++g)
-            groups.push_back(op.to_batch(x, g, galois));
-        heongpu::llama::RectActivation back =
-            op.from_batch(groups, channels, galois);
-        cudaDeviceSynchronize();
+        const int reps = EnvInt("HEONGPU_RECT_BRIDGE_REPS", 1);
+        for (int r = 0; r < reps; ++r)
+        {
+            RegionTimer rep;
+            heongpu::llama::BatchActivation b = op.to_batch(x, 0, galois);
+            std::vector<heongpu::llama::BatchActivation> groups;
+            groups.push_back(std::move(b));
+            for (int g = 1; g < channel_groups; ++g)
+                groups.push_back(op.to_batch(x, g, galois));
+            heongpu::llama::RectActivation back =
+                op.from_batch(groups, channels, galois);
+            cudaDeviceSynchronize();
+            std::cout << "[rect] bridge rep " << r << ": " << rep.ms()
+                      << " ms" << std::endl;
+        }
     }
     else if (stage == "ccmm")
     {
