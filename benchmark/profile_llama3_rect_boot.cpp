@@ -518,6 +518,17 @@ int main(int argc, char* argv[])
                                   : "staged, 2/2/3/3 levels")
               << std::endl;
 
+    // HEONGPU_BOOT_HOIST=1 shares one key-switch decomposition across every
+    // rotation train of a crossing and fuses each giant group's plaintext
+    // products into one launch. Bit-identical results; only the work and the
+    // launch count move.
+    const bool hoisted_crossings = EnvFlag("HEONGPU_BOOT_HOIST", false);
+    op.set_hoisted_crossings(hoisted_crossings);
+    std::cout << "[boot] hoisting        : "
+              << (hoisted_crossings ? "on, one ModUp per rotation train"
+                                    : "off, one ModUp per rotation")
+              << std::endl;
+
     // The bootstrapping context is per operator, so it is generated on the very
     // arithmetic half that will run the refresh and not on a second one.
     heongpu::BootstrappingConfig boot_config(ctos, stoc, taylor, less_key);

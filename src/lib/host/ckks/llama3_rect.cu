@@ -367,6 +367,39 @@ namespace heongpu
                 }
             }
 
+            if (hoisted_crossings_)
+            {
+                // Every one of the 2*(k/2) - 1 shifts reads ONE source and
+                // there are no giant steps, so the whole walk above is a
+                // single hoisted rotation train and ONE fused
+                // multiply-accumulate: the map that measured dearer than the
+                // row bridge (see the note above) becomes two launches per
+                // ciphertext plus its rescale, bit-identically.
+                DeviceVector<Data64> packed =
+                    batch_.arith().pack_bsgs_plaintexts(plain, depth);
+                std::vector<int> shifts;
+                shifts.reserve(shift.size());
+                for (const int eps : shift)
+                {
+                    shifts.push_back(eps >= 0 ? eps : slot_count_ + eps);
+                }
+                const int count = static_cast<int>(plain.size());
+
+                for (auto& source : ct)
+                {
+                    SuffixRange _r(name, "diagonals");
+                    DeviceVector<Data64> babies =
+                        batch_.arith().hoisted_rotation_train(
+                            source, shifts, count, galois_key);
+                    Ciphertext<Scheme::CKKS> acc =
+                        batch_.arith().hoisted_bsgs_group_sum(
+                            babies, packed, 0, count, source, plain_scale);
+                    batch_.arith().rescale_inplace(acc);
+                    source = std::move(acc);
+                }
+                return;
+            }
+
             for (auto& source : ct)
             {
                 Ciphertext<Scheme::CKKS> acc(context_);
@@ -928,6 +961,8 @@ namespace heongpu
                 std::vector<Plaintext<Scheme::CKKS>> plains;
                 plains.reserve(static_cast<size_t>(n));
                 std::vector<Complex64> shifted(static_cast<size_t>(n));
+                const std::vector<Complex64> zero(static_cast<size_t>(n),
+                                                  Complex64(0.0, 0.0));
                 for (int i = 0; i < n2; ++i)
                 {
                     const int giant = i * n1;
@@ -937,6 +972,14 @@ namespace heongpu
                             table[static_cast<size_t>(giant + j)];
                         if (src.empty())
                         {
+                            // Stored DENSE, so slot i*n1 + j is diagonal
+                            // giant + j by arithmetic alone -- which is what
+                            // lets the hoisted path hand a whole group to
+                            // one fused launch. A structural zero is an
+                            // encoded zero; the unhoisted loop still skips
+                            // it off the table.
+                            plains.push_back(
+                                encode(zero, plain_scale, depth));
                             continue;
                         }
                         for (int p = 0; p < n; ++p)
@@ -951,12 +994,98 @@ namespace heongpu
                             encode(shifted, plain_scale, depth));
                     }
                 }
+                EncodedDiagonalSet set;
+                set.plains = std::move(plains);
                 encoded =
-                    fused_plain_.emplace(plain_key, std::move(plains)).first;
+                    fused_plain_.emplace(plain_key, std::move(set)).first;
+            }
+
+            // Which giant groups multiply anything at all, read off the
+            // table: the dense set encodes zeros into the structural gaps,
+            // so presence is no longer readable from the plaintexts.
+            std::vector<char> group_live(static_cast<size_t>(n2), 0);
+            for (int i = 0; i < n2; ++i)
+            {
+                for (int j = 0; j < n1; ++j)
+                {
+                    if (!table[static_cast<size_t>(i * n1 + j)].empty())
+                    {
+                        group_live[static_cast<size_t>(i)] = 1;
+                        break;
+                    }
+                }
             }
 
             for (auto& source : ct)
             {
+                if (hoisted_crossings_)
+                {
+                    // One decomposition for the whole baby train, one fused
+                    // multiply-accumulate per giant group; identical modular
+                    // arithmetic, identically ordered, so identical bits.
+                    EncodedDiagonalSet& set = encoded->second;
+                    if (set.packed.size() == 0)
+                    {
+                        set.packed = batch_.arith().pack_bsgs_plaintexts(
+                            set.plains, depth);
+                    }
+
+                    DeviceVector<Data64> babies;
+                    {
+                        SuffixRange _r(name, "rotations");
+                        std::vector<int> shifts(static_cast<size_t>(n1));
+                        for (int j = 0; j < n1; ++j)
+                        {
+                            shifts[static_cast<size_t>(j)] = j;
+                        }
+                        babies = batch_.arith().hoisted_rotation_train(
+                            source, shifts, n1, galois_key);
+                    }
+
+                    Ciphertext<Scheme::CKKS> total(context_);
+                    bool total_started = false;
+                    {
+                        SuffixRange _r(name, "diagonals");
+                        for (int i = 0; i < n2; ++i)
+                        {
+                            if (!group_live[static_cast<size_t>(i)])
+                            {
+                                continue;
+                            }
+                            Ciphertext<Scheme::CKKS> acc =
+                                batch_.arith().hoisted_bsgs_group_sum(
+                                    babies, set.packed, i * n1, n1, source,
+                                    plain_scale);
+                            batch_.arith().rescale_inplace(acc);
+                            if (i != 0)
+                            {
+                                Ciphertext<Scheme::CKKS> moved(context_);
+                                batch_.arith().rotate_rows(
+                                    acc, moved, galois_key, i * n1);
+                                acc = std::move(moved);
+                            }
+                            if (!total_started)
+                            {
+                                total = std::move(acc);
+                                total_started = true;
+                            }
+                            else
+                            {
+                                batch_.arith().add_inplace(total, acc);
+                            }
+                        }
+                    }
+                    if (!total_started)
+                    {
+                        throw std::runtime_error(
+                            "The fused crossing multiplied no diagonal at "
+                            "all, which the table build above should have "
+                            "refused");
+                    }
+                    source = std::move(total);
+                    continue;
+                }
+
                 // The n1 baby shifts are shared by every giant step of this
                 // column, so they are taken once.
                 std::vector<Ciphertext<Scheme::CKKS>> baby;
@@ -983,7 +1112,6 @@ namespace heongpu
                 bool total_started = false;
                 {
                     SuffixRange _r(name, "diagonals");
-                    size_t cursor = 0;
                     for (int i = 0; i < n2; ++i)
                     {
                         Ciphertext<Scheme::CKKS> acc(context_);
@@ -995,7 +1123,8 @@ namespace heongpu
                                 continue;
                             }
                             Plaintext<Scheme::CKKS>& plain =
-                                encoded->second[cursor++];
+                                encoded->second.plains[static_cast<size_t>(
+                                    i * n1 + j)];
 
                             Ciphertext<Scheme::CKKS> term(context_);
                             batch_.arith().multiply_plain(baby[j], plain,

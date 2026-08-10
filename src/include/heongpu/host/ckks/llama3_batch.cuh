@@ -594,8 +594,16 @@ namespace heongpu
             /// and d of them is not small. The key that matters is the one the
             /// current call uses, so a handful of entries holds every level a
             /// block actually visits.
-            std::map<std::tuple<bool, int, uint64_t>,
-                     std::vector<Plaintext<Scheme::CKKS>>>
+            /// One cached set: the encoded plaintexts, and -- once the
+            /// hoisted path has touched the entry -- the same set packed
+            /// contiguously at its level's limb count, which is the layout
+            /// the fused multiply-accumulate launch walks.
+            struct EncodedDiagonalSet
+            {
+                std::vector<Plaintext<Scheme::CKKS>> plains;
+                DeviceVector<Data64> packed;
+            };
+            std::map<std::tuple<bool, int, uint64_t>, EncodedDiagonalSet>
                 bridge_plain_;
 
             /// Encoded diagonal sets kept at once, over all levels and both
@@ -610,6 +618,9 @@ namespace heongpu
             /// can be measured against each other rather than argued about.
             /// Must divide d. Changes cost, never the result.
             int bridge_baby_steps_ = 0;
+
+            /// @see set_hoisted_crossings.
+            bool hoisted_crossings_ = false;
 
           public:
             /// The bridge's diagonal tables, read-only. The rectangular
@@ -667,6 +678,22 @@ namespace heongpu
                     bridge_plain_.erase(bridge_plain_.begin());
                 }
             }
+
+            /**
+             * @brief Hoist the bridge's rotation trains.
+             *
+             * The n1 baby shifts of a bridge call all read ONE source, and a
+             * key switch spends most of its time decomposing its input,
+             * which does not depend on the shift. With this on, the babies
+             * share one decomposition (hoisted_rotation_train) and each
+             * giant group's n1 plaintext products and additions collapse
+             * into one fused launch (hoisted_bsgs_group_sum). The modular
+             * arithmetic is unchanged to the bit; what falls is the work and
+             * the launch count. OFF by default so existing measurements stay
+             * reproducible.
+             */
+            void set_hoisted_crossings(bool on) { hoisted_crossings_ = on; }
+            bool hoisted_crossings() const { return hoisted_crossings_; }
         };
 
     } // namespace llama

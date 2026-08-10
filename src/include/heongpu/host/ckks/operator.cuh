@@ -1179,6 +1179,64 @@ namespace heongpu
         }
 
         /**
+         * @brief Rotate one ciphertext by a whole train of shifts, sharing
+         *        the key-switch decomposition across them.
+         *
+         * A rotation spends most of its time decomposing its input -- INTT,
+         * base conversion to Q~, NTT -- and none of that depends on the
+         * shift, because the Galois permutation is applied by the mod-down
+         * tail after the key product. So a train of shifts of the SAME
+         * source pays the decomposition once. The result packs the rotated
+         * ciphertexts consecutively, 2 * current_decomp_count polynomials
+         * each, in shift-list order; a shift of 0 is a plain copy. Every
+         * listed shift must have its Galois key present for the sharing to
+         * hold -- a missing key falls back to multi-hop rotation and pays
+         * its own decompositions.
+         */
+        __host__ DeviceVector<Data64> hoisted_rotation_train(
+            Ciphertext<Scheme::CKKS>& input1, std::vector<int>& shifts,
+            int count, Galoiskey<Scheme::CKKS>& galois_key,
+            const cudaStream_t stream = cudaStreamDefault)
+        {
+            return fast_single_hoisting_rotation_ckks(input1, shifts, count,
+                                                      galois_key, stream);
+        }
+
+        /**
+         * @brief Copy encoded diagonals into one contiguous device buffer
+         *        for hoisted_bsgs_group_sum.
+         *
+         * Each plaintext contributes its first Q_size - depth limbs, packed
+         * back to back in vector order, which is the layout the fused
+         * multiply-accumulate kernel walks. The plaintexts must be
+         * device-resident and encoded for @p depth.
+         */
+        __host__ DeviceVector<Data64> pack_bsgs_plaintexts(
+            std::vector<Plaintext<Scheme::CKKS>>& plains, int depth,
+            const cudaStream_t stream = cudaStreamDefault);
+
+        /**
+         * @brief One giant group of a BSGS diagonal map over a hoisted
+         *        rotation train: sum over j of babies[j] * plains[first + j],
+         *        fused into a single kernel launch.
+         *
+         * Reads @p count consecutive rotated ciphertexts from the START of
+         * @p rotated_babies and the @p count diagonals of @p packed_plains
+         * beginning at @p first_diagonal, so the caller stores each giant
+         * group's plaintexts pre-rotated by its giant step exactly as the
+         * unfused loop does. The result carries @p like's level and
+         * @p like's scale times @p plain_scale, and owes the rescale. The
+         * arithmetic is the same modular multiply-accumulate the separate
+         * multiply_plain and add calls perform, in the same order, so the
+         * output is identical to the bit.
+         */
+        __host__ Ciphertext<Scheme::CKKS> hoisted_bsgs_group_sum(
+            DeviceVector<Data64>& rotated_babies,
+            DeviceVector<Data64>& packed_plains, int first_diagonal,
+            int count, Ciphertext<Scheme::CKKS>& like, double plain_scale,
+            const cudaStream_t stream = cudaStreamDefault);
+
+        /**
          * @brief Applies a Galois automorphism to the ciphertext and stores the
          * result in the output.
          *
