@@ -86,6 +86,7 @@ set(HEONGPU_KERNEL_SOURCES
     lib/kernel/encryption.cu
     lib/kernel/keygeneration.cu
     lib/kernel/multiplication.cu
+    lib/kernel/ringswitch.cu
     lib/kernel/small_ntt.cu
     lib/kernel/switchkey.cu
 )
@@ -191,6 +192,7 @@ set(HEONGPU_HOST_CKKS_SOURCES
     lib/host/ckks/plaintext.cu
     lib/host/ckks/precision.cu
     lib/host/ckks/publickey.cu
+    lib/host/ckks/ringswitch.cu
     lib/host/ckks/secretkey.cu
 )
 
