@@ -265,6 +265,17 @@ int main(int argc, char* argv[])
     heongpu::llama::Llama3BatchOperator batch(context, encoder, layout, scale);
     Rect op(context, encoder, layout, scale);
 
+    // HEONGPU_RECT_FUSED=1 takes every crossing in one level via the composed
+    // BSGS map, so the same stages measure the trade against the staged path.
+    const bool fused_crossings = EnvInt("HEONGPU_RECT_FUSED", 0) != 0;
+    op.set_fused_crossings(fused_crossings);
+    op.set_fused_plain_capacity(
+        static_cast<std::size_t>(EnvInt("HEONGPU_RECT_FUSED_SETS", 8)));
+    std::cout << "[rect] crossings       : "
+              << (fused_crossings ? "fused, one level each"
+                                  : "staged, 2/2/3/3 levels")
+              << std::endl;
+
     std::vector<int> shifts = op.rotation_indices();
     heongpu::Galoiskey<S> galois(context, shifts);
     keygen.generate_galois_key(galois, secret);
@@ -301,15 +312,25 @@ int main(int argc, char* argv[])
     }
     else if (stage == "bridge")
     {
+        // HEONGPU_RECT_BRIDGE_REPS > 1 separates the one-time diagonal encode
+        // from the recurring cost: rep 0 is cold, later reps run on the cached
+        // plaintext sets, which is what a multi-block stack sees.
         Range _r("stage.bridge");
-        heongpu::llama::BatchActivation b = op.to_batch(x, 0, galois);
-        std::vector<heongpu::llama::BatchActivation> groups;
-        groups.push_back(std::move(b));
-        for (int g = 1; g < channel_groups; ++g)
-            groups.push_back(op.to_batch(x, g, galois));
-        heongpu::llama::RectActivation back =
-            op.from_batch(groups, channels, galois);
-        cudaDeviceSynchronize();
+        const int reps = EnvInt("HEONGPU_RECT_BRIDGE_REPS", 1);
+        for (int r = 0; r < reps; ++r)
+        {
+            RegionTimer rep;
+            heongpu::llama::BatchActivation b = op.to_batch(x, 0, galois);
+            std::vector<heongpu::llama::BatchActivation> groups;
+            groups.push_back(std::move(b));
+            for (int g = 1; g < channel_groups; ++g)
+                groups.push_back(op.to_batch(x, g, galois));
+            heongpu::llama::RectActivation back =
+                op.from_batch(groups, channels, galois);
+            cudaDeviceSynchronize();
+            std::cout << "[rect] bridge rep " << r << ": " << rep.ms()
+                      << " ms" << std::endl;
+        }
     }
     else if (stage == "ccmm")
     {

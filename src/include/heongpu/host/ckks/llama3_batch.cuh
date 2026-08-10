@@ -612,6 +612,22 @@ namespace heongpu
             int bridge_baby_steps_ = 0;
 
           public:
+            /// The bridge's diagonal tables, read-only. The rectangular
+            /// operator composes them with its block transform to build the
+            /// one-level fused crossings, and building them twice from the ring
+            /// would only be a second chance to disagree about a convention.
+            /// Entry delta multiplies the input rotated by delta * (k/2).
+            const std::vector<std::vector<Complex64>>&
+            bridge_forward_diagonals() const
+            {
+                return forward_diagonal_;
+            }
+            const std::vector<std::vector<Complex64>>&
+            bridge_inverse_diagonals() const
+            {
+                return inverse_diagonal_;
+            }
+
             /// Baby steps the bridge splits its d diagonals into, n1, with
             /// n2 = d / n1 giant steps; the crossing costs n1 + n2 - 2 key
             /// switches per column instead of d - 1.
