@@ -25,6 +25,7 @@ set(EXECUTABLES
     ringswitch_profile profile_ringswitch.cpp
     tworing_attention_profile profile_tworing_attention.cpp
     tworing_stage16_profile profile_tworing_stage16.cpp
+    tworing_block_profile profile_tworing_block.cpp
 )
 
 function(add_benchmark exe source)
