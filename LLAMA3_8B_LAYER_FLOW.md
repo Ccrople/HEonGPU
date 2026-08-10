@@ -1129,3 +1129,59 @@ Halves by wall time: attention 1001.1 s (41.0%), feed-forward 1315.5 s (53.9%),
 3. **The arithmetic is 1%.** Every remaining optimisation on this path is an
    optimisation of key switching, refreshing, or layout — not of the products
    the layer exists to compute.
+
+## 13. The two-ring structure, priced and unblocked (2026-08-10)
+
+Every §10 item below item 3 is now closed on branch `HEonGPU_LLama3_8B_tworing`.
+
+**Placement is settled by measurement** (`tworing_attention_profile`,
+`tworing_stage16_profile`, `test_ckks_tworing_bridge.cpp`):
+
+- At a 2^13 high ring (profiling regime), §7bis's split wins: CCMM high, only
+  Algorithm 5 low (measured A 3206 ms vs B 3147 ms vs no-island 2799 ms at
+  the 8B attention shape).
+- At the 2^16 high ring the security envelope forces (§7.4's conflict is
+  resolved by force: only the v2-class chain fits 1761 bits, so this is a
+  12-bit-class system), the placement INVERTS to Sylph's shape — but with
+  the island at 2^13, not 2^12: one CCMM call covers all 32 heads at 2^13
+  (61 ms vs 321 ms at 2^16, where 32 heads fill 32 of 256 batch slots), and
+  2^12 admits no 128-bit chain at all.
+
+**§8's crossing exists and is a layout choice, not new code.** compose_up of
+k island SinC columns IS the big ring's SinC coefficient layout at block
+size d*k over the same subring (k_s = N_s/d = N_H/(d k)), so SlotToSinC at
+the big ring is `Llama3BatchOperator::to_slots/from_slots` at
+`BatchMatrixLayout(N_H, d*k)`. Slot law: slot b + (k_H/2)(j' + k u) of big
+ct g = M_b[u][g k + j']. Proven on GPU at 13<->12 (errors 2.9e-9/4.8e-10)
+and at the real 16<->13 shape (1.2e-8/1.8e-9), full path slots -> SinC ->
+switch_down -> island columns, with only the BSGS SUBSET of bridge keys
+(62 shifts, not 1023 — 9.8 GiB at dnum 4 instead of 160).
+
+**The Stage-3 ledger at the accepted envelope** (2^16, v2 chain, nbase 16,
+dnum 4 per decision; island 2^13 on the natural prefix {41,33,33}; A6000):
+
+| leg | measured |
+|---|---|
+| v2 bootstrap (16), 48 keys 7.7 GiB       | 356.8 ms/ct, 16.76 bits, depth_after 15 |
+| SoftMax (16), exp 15 / 1/x 63, unmasked  | 58.1 ms/ct, 14 levels (13 with the folds) |
+| wide crossing (16), l = 4                | 134.3 ms/big ct both ways (77 down + 57 up) |
+| ring switch 16<->13, k = 8               | 0.63 ms/big ct |
+| CCMM, 32 heads, one island call          | 57-61 ms (err 5e-8) |
+| Alg 5, 4096 -> 4096, island              | 2.8-3.0 s (err 6e-9) |
+
+Assembled 8B block projection: ~150-200 s against §12's measured 2425.5 s —
+bootstraps 1200 s -> ~74 s (16x packing), conversions ~735 s -> tens of
+seconds, Alg 5 -> 16 island calls. The dnum = 1 mod-down disease (§12.3's
+84.6%) is gone by construction: the high ring holds ~50 boot + 62 bridge
+indices, nothing forces dnum = 1.
+
+**Open after this:** (1) dnum 4 is 96-190 bits over sec128 at the needed
+nbase; the legal floor is dnum 6-7, affordable ONLY with the subset keys.
+(2) The wide constructor inverts `step` d_H x d_H matrices on the host
+(197 s at (65536,1024)); the Vandermonde inverse should be analytic.
+(3) v2 at 2^16 is 16.75 bits mean / ~11-12 worst-slot — the 12-bit target
+holds at the mean only. (4) `Llama3RectOperator::transformer_block` still
+runs single-ring; wiring it onto these proven pieces is the remaining
+engineering. (5) Generating the 62-key wide set exhausts a cold 40.9 GiB
+RMM pool (keygen transients); a short-chain context for standalone key
+generation, or a warmed pool, works around it.
