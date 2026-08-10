@@ -23,6 +23,7 @@ set(EXECUTABLES
     attention_layout_profile profile_attention_layout.cpp
     low_ring_params_profile profile_low_ring_params.cpp
     ringswitch_profile profile_ringswitch.cpp
+    tworing_attention_profile profile_tworing_attention.cpp
 )
 
 function(add_benchmark exe source)
