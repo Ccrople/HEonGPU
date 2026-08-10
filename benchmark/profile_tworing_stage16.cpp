@@ -195,6 +195,8 @@ int main()
     // ==================================================================
     if (leg_boot || leg_softmax)
     {
+        try
+        {
         heongpu::Secretkey<S> sparse(big, 32);
         keygen.generate_secret_key_v2(sparse);
         heongpu::Switchkey<S> swk_d2s(big);
@@ -261,46 +263,70 @@ int main()
 
         if (leg_softmax)
         {
-            // The 8B block's recalibrated fits: exp degree 15 (one round),
-            // reciprocal degree 63, no Newton. Unmasked overload -- the
-            // causal-masked one costs one level more.
-            heongpu::llama::Llama3Operator::SoftmaxConfig cfg;
-            cfg.strided = true;
-            cfg.stride = slots;
-            cfg.count = 1;
-            cfg.bound = 21.0;
-            cfg.iterations = 1;
-            cfg.exp_degree = 15;
-            cfg.inverse_degree = 63;
-            cfg.inverse_newton = 0;
+            try
+            {
+                // The 8B block's recalibrated fits: exp degree 15 (one
+                // round), reciprocal degree 63, no Newton. The block reduces
+                // across PARTS (the key axis is the ciphertext axis, zero
+                // rotations), so the cost-true unit is the vector overload;
+                // two parts keep the reduction shape and halve to per-part.
+                heongpu::llama::Llama3Operator::SoftmaxConfig cfg;
+                cfg.strided = true;
+                cfg.stride = slots;
+                cfg.count = 1;
+                cfg.bound = 21.0;
+                cfg.iterations = 1;
+                cfg.exp_degree = 15;
+                cfg.inverse_degree = 63;
+                cfg.inverse_newton = 0;
 
-            std::vector<double> msg(slots);
-            std::uniform_real_distribution<double> neg(-cfg.bound, 0.0);
-            for (auto& v : msg)
-                v = neg(rng);
-            heongpu::Plaintext<S> P1(big);
-            encoder.encode(P1, msg, scale, heongpu::ExecutionOptions(),
-                           heongpu::encoding::SLOT);
-            heongpu::Ciphertext<S> C1(big);
-            encryptor.encrypt(C1, P1);
-            while (L - C1.depth() > 1 + nbase)
-                arith.mod_drop_inplace(C1);
-            const int depth_in = C1.depth();
-
-            std::unique_ptr<heongpu::Ciphertext<S>> sm;
-            softmax_ms = BestMs(
-                [&]()
+                const int nparts = 2;
+                std::uniform_real_distribution<double> neg(-cfg.bound, 0.0);
+                std::vector<heongpu::Ciphertext<S>> parts;
+                for (int j = 0; j < nparts; ++j)
                 {
-                    heongpu::Ciphertext<S> work = C1;
-                    sm = std::make_unique<heongpu::Ciphertext<S>>(
-                        arith.softmax(work, cfg, boot_galois, relin));
-                },
-                reps);
-            softmax_levels = sm->depth() - depth_in;
-            std::cout << "[t16] softmax at 16 (exp 15, 1/x 63, unmasked): "
-                      << std::setprecision(1) << softmax_ms
-                      << " ms per ct, levels " << softmax_levels
-                      << " (from l = " << (L - depth_in) << ")" << std::endl;
+                    std::vector<double> msg(slots);
+                    for (auto& v : msg)
+                        v = neg(rng);
+                    heongpu::Plaintext<S> P1(big);
+                    encoder.encode(P1, msg, scale);
+                    heongpu::Ciphertext<S> C1(big);
+                    encryptor.encrypt(C1, P1);
+                    while (L - C1.depth() > 1 + nbase)
+                        arith.mod_drop_inplace(C1);
+                    parts.push_back(std::move(C1));
+                }
+                const int depth_in = parts.front().depth();
+                const std::vector<std::vector<double>> no_masks;
+
+                std::vector<heongpu::Ciphertext<S>> sm;
+                softmax_ms = BestMs(
+                    [&]()
+                    {
+                        std::vector<heongpu::Ciphertext<S>> work = parts;
+                        sm = arith.softmax(work, cfg, no_masks, boot_galois,
+                                           relin);
+                    },
+                    reps);
+                softmax_ms /= nparts;
+                softmax_levels = sm.front().depth() - depth_in;
+                std::cout << "[t16] softmax at 16 (exp 15, 1/x 63, "
+                          << nparts << "-part, unmasked): "
+                          << std::setprecision(1) << softmax_ms
+                          << " ms per ct, levels " << softmax_levels
+                          << " (from l = " << (L - depth_in) << ")"
+                          << std::endl;
+            }
+            catch (const std::exception& e)
+            {
+                std::cout << "[t16] softmax leg failed: " << e.what()
+                          << std::endl;
+            }
+        }
+        }
+        catch (const std::exception& e)
+        {
+            std::cout << "[t16] phase 1 failed: " << e.what() << std::endl;
         }
     }
 
@@ -310,6 +336,8 @@ int main()
     // ==================================================================
     if (leg_island)
     {
+        try
+        {
         const int shared = 3;
         heongpu::HEContext<S> small =
             heongpu::GenHEContext<S>(heongpu::sec_level_type::none);
@@ -492,6 +520,11 @@ int main()
                   << std::fixed << std::setprecision(1) << ccmm_ms
                   << " ms, alg5 " << model << "->" << model << " " << alg5_ms
                   << " ms" << std::endl;
+        }
+        catch (const std::exception& e)
+        {
+            std::cout << "[t16] island leg failed: " << e.what() << std::endl;
+        }
     }
 
     // ==================================================================
