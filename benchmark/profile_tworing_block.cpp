@@ -216,6 +216,15 @@ namespace
             m = std::max(m, std::abs(a[i] - b[i]));
         return m;
     }
+
+    void PrintFree(const char* tag)
+    {
+        std::size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        std::cout << "[tb.mem] " << tag << ": free "
+                  << double(free_b) / (1024.0 * 1024.0 * 1024.0) << " GiB"
+                  << std::endl;
+    }
 } // namespace
 
 // ----------------------------------------------------------------------
@@ -300,7 +309,20 @@ struct TwoRing
         std::vector<Data64> p_vals = heongpu::generate_proper_primes(
             Data64(2) * Data64(n_hi), 61, specials);
         big->set_coeff_modulus_values(q_vals, p_vals);
-        big->generate();
+        // Cap the RMM pool below the default 0.95-of-free: the wide
+        // operators' constructors allocate ~4 GiB of device tables OUTSIDE
+        // the pool, and the default reservation starves them (and then the
+        // pool's own growth). Percent of free VRAM, default 86.
+        {
+            heongpu::MemoryPoolConfig pool_cfg =
+                heongpu::MemoryPoolConfig::Defaults();
+            pool_cfg.initial_device_fraction =
+                float(EnvInt("HEONGPU_TB_POOL_INIT", 55)) / 100.0f;
+            pool_cfg.max_device_fraction =
+                float(EnvInt("HEONGPU_TB_POOL_MAX", 86)) / 100.0f;
+            big->generate(pool_cfg);
+        }
+        PrintFree("big context generated (pool grabbed)");
 
         keygen = std::make_unique<heongpu::HEKeyGenerator<S>>(big);
         secret = std::make_unique<heongpu::Secretkey<S>>(big, 192);
@@ -335,10 +357,14 @@ struct TwoRing
                 heongpu::EncodingMatrixConfig(
                     heongpu::LinearTransformType::COEFFS_TO_SLOTS, cts_start));
             arith_hi->generate_bootstrapping_params_v2(scale, boot_config);
+            PrintFree("boot params (CtS/StC matrices) generated");
             std::vector<int> key_index = arith_hi->bootstrapping_key_indexs();
+            std::cout << "[tb] v2 boot galois indices: " << key_index.size()
+                      << std::endl;
             boot_galois =
                 std::make_unique<heongpu::Galoiskey<S>>(big, key_index);
             keygen->generate_galois_key(*boot_galois, *secret);
+            PrintFree("boot galois generated");
         }
     }
 
@@ -439,6 +465,7 @@ struct TwoRing
             std::make_unique<heongpu::HERingSwitchOperator<S>::SecretPair>(
                 rs->make_secret_pair(64, 0xC0FFEEULL));
         rs->generate_keys(*keygen, *secret, pair->embedded);
+        PrintFree("ring-switch keys generated");
 
         keygen_is = std::make_unique<heongpu::HEKeyGenerator<S>>(island);
         pub_is = std::make_unique<heongpu::Publickey<S>>(island);
@@ -653,10 +680,26 @@ int main()
     Ledger ledger;
     tr.ledger = &ledger;
 
+    // Free VRAM outside the RMM pool: a drop here is the pool growing, so
+    // the deltas between checkpoints attribute the pool's real consumers.
+    auto vram = [](const char* tag) {
+        std::size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        std::cout << "[tb.mem] " << tag << ": free "
+                  << double(free_b) / (1024.0 * 1024.0 * 1024.0) << " GiB"
+                  << std::endl;
+    };
+
+    vram("start");
     tr.build_big(nbase, specials, with_boot);
+    vram("after big context+boot");
     tr.build_wide();
+    vram("after wide ops+keys");
     if (!unit_stage)
+    {
         tr.build_island();
+        vram("after island");
+    }
 
     std::mt19937_64 rng(20260810u);
     const int slots_hi = int(tr.n_hi) / 2;
