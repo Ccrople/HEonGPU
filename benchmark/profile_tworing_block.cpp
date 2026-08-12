@@ -1260,6 +1260,17 @@ int main()
         return tr.wide_from_slots(slots);
     };
 
+    // The same crossing, but leaving the island side @p island_l limbs to
+    // work with. The bridge is cheapest at the bottom of the chain, which is
+    // why from_slots_low drops to FROM_L -- but the bridge spends a level of
+    // its own and descend() can only DROP to its target, never raise to it.
+    // A crossing whose island side still has products to run therefore has
+    // to buy those levels here; there is nowhere later to do it.
+    auto from_slots_at = [&](std::vector<Ct>& slots, int island_l) {
+        drop_big_to(slots, island_l + 1);
+        return tr.wide_from_slots(slots);
+    };
+
     // ---- RMSNorm at the big ring, on an island RECT activation. --------
     // One ascend + boot serves TWO consumers: the norm path (block map ->
     // rms_norm -> block map -> bridge down) and the residual "skip" copy
@@ -1288,7 +1299,7 @@ int main()
         // refreshed stream.
         {
             std::vector<Ct> skip_slots = slots;
-            std::vector<Ct> skip_big = from_slots_low(skip_slots);
+            std::vector<Ct> skip_big = from_slots_at(skip_slots, shared);
             std::vector<Ct> cols = tr.descend(skip_big, shared);
             skip.column = std::move(cols);
             skip.rows = d;
@@ -1344,7 +1355,11 @@ int main()
             tr.wide_rect->block_map(slots, false, "wide.block_forward",
                                     *tr.galois_hi);
         });
-        std::vector<Ct> big_out = from_slots_low(slots);
+        // The normed stream is the input to a whole sublayer of island work
+        // -- "x arrives as island RECT at l = shared" -- so this crossing
+        // has to hand it down with those levels, not with the one the cheap
+        // bridge would leave.
+        std::vector<Ct> big_out = from_slots_at(slots, shared);
         std::vector<Ct> cols = tr.descend(big_out, shared);
         normed.column = std::move(cols);
         normed.rows = d;
@@ -1686,7 +1701,9 @@ int main()
                                         *tr.galois_hi);
             });
             const int l_hf = hi_l(gslots);
-            std::vector<Ct> hbig = from_slots_low(gslots);
+            // The down projection and the residual behind it run on the
+            // island, so the crossing has to leave them their levels.
+            std::vector<Ct> hbig = from_slots_at(gslots, shared);
             ledger.note("wide.from_slots", "16", l_hf, hi_l(hbig));
             const int l_hd = hi_l(hbig);
             std::vector<Ct> hcols = tr.descend(hbig, shared);
