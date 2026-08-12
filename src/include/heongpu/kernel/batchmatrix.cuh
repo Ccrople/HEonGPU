@@ -14,6 +14,31 @@
 namespace heongpu
 {
     /**
+     * @brief Lift centred int64 coefficients into the RNS base, one limb per
+     * grid row.
+     *
+     * out[limb][i] = coeffs[i] mod modulus[limb], with a negative coefficient
+     * mapped to p - (-v mod p) and -0 mapped to 0.
+     *
+     * The plaintext matrix is one array of coefficients repeated across every
+     * limb, so building it limb-by-limb on the host meant writing num_limbs
+     * copies of it through host memory and uploading all of them: 960 MiB per
+     * projection at the 8B shape, against 64 MiB for the coefficients alone.
+     *
+     * One thread per coefficient, walking every limb, so the coefficient is
+     * read once and the launch is one-dimensional.
+     *
+     * @param out      [num_limbs][per_limb] destination.
+     * @param coeffs   [per_limb] centred coefficients, shared by every limb.
+     *                 May alias out's first limb, which is how the caller
+     *                 expands in place; each thread loads its element before
+     *                 the loop stores, and owns index i in every limb.
+     */
+    __global__ void bm_crt_expand_kernel(Data64* out, const int64_t* coeffs,
+                                         const Modulus64* modulus,
+                                         size_t per_limb, int num_limbs);
+
+    /**
      * @brief Forward negacyclic NTT of length k, one transform per block.
      *
      * Output lands in bit-reversed order, matching the ordering that

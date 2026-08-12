@@ -34,9 +34,19 @@ namespace heongpu
     MemoryPool& MemoryPool::instance()
     {
         // Initialize CUDA runtime before the singleton is constructed so that
-        // teardown order stays correct at process exit.
-        cudaFree(nullptr);
-        HEONGPU_CUDA_CHECK(cudaGetLastError());
+        // teardown order stays correct at process exit. Only the first call
+        // can do that, and every DeviceVector constructor lands here: one real
+        // 8B block made this call 8.35 M times for 4.0 s of driver time, all
+        // but the first of it buying nothing. A function-local static is
+        // initialized before the one below it, so the ordering this relies on
+        // is unchanged.
+        static const bool cuda_runtime_ready = []
+        {
+            cudaFree(nullptr);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+            return true;
+        }();
+        (void) cuda_runtime_ready;
 
         static MemoryPool instance;
         return instance;

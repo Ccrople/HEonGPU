@@ -14,8 +14,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <stdexcept>
+#include <string>
 
 namespace heongpu
 {
@@ -105,6 +107,21 @@ namespace heongpu
         inline Data64 mulmod(Data64 a, Data64 b, Data64 p)
         {
             return static_cast<Data64>(static_cast<__uint128_t>(a) * b % p);
+        }
+
+        // HEONGPU_BM_ENCODE_CHECK=1 makes every device-side RNS expansion also
+        // run the host expansion it replaced and compare the two word for
+        // word, so a divergence names its own call site instead of surfacing
+        // later as a decode error. Off by default; the check allocates and
+        // reads back the whole expanded matrix.
+        inline bool bm_encode_check_enabled()
+        {
+            static const bool on = []
+            {
+                const char* e = std::getenv("HEONGPU_BM_ENCODE_CHECK");
+                return e != nullptr && e[0] == '1';
+            }();
+            return on;
         }
 
         // Minimal little-endian fixed-width unsigned integer, carrying just the
@@ -550,17 +567,63 @@ namespace heongpu
         const BatchSubringTables& t = tables_for(depth);
         const int num_limbs = t.num_limbs;
 
-        std::vector<Modulus64> all = context_->get_key_modulus();
-        std::vector<Data64> host(static_cast<size_t>(num_limbs) * per_limb);
-        for (int l = 0; l < num_limbs; ++l)
+        // The coefficients are the same for every limb, so the RNS expansion
+        // is done on the device: only the coefficients are uploaded, and the
+        // num_limbs copies of them are written straight into device memory.
+        // Building them host-side instead was the single most expensive thing
+        // in a real 8B block -- 58 projections x (a 960 MiB host buffer, 126 M
+        // host modular reductions and a 960 MiB pageable upload) came to 139 s
+        // of a 352 s block, against 2.5 s of GPU work in the same 58 calls.
+        // t.modulus is the first num_limbs primes of the key modulus, which is
+        // exactly what the host loop indexed, so the result is unchanged.
+        // Staged in the first limb's slice of the destination and expanded in
+        // place, so this costs no device memory beyond the plaintext itself.
+        // A separate upload buffer would add per_limb words on top -- hundreds
+        // of MiB at the wide sweep shapes, on a pool that other work on this
+        // machine already drives to its ceiling.
+        plain_ = DeviceVector<Data64>(static_cast<size_t>(num_limbs) *
+                                      per_limb);
+        HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+            plain_.data(), coeffs.data(), per_limb * sizeof(int64_t),
+            cudaMemcpyHostToDevice, cudaStreamDefault));
         {
-            const Data64 p = all[l].value;
-            for (size_t i = 0; i < per_limb; ++i)
-                host[static_cast<size_t>(l) * per_limb + i] =
-                    centered_to_modular(coeffs[i], p);
+            const int expand_threads = 256;
+            const dim3 expand_grid(static_cast<unsigned>(
+                (per_limb + expand_threads - 1) / expand_threads));
+            bm_crt_expand_kernel<<<expand_grid, expand_threads>>>(
+                plain_.data(),
+                reinterpret_cast<const int64_t*>(plain_.data()),
+                t.modulus.data(), per_limb, num_limbs);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
         }
 
-        plain_ = DeviceVector<Data64>(host);
+        if (bm_encode_check_enabled())
+        {
+            const size_t total = static_cast<size_t>(num_limbs) * per_limb;
+            std::vector<Data64> got(total);
+            HEONGPU_CUDA_CHECK(cudaMemcpy(got.data(), plain_.data(),
+                                          total * sizeof(Data64),
+                                          cudaMemcpyDeviceToHost));
+            std::vector<Modulus64> all = context_->get_key_modulus();
+            for (int l = 0; l < num_limbs; ++l)
+            {
+                const Data64 p = all[l].value;
+                for (size_t i = 0; i < per_limb; ++i)
+                {
+                    const Data64 want = centered_to_modular(coeffs[i], p);
+                    const size_t at = static_cast<size_t>(l) * per_limb + i;
+                    if (got[at] != want)
+                    {
+                        throw std::runtime_error(
+                            "bm_crt_expand_kernel disagrees with the host "
+                            "expansion at limb " + std::to_string(l) +
+                            " index " + std::to_string(i) + ": device " +
+                            std::to_string(got[at]) + " host " +
+                            std::to_string(want));
+                    }
+                }
+            }
+        }
 
         const int threads = (k < 256) ? k : 256;
         const size_t shared = static_cast<size_t>(k) * sizeof(Data64);

@@ -6,6 +6,48 @@
 
 namespace heongpu
 {
+    __global__ void bm_crt_expand_kernel(Data64* out, const int64_t* coeffs,
+                                         const Modulus64* modulus,
+                                         size_t per_limb, int num_limbs)
+    {
+        const size_t i =
+            static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (i >= per_limb)
+            return;
+
+        // One load of the coefficient serves every limb: the array is shared
+        // across the RNS base, which is exactly what made the host expansion
+        // write num_limbs copies of it. Walking the limbs inside the thread
+        // rather than across a grid dimension keeps that single load, and
+        // keeps this loop on the path every shape takes -- spreading limbs
+        // over blockIdx.y would leave it dead below 33 limbs, which is every
+        // shape the tests cover and none of the ones the Llama chain runs.
+        //
+        // coeffs is allowed to alias the first limb of out, which is how the
+        // caller avoids a second buffer. That is safe in exactly one way and
+        // it is load-before-store: this thread reads its own element once,
+        // here, before the loop writes anything, and no other thread touches
+        // index i in any limb. Neither pointer is __restrict__, and int64_t
+        // and Data64 are the corresponding signed/unsigned types, so the
+        // compiler has to keep this load ahead of the stores.
+        const int64_t v = coeffs[i];
+        for (int limb = 0; limb < num_limbs; ++limb)
+        {
+            const Data64 p = modulus[limb].value;
+            Data64 r;
+            if (v >= 0)
+            {
+                r = static_cast<Data64>(v) % p;
+            }
+            else
+            {
+                const Data64 m = static_cast<Data64>(-v) % p;
+                r = (m == 0) ? 0 : p - m;
+            }
+            out[static_cast<size_t>(limb) * per_limb + i] = r;
+        }
+    }
+
     __global__ void bm_ntt_k_kernel(Data64* data, const Data64* psi,
                                     const Modulus64* modulus, int k,
                                     int transforms_per_limb)
