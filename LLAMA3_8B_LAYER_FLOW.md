@@ -1821,7 +1821,7 @@ secret-distribution half.
 
 1. **Bootstrapping is now the block, at 50.4%** — 11 calls x 16 big
    ciphertexts x ~164 ms. Every other bucket is under a third of it.
-2. **BSGS on `wide.block_map`** (4,909 ms, 7.8%), analysed and not built.
+2. **BSGS on `wide.block_map`** (4,909 ms, 7.8%) — BUILT, see §16.8.
    The comment at `llama3_rect.cu:348` says it needs new Galois indices; at
    `step_h = 32` it does not. With `n1 = 8`, `eps = 8i + j` needs babies
    `{1..7}` and giants `{+-8, +-16, +-24, +-32}`, and `build_wide()` already
@@ -1832,3 +1832,74 @@ secret-distribution half.
    §15's single-ring 107,455 ms, which ran the full width.
 4. §15.5 items 1-3 are unchanged, and (1) is now partly done: the SoftMax
    runs in 10 levels rather than 13, at better accuracy.
+
+### 16.8 BSGS on the block map: the one index the old note got wrong
+
+`block_map` applies 2*step - 1 diagonals at shifts eps in
+[-(step-1), step-1], one rotation each — 62 key switches per ciphertext at
+step_h = 32, and 7.8% of the block once the crossings were hoisted. The
+comment at `llama3_rect.cu:348` explained why BSGS had not been done: the
+giant shifts "run past the +-(k/2 - 1) window this map's Galois indices
+cover, so unlike the row bridge it is not free of new keys."
+
+That is true of **exactly one index**. Writing eps = n1*i + b with
+b in [0, n1):
+
+* babies are `1..n1-1`, inside the window;
+* non-negative giants are at most `n1*floor((step-1)/n1) < step`, inside it;
+* only the most negative giant, `-n1*ceil((step-1)/n1)`, reaches `-step`.
+
+At step_h = 32, n1 = 8 that single index is `-32`, and `build_wide()`
+already generates it — it is the SoftMax comb's `+-step_h`. So the split is
+free of new keys on this path after all. `block_bsgs_rotation_indices()`
+returns the set for callers who need to check, and a missing key falls back
+to multi-hop rotation: slower, never wrong.
+
+Rotations per ciphertext **62 -> 14** (7 babies + 7 live giants).
+
+**It is not bit-identical, and it cannot be.** The plain walk sums every
+diagonal and rescales once; the split rescales each of the 8 giant groups.
+Measured gap against the plain walk **1.49e-08**, consistent with sqrt(8)
+independent rescale roundings and three orders under the encoding floor.
+The test measures that gap rather than asserting equality, and separately
+checks that the level cost is unchanged, that the round trip still inverts,
+and that no shift the split asks for leaves the `+-step` window. 38/38 green
+on the rect suite (36 before, +2 new).
+
+Measured on the secure block, `d17ec6e`:
+
+| leg | before | after | |
+|---|---:|---:|---|
+| `wide.block_map` (8 calls) | 4,908.9 | **1,948.8** | **-60.3%** |
+| whole block, steady state | 62,551 | **58,949** | -5.8% |
+| accuracy | 9.78 bits | 9.77 bits | unchanged |
+
+Of the 3,602 ms the block lost, 2,960 is the block map; the remainder is
+run-to-run variation across the projection legs and is not attributable to
+this change.
+
+**The cumulative picture, one 16<->13 layer:**
+
+| step | steady state | bits |
+|---|---:|---:|
+| §13 baseline | 110,856 | 6.39 |
+| + hoisted crossings | (85,084 first block) | 6.39 |
+| + encode charged apart | 69,353 | 6.39 |
+| + NBASE 13, degree-7 fits (fits the cap) | 62,551 | 9.78 |
+| + BSGS block map | **58,949** | **9.77** |
+
+**110,856 -> 58,949 ms, -46.8%, +3.4 bits, inside the 128-bit modulus cap.**
+
+The buckets at the end of it (58,949 ms):
+
+| | ms | % |
+|---|---:|---:|
+| **Bootstrapping** (11 calls) | **31,647** | **53.7** |
+| Layout conversion | 17,330 | 29.4 |
+| Matrix products | 9,009 | 15.3 |
+| Non-linear fits | 723 | 1.2 |
+| Ring switching (22 crossings) | 179 | 0.3 |
+
+Bootstrapping was 32.4% of the §13 block and is 53.7% of this one, having
+barely moved in absolute terms (35,909 -> 31,647). Everything else has been
+cut roughly in half around it. It is now the only thing worth attacking.
