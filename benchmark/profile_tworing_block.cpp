@@ -599,6 +599,18 @@ struct TwoRing
         ledger->charge(std::string("boot.") + name, [&]() {
             for (auto& c : big_cts)
             {
+                // The v2 boot silently corrupts an input whose TRACKED scale
+                // has drifted off the nominal -- measured on this path:
+                // 2^33*1.00036 boots to garbage, 2^33 exact boots to 5e-7.
+                // Normalising here rather than at each call site is free, and
+                // free is why it belongs here: the level match_scale costs is
+                // one this function was about to drop anyway. Three of the
+                // seven call sites did it and four did not, and the one that
+                // mattered -- post_softmax, behind an exp fit, a reciprocal
+                // fit and their product -- was among the four.
+                const double drift = std::abs(c.scale() / scale - 1.0);
+                if (L_hi - c.depth() > 1 && drift > 1e-12)
+                    arith_hi->match_scale(c, scale);
                 while (L_hi - c.depth() > 1)
                     arith_hi->mod_drop_inplace(c);
                 c = arith_hi->regular_bootstrapping_v2(
@@ -1392,6 +1404,19 @@ int main()
             outb = tr.batch_is->matmul(P, V2, "attn.pv", *tr.galois_is,
                                        *tr.relin_is);
         });
+        if (dbg)
+        {
+            const auto got = tr.batch_is->decrypt(
+                outb, *tr.decryptor_is, outb.column.front().scale());
+            double m = 0.0;
+            for (const auto& row : got)
+                for (double v : row) m = std::max(m, std::abs(v));
+            std::cout << "[tb.dbg] island.pv out: max|v| = " << std::scientific
+                      << std::setprecision(3) << m << std::defaultfloat
+                      << " (island depth "
+                      << outb.column.front().depth() << " of " << tr.shared
+                      << ")" << std::endl;
+        }
         ledger.charge("island.out", [&]() {
             std::vector<BatchActivation> groups;
             groups.push_back(std::move(outb));
