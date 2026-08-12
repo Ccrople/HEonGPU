@@ -1516,6 +1516,35 @@ int main()
         ledger.note("cross.down", "16->13", l_dn, island_l(cols));
     };
 
+    // A refresh the chain does not need is pure cost, and at shared = 4 the
+    // chain always needs it -- which is why these were unconditional. More
+    // island levels only pay if the boot is allowed to NOT fire.
+    //
+    // `need` is what the walk behind this point spends before the next
+    // natural refresh, read off the level map:
+    //   q, k : qk 1 + scale_norm 1 + to_slots 1 + the boot's own input 1 = 4
+    //   v    : pv 1 + from_batch 1 + project_o 1 + residual 1
+    //          + norm2's entry 2                                        = 6
+    //   tail : project_o 1 + residual 1 + norm2's entry 2               = 4
+    // So q/k free at shared >= 7 and the tail at shared >= 9, which is the
+    // whole reason a bigger island ring is worth its key memory.
+    //
+    // Fail-safe by construction: when the levels are not there the boot
+    // still fires, so this can only remove work the chain provably does not
+    // need. Off by default -- it is a no-op at shared = 4.
+    const bool lazy_refresh = EnvInt("HEONGPU_TB_LAZY_REFRESH", 0) != 0;
+    auto island_refresh_if = [&](std::vector<Ct>& cols, const char* name,
+                                 int need) {
+        if (lazy_refresh && island_l(cols) >= need)
+        {
+            const int l = island_l(cols);
+            ledger.charge("refresh.skipped", []() {});
+            ledger.note("refresh.skipped", "13", l, l);
+            return;
+        }
+        island_refresh(cols, name);
+    };
+
     // ---- Attention sublayer, two-ring. ---------------------------------
     // x arrives as island RECT at l = shared. Weights are model x model
     // row-major (in x out), K/V already GQA-expanded.
@@ -1555,9 +1584,9 @@ int main()
         });
         ledger.note("island.to_batch", "island", l_tb, is_lb(qb));
         const int l_bq = is_lb(qb);
-        island_refresh(qb.column, "qkv");
-        island_refresh(kb.column, "qkv");
-        island_refresh(vb.column, "qkv"); // idles at shared until PV
+        island_refresh_if(qb.column, "qkv", 4);
+        island_refresh_if(kb.column, "qkv", 4);
+        island_refresh_if(vb.column, "qkv", 6); // idles at shared until PV
         (void) l_bq; // island_refresh notes its own three legs
         const int l_qk = is_lb(qb);
         ledger.charge("island.qk", [&]() {
@@ -1742,13 +1771,18 @@ int main()
         });
         ledger.note("island.from_batch", "island", l_fb, is_l(out));
         // The PV product drifted the scale; the tail refresh must see the
-        // exact nominal or the boot corrupts it.
-        ledger.charge("scale_norm", [&]() {
-            for (auto& c : out.column)
-                tr.rect_is->arith().match_scale(c, tr.scale);
-        });
+        // exact nominal or the boot corrupts it. When the refresh is going
+        // to be skipped there is no boot to protect, and the level this
+        // match_scale costs is exactly the one project_o needs -- so the
+        // two decisions are one decision.
+        const bool skip_tail = lazy_refresh && is_l(out) >= 4;
+        if (!skip_tail)
+            ledger.charge("scale_norm", [&]() {
+                for (auto& c : out.column)
+                    tr.rect_is->arith().match_scale(c, tr.scale);
+            });
         const int l_at = is_l(out);
-        island_refresh(out.column, "attn_tail");
+        island_refresh_if(out.column, "attn_tail", 4);
         (void) l_at; // island_refresh notes its own three legs
         const int l_po = is_l(out);
         ledger.charge("island.project_o", [&]() {
