@@ -1439,6 +1439,20 @@ namespace heongpu
     // is bit-identical by construction; HEONGPU_MODDOWN_CHECK still compares
     // the whole staged path against the legacy kernel word for word.
     //
+    // WHERE IT IS ACTUALLY FASTER, measured on one real 8B block rather than
+    // argued from the grid. The gain scales with P -- the chain is O(P^2) per
+    // thread and O(P) per lane -- while the cost is fixed at 32 - P idle lanes
+    // and one __shfl_sync dependency per step. So it wins at a long chain and
+    // loses at a short one, and the crossover is real:
+    //
+    //     |P| = 20 (dnum 2)   201,186 -> 186,385 ms   7.4% FASTER
+    //     |P| = 10 (dnum 4)   149,341 -> 152,315 ms   2.0% slower
+    //     |P| =  8 (dnum 5)   141,539 -> 146,353 ms   3.4% slower
+    //
+    // Hence the >= 16 floor below: it sits on the winning side of a crossover
+    // measured between 10 and 20, and every decomposition the Llama-3 path
+    // actually runs at (dnum 4-6) keeps the array form.
+    //
     // Lanes at or above P_size do no work but must not exit: __shfl_sync needs
     // the whole warp.
     __global__ void divide_round_lastq_p_chain_warp_kernel(
@@ -1502,16 +1516,31 @@ namespace heongpu
         }
     }
 
-    // HEONGPU_MODDOWN_WARP=0 puts the thread-per-coefficient chain back, which
-    // is how the two are compared on one build.
-    static bool moddown_warp_enabled()
+    // HEONGPU_MODDOWN_WARP=0 forces the thread-per-coefficient chain even
+    // where the warp form is selected, and =1 forces the warp form down to
+    // P_size 2; unset takes the measured >= 16 floor. This is how the two are
+    // compared on one build.
+    static int moddown_warp_mode()
     {
-        static const bool on = []
+        static const int mode = []
         {
             const char* e = std::getenv("HEONGPU_MODDOWN_WARP");
-            return e == nullptr || e[0] != '0';
+            if (e == nullptr || e[0] == '\0')
+                return 0; // measured default
+            return (e[0] == '0') ? -1 : 1;
         }();
-        return on;
+        return mode;
+    }
+
+    /// The warp form needs one lane per special prime, and it only pays back
+    /// its idle lanes once the chain is long enough. See the kernel comment
+    /// for the crossover this floor sits on.
+    static bool moddown_warp_selected(int P_size)
+    {
+        const int mode = moddown_warp_mode();
+        if (mode < 0 || P_size > 32)
+            return false;
+        return mode > 0 ? (P_size >= 2) : (P_size >= 16);
     }
 
     __host__ void divide_round_lastq_p_chain_leveled(
@@ -1521,10 +1550,7 @@ namespace heongpu
         int P_size, int components, cudaStream_t stream)
     {
         dim3 grid((n >> 8), 1, components);
-        // One warp per coefficient needs P_size lanes, so the warp form covers
-        // every decomposition from dnum 2 up; dnum 1 at a long chain keeps the
-        // array form.
-        if (P_size <= 32 && moddown_warp_enabled())
+        if (moddown_warp_selected(P_size))
         {
             constexpr int threads = 256;
             const int warps_per_block = threads / 32;
