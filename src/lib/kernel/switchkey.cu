@@ -5,6 +5,7 @@
 
 #include <heongpu/kernel/switchkey.cuh>
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace heongpu
@@ -1413,6 +1414,106 @@ namespace heongpu
         }
     }
 
+    // The same chain, one WARP per (coefficient, component) instead of one
+    // thread.
+    //
+    // Why it exists. The thread-per-coefficient form above has exactly
+    // n * components threads -- 8192 at N = 4096 -- which is 32 blocks, so on
+    // an A100 it occupies 32 of 108 SMs and no more, however long the chain
+    // is. Measured on one real Llama-3-8B block at dnum 4 it was 11.0% of all
+    // GPU time at 22 us a launch across 660932 launches, the single largest
+    // kernel in the profile, and it was there because of the grid and not
+    // because of the arithmetic: the whole call moves 1.3 MB.
+    //
+    // The chain is sequential in i, but step i's inner loop is a set of
+    // INDEPENDENT updates, one per surviving residue j, and each reads only
+    // last_ct[j] and the one scalar last_ct_add_half_. So lane j owns
+    // last_ct[j] for the whole chain, the lane that owns the residue being
+    // removed broadcasts the scalar with __shfl_sync, and the O(P^2) work per
+    // thread becomes O(P) work per lane. Threads go from n * components to
+    // 32 * n * components and the local array -- the one that forced the
+    // MAX_P template and lives in local memory whenever the compiler cannot
+    // promote a dynamically indexed array -- disappears.
+    //
+    // It is the same arithmetic in the same order on the same operands, so it
+    // is bit-identical by construction; HEONGPU_MODDOWN_CHECK still compares
+    // the whole staged path against the legacy kernel word for word.
+    //
+    // Lanes at or above P_size do no work but must not exit: __shfl_sync needs
+    // the whole warp.
+    __global__ void divide_round_lastq_p_chain_warp_kernel(
+        Data64* input, Data64* staged, Modulus64* modulus, Data64* half,
+        Data64* half_mod, Data64* last_q_modinv, int n_power, int Q_prime_size,
+        int Q_size, int first_Q_prime_size, int first_Q_size, int P_size)
+    {
+        const int lane = static_cast<int>(threadIdx.x) & 31;
+        const int warp = static_cast<int>(threadIdx.x) >> 5;
+        const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+        const int idx = blockIdx.x * warps_per_block + warp; // Ring Sizes
+        const int block_z = blockIdx.z; // Cipher Size (2)
+
+        if (idx >= (1 << n_power))
+        {
+            return; // uniform across the warp: the grid is a multiple of it
+        }
+
+        Data64 residue = 0;
+        if (lane < P_size)
+        {
+            residue = input[idx + ((Q_size + lane) << n_power) +
+                            ((Q_prime_size << n_power) * block_z)];
+        }
+
+        int location_ = 0;
+        for (int i = 0; i < P_size; i++)
+        {
+            const int source = P_size - 1 - i;
+
+            Data64 last_ct_add_half_ = 0;
+            if (lane == source)
+            {
+                last_ct_add_half_ = OPERATOR_GPU_64::add(
+                    residue, half[i], modulus[(first_Q_prime_size - 1 - i)]);
+                staged[idx + (i << n_power) +
+                       ((P_size << n_power) * block_z)] = last_ct_add_half_;
+            }
+            last_ct_add_half_ =
+                __shfl_sync(0xffffffffu, last_ct_add_half_, source);
+
+            if (lane < source)
+            {
+                const int j = lane;
+                Data64 temp1 = OPERATOR_GPU_64::reduce_forced(
+                    last_ct_add_half_, modulus[first_Q_size + j]);
+
+                temp1 = OPERATOR_GPU_64::sub(
+                    temp1, half_mod[location_ + first_Q_size + j],
+                    modulus[first_Q_size + j]);
+
+                temp1 = OPERATOR_GPU_64::sub(residue, temp1,
+                                             modulus[first_Q_size + j]);
+
+                residue = OPERATOR_GPU_64::mult(
+                    temp1, last_q_modinv[location_ + first_Q_size + j],
+                    modulus[first_Q_size + j]);
+            }
+
+            location_ = location_ + (first_Q_prime_size - 1 - i);
+        }
+    }
+
+    // HEONGPU_MODDOWN_WARP=0 puts the thread-per-coefficient chain back, which
+    // is how the two are compared on one build.
+    static bool moddown_warp_enabled()
+    {
+        static const bool on = []
+        {
+            const char* e = std::getenv("HEONGPU_MODDOWN_WARP");
+            return e == nullptr || e[0] != '0';
+        }();
+        return on;
+    }
+
     __host__ void divide_round_lastq_p_chain_leveled(
         Data64* input, Data64* staged, Modulus64* modulus, Data64* half,
         Data64* half_mod, Data64* last_q_modinv, int n, int n_power,
@@ -1420,6 +1521,24 @@ namespace heongpu
         int P_size, int components, cudaStream_t stream)
     {
         dim3 grid((n >> 8), 1, components);
+        // One warp per coefficient needs P_size lanes, so the warp form covers
+        // every decomposition from dnum 2 up; dnum 1 at a long chain keeps the
+        // array form.
+        if (P_size <= 32 && moddown_warp_enabled())
+        {
+            constexpr int threads = 256;
+            const int warps_per_block = threads / 32;
+            dim3 warp_grid(
+                static_cast<unsigned>((n + warps_per_block - 1) /
+                                      warps_per_block),
+                1, static_cast<unsigned>(components));
+            divide_round_lastq_p_chain_warp_kernel<<<warp_grid, threads, 0,
+                                                     stream>>>(
+                input, staged, modulus, half, half_mod, last_q_modinv, n_power,
+                Q_prime_size, Q_size, first_Q_prime_size, first_Q_size,
+                P_size);
+            return;
+        }
         if (P_size <= 16)
         {
             divide_round_lastq_p_chain_leveled_kernel<16>
