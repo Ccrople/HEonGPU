@@ -1328,6 +1328,49 @@ point restated: 30 unhoisted rotations cost what 22 baby-step/giant-step ones
 do. The row bridge is bigger now only because the block runs 6272
 column-crossings of it against 4736 of the block map.
 
+### 14.4bis Which kernel inside which function — the join
+
+`nsys stats --report nvtx_kern_sum`, as a share of each range's OWN GPU time.
+This is the cut neither §14.3 nor §14.4 shows, and it settles what the two
+conversions differ by.
+
+| function | GPU s | NTT | ModDown | BConv | KeyProd | other |
+|---|---:|---:|---:|---:|---:|---|
+| `bootstrap` (2432 ct) | 53.0 | **44%** | 27% | 18% | 5% | |
+| `boot.eval_mod` | 22.7 | 45% | 27% | 16% | | 5% |
+| `boot.coeff_to_slot` | 19.8 | 42% | 25% | 22% | 6% | |
+| `boot.slot_to_coeff` | 10.4 | 44% | 32% | 15% | 4% | |
+| `bridge.block_inverse.diagonals` | 12.7 | **43%** | 30% | 17% | 5% | |
+| `bridge.block_forward.diagonals` | 7.1 | **44%** | 30% | 17% | 5% | |
+| `CMT.automorphisms` | 15.9 | **46%** | 32% | 17% | 5% | |
+| `RectangularPCMM.summation` | 19.2 | 38% | 26% | 14% | | BatchMatrix 18% |
+| `bridge.to_slots.diagonals` | 7.3 | 29% | 18% | | | **PlainProduct 24%** |
+| `bridge.from_slots.diagonals` | 5.3 | 30% | 18% | | | **PlainProduct 24%** |
+| `RectangularPCMM.blocks` | 10.8 | | | | | **GEMM 93%** |
+| `chebyshev.evaluate` | 2.1 | 39% | 20% | 8% | | 28% |
+
+**The block map's signature is indistinguishable from the bootstrap's** —
+43/30/17/5 against 44/27/18/5 — so it is pure key switching and nothing else.
+The row bridge's is visibly different (NTT 29%, plaintext products 24%), and
+that difference IS baby-step/giant-step: the row bridge has already traded its
+rotations for plaintext multiply-accumulates and the block map has not. §12.6
+item 2 asked whether BSGS on the block map was worth new Galois indices; this
+is the measurement that says the map is 100% rotation cost and nothing else,
+so the answer is about the rotation count alone.
+
+**`RectangularPCMM.blocks` at 93% GEMM is the only range in the block where
+the matrix arithmetic dominates its own time** — and it is 10.8 s of 132.0.
+`CMT.automorphisms` at 15.9 s costs more than the GEMM it exists to prepare.
+
+And the operation, from the mod-down stage-two call counts, which split
+exactly one per key switch:
+
+| operation | calls | share of the block's key switches |
+|---|---:|---:|
+| **rotation** (Galois) | 566,030 | **85.6%** |
+| relinearization | 94,902 | 14.4% |
+| total | 660,932 | 160 us each |
+
 ### 14.5 The dnum answer
 
 Sweep at the real shape, all seven decompositions, `|P|` chosen so
