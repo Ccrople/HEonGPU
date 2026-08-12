@@ -1389,6 +1389,40 @@ int main()
         V2.rows = d;
         V2.column = std::move(vb.column);
 
+        if (dbg)
+        {
+            // P is correct in wide slot form and the product behind it is
+            // not, so the descent between them is what has to be read.
+            const auto gp = tr.batch_is->decrypt(P, *tr.decryptor_is,
+                                                 P.column.front().scale());
+            double ep = 0.0, mp = 0.0;
+            for (int b = 0; b < heads && b < int(gp.size()); ++b)
+                for (int u = 0; u < d; ++u)
+                    for (int j = 0; j < d; ++j)
+                    {
+                        const double v = gp[b][std::size_t(u) * d + j];
+                        mp = std::max(mp, std::abs(v));
+                        ep = std::max(ep,
+                                      std::abs(v - p_host[(std::size_t(b) * d +
+                                                           u) * d + j]));
+                    }
+            const auto gv = tr.batch_is->decrypt(V2, *tr.decryptor_is,
+                                                 V2.column.front().scale());
+            double mv = 0.0;
+            for (const auto& row : gv)
+                for (double v : row) mv = std::max(mv, std::abs(v));
+            std::cout << "[tb.dbg] P after descend: max|v| = "
+                      << std::scientific << std::setprecision(3) << mp
+                      << ", err vs host " << ep << " (depth "
+                      << P.column.front().depth() << ", " << P.column.size()
+                      << " cts)" << std::defaultfloat << std::endl;
+            std::cout << "[tb.dbg] V before pv    : max|v| = "
+                      << std::scientific << std::setprecision(3) << mv
+                      << " (depth " << V2.column.front().depth() << ", "
+                      << V2.column.size() << " cts)" << std::defaultfloat
+                      << std::endl;
+        }
+
         BatchActivation outb;
         RectActivation out;
         ledger.charge("island.pv", [&]() {
