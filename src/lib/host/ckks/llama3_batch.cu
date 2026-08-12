@@ -281,16 +281,26 @@ namespace heongpu
                 const auto plain_key =
                     std::make_tuple(inverse, source.depth(),
                                     static_cast<uint64_t>(plain_scale));
+                // A set too wide to be worth its memory is built, used and
+                // dropped rather than cached, so it cannot displace a narrow
+                // set that more calls want. @see set_bridge_plain_limb_limit.
+                const int this_set_limbs = set_limbs(plain_key);
+                const bool cacheable =
+                    bridge_plain_limb_limit_ <= 0 ||
+                    this_set_limbs <= bridge_plain_limb_limit_;
+
                 auto encoded = bridge_plain_.find(plain_key);
+                EncodedDiagonalSet scratch;
                 if (encoded == bridge_plain_.end())
                 {
                     SuffixRange _r(name, "encode");
-                    if (bridge_plain_.size() >= bridge_plain_capacity_)
+                    while (cacheable &&
+                           bridge_plain_.size() >= bridge_plain_capacity_)
                     {
-                        // Whole-set eviction. The next call that wants this
-                        // level pays the encode again and gets the same
-                        // plaintexts, so the only thing at stake is time.
-                        bridge_plain_.erase(bridge_plain_.begin());
+                        // Whole-set eviction, widest first. The next call that
+                        // wants this level pays the encode again and gets the
+                        // same plaintexts, so the only thing at stake is time.
+                        evict_widest();
                     }
                     // Stored in BSGS order and PRE-ROTATED: entry i*n1 + j is
                     // diagonal[i*n1 + j] shifted back by the giant step that
@@ -324,10 +334,23 @@ namespace heongpu
                     }
                     EncodedDiagonalSet set;
                     set.plains = std::move(plains);
-                    encoded =
-                        bridge_plain_.emplace(plain_key, std::move(set))
-                            .first;
+                    if (cacheable)
+                    {
+                        encoded =
+                            bridge_plain_.emplace(plain_key, std::move(set))
+                                .first;
+                    }
+                    else
+                    {
+                        scratch = std::move(set);
+                    }
                 }
+
+                // Either the cached entry or this call's throwaway. The rest
+                // of the loop does not care which.
+                EncodedDiagonalSet& live = (encoded != bridge_plain_.end())
+                                               ? encoded->second
+                                               : scratch;
 
                 if (hoisted_crossings_)
                 {
@@ -336,7 +359,7 @@ namespace heongpu
                     // The modular arithmetic is exact and identically
                     // ordered, so this is the loop below to the bit, at a
                     // fraction of the work and the launches.
-                    EncodedDiagonalSet& set = encoded->second;
+                    EncodedDiagonalSet& set = live;
                     if (set.packed.size() == 0)
                     {
                         set.packed = arith_.pack_bsgs_plaintexts(
@@ -428,8 +451,7 @@ namespace heongpu
                         for (int j = 0; j < n1; ++j)
                         {
                             Plaintext<Scheme::CKKS>& plain =
-                                encoded->second
-                                    .plains[static_cast<std::size_t>(i) * n1 +
+                                live.plains[static_cast<std::size_t>(i) * n1 +
                                             j];
 
                             Ciphertext<Scheme::CKKS> term(context_);

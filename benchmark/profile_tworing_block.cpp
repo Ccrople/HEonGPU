@@ -530,7 +530,15 @@ struct TwoRing
         // exhausts the pool at 2^16. Whole-set eviction costs re-encodes,
         // never correctness.
         wide->set_bridge_plain_capacity(
-            std::size_t(EnvInt("HEONGPU_TB_BRIDGE_SETS", 1)));
+            std::size_t(EnvInt("HEONGPU_TB_BRIDGE_SETS", 3)));
+        // A set costs d_wide plaintexts of N words PER LIVE LIMB, and its
+        // value is how often that (direction, level) pair recurs. Those are
+        // unrelated: to_slots sits at 2 limbs and SEVEN calls want it, while
+        // a from_slots set at 7 limbs is 3.5x the memory for four. Counting
+        // sets alone let the second evict the first and OOM'd at
+        // BRIDGE_SETS=2; capping the WIDTH keeps the cheap set resident.
+        wide->set_bridge_plain_limb_limit(
+            EnvInt("HEONGPU_TB_BRIDGE_LIMBS", 3));
         // The wide-layout rect operator supplies block_map: a RECT stream's
         // coefficients are raw (not interpolated), so its crossing is the
         // row bridge PLUS the block transform, exactly as on the island.

@@ -612,6 +612,45 @@ namespace heongpu
             /// correctness.
             std::size_t bridge_plain_capacity_ = 4;
 
+            /// @see set_bridge_plain_limb_limit. 0 means no limit.
+            int bridge_plain_limb_limit_ = 0;
+
+            /// Live limbs of the set behind a cache key, which is what its
+            /// memory is proportional to: the key carries the depth and the
+            /// context carries the chain length.
+            int set_limbs(
+                const std::tuple<bool, int, uint64_t>& key) const
+            {
+                return context_->get_ciphertext_modulus_count() -
+                       std::get<1>(key);
+            }
+
+            /// Drop the WIDEST resident set -- the one whose memory is
+            /// largest. The map is ordered by (direction, depth), so its
+            /// first element is an arbitrary victim rather than a cheap one,
+            /// and evicting arbitrarily is how a 2-limb set that seven calls
+            /// want gets displaced by a 7-limb set that four do.
+            void evict_widest()
+            {
+                if (bridge_plain_.empty())
+                {
+                    return;
+                }
+                auto victim = bridge_plain_.begin();
+                int widest = set_limbs(victim->first);
+                for (auto it = std::next(victim); it != bridge_plain_.end();
+                     ++it)
+                {
+                    const int limbs = set_limbs(it->first);
+                    if (limbs > widest)
+                    {
+                        widest = limbs;
+                        victim = it;
+                    }
+                }
+                bridge_plain_.erase(victim);
+            }
+
             /// Baby steps for the bridge's BSGS split; 0 takes sqrt(d). One
             /// forces the whole split onto the giant side, which is the
             /// d - 1 rotations the bridge used to take and is here so the two
@@ -675,8 +714,44 @@ namespace heongpu
                 bridge_plain_capacity_ = sets;
                 while (bridge_plain_.size() > bridge_plain_capacity_)
                 {
-                    bridge_plain_.erase(bridge_plain_.begin());
+                    evict_widest();
                 }
+            }
+
+            /**
+             * @brief Refuse to CACHE a diagonal set wider than @p limbs.
+             *
+             * A set costs d plaintexts of N words per live limb, so its size
+             * is linear in the level while its VALUE is how often that
+             * (direction, level) pair comes back. Those two are unrelated,
+             * and on a two-ring block they point opposite ways: the
+             * to_slots set sits at 2 limbs and seven calls want it, while a
+             * from_slots set at 7 limbs is three and a half times the memory
+             * for four calls. A capacity counted in SETS lets the second
+             * evict the first, which is the worst of both.
+             *
+             * With a limit set, a wider set is still built and used -- it is
+             * simply not kept, so the narrow set it would have displaced
+             * survives. 0, the default, means no limit.
+             */
+            void set_bridge_plain_limb_limit(int limbs)
+            {
+                bridge_plain_limb_limit_ = limbs;
+                if (limbs <= 0)
+                {
+                    return;
+                }
+                for (auto it = bridge_plain_.begin();
+                     it != bridge_plain_.end();)
+                {
+                    it = (set_limbs(it->first) > limbs)
+                             ? bridge_plain_.erase(it)
+                             : std::next(it);
+                }
+            }
+            int bridge_plain_limb_limit() const
+            {
+                return bridge_plain_limb_limit_;
             }
 
             /**
