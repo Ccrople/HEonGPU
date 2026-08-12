@@ -420,6 +420,51 @@ namespace heongpu
                 {
                     e *= head_scale;
                 }
+
+                // RoPE, on the head-dim axis of Q and K only. It commutes with
+                // head_scale (a scalar) and with Section 3.1.1's rotations
+                // (R1 acts on the stream axis, R2 on V's head axis and o_proj's
+                // -- neither touches Q or K's head dimension), so it goes here,
+                // where the circuit puts it: after the projection, before the
+                // scores.
+                if (shape.rope)
+                {
+                    const int pairs = hd / 2;
+                    auto rope = [&](std::vector<double>& m, int width,
+                                    int nheads)
+                    {
+                        for (int i = 0; i < t; i++)
+                        {
+                            for (int h = 0; h < nheads; h++)
+                            {
+                                for (int e = 0; e < pairs; e++)
+                                {
+                                    const double omega = std::pow(
+                                        shape.rope_theta,
+                                        -2.0 * static_cast<double>(e) /
+                                            static_cast<double>(hd));
+                                    const double a =
+                                        static_cast<double>(
+                                            i + shape.rope_position_offset) *
+                                        omega;
+                                    const double cs = std::cos(a);
+                                    const double sn = std::sin(a);
+                                    const std::size_t lo =
+                                        static_cast<std::size_t>(i) * width +
+                                        h * hd + e;
+                                    const std::size_t hi = lo + pairs;
+                                    const double x1 = m[lo];
+                                    const double x2 = m[hi];
+                                    m[lo] = x1 * cs - x2 * sn;
+                                    m[hi] = x2 * cs + x1 * sn;
+                                }
+                            }
+                        }
+                    };
+                    rope(q, c, heads);
+                    rope(k, kv, kv_heads);
+                }
+
                 cal.value_abs = absmax(v);
 
                 // Scores, exact SoftMax, the value product -- per head, with
@@ -689,6 +734,9 @@ namespace heongpu
             out.shape.kv_channels = kv;
             out.shape.head_dim = hd;
             out.shape.hidden = hidden;
+            out.shape.rope = config.rope;
+            out.shape.rope_theta = config.rope_theta;
+            out.shape.rope_position_offset = config.rope_position_offset;
 
             auto& w = out.weights;
             w.attention.query = bundle.query;

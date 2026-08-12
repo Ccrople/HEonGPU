@@ -366,10 +366,16 @@ int main(int argc, char* argv[])
         heongpu::llama::SylphPrepConfig prep;
         prep.rotate = EnvFlag("HEONGPU_BOOT_ROTATE", true);
         prep.prescale = EnvFlag("HEONGPU_BOOT_PRESCALE", true);
+        // The reference is the calibrator, so RoPE has to be decided here,
+        // before a single range is measured, and the same flag drives the
+        // circuit below.
+        prep.rope = EnvFlag("HEONGPU_BOOT_ROPE", false);
+        prep.rope_theta = EnvDouble("HEONGPU_BOOT_ROPE_THETA", 500000.0);
         std::cout << "[boot] real weights    : layer " << bundle.layer
                   << ", sink tokens " << bundle.sink_tokens << ", rotations "
                   << (prep.rotate ? "on" : "off") << ", 1/B folds "
-                  << (prep.prescale ? "on" : "off") << std::endl;
+                  << (prep.prescale ? "on" : "off") << ", RoPE "
+                  << (prep.rope ? "on" : "off") << std::endl;
 
         real = std::make_unique<heongpu::llama::PreparedBlock>(
             heongpu::llama::prepare_block(bundle, prep));
@@ -767,6 +773,11 @@ int main(int argc, char* argv[])
         c.attention.heads = heads;
         c.attention.kv_heads = kv_heads;
         c.attention.causal = EnvFlag("HEONGPU_BOOT_CAUSAL", true);
+        // Rotary position embedding, at the slot midpoint of the crossing the
+        // sublayer already takes. Off by default so a run stays comparable
+        // with the recorded ones, which were measured without it.
+        c.attention.rope = EnvFlag("HEONGPU_BOOT_ROPE", false);
+        c.attention.rope_theta = EnvDouble("HEONGPU_BOOT_ROPE_THETA", 500000.0);
         c.attention.softmax.bound = EnvDouble("HEONGPU_BOOT_SOFTMAX_BOUND", 8.0);
         c.attention.softmax.iterations =
             EnvInt("HEONGPU_BOOT_SOFTMAX_ITERS", 1);

@@ -100,6 +100,14 @@ namespace heongpu
             int head_dim = 0;
             int hidden = 0;
 
+            /// Rotary position embedding on Q and K, matching
+            /// RectAttentionConfig::rope. It has to be set here as well as
+            /// there: the reference is both the yardstick and the CALIBRATOR,
+            /// and RoPE moves the score range the SoftMax is fitted over.
+            bool rope = false;
+            double rope_theta = 500000.0;
+            int rope_position_offset = 0;
+
             int heads() const { return channels / head_dim; }
             int kv_heads() const { return kv_channels / head_dim; }
         };
@@ -163,8 +171,10 @@ namespace heongpu
         /**
          * @brief The exact circuit, in double precision on the host.
          *
-         * This is the PROFILED block, not the true model: no RoPE, grouped
-         * queries read repeated kv heads, the SoftMax is causal and exact.
+         * This is the PROFILED block, not the true model: grouped queries
+         * read repeated kv heads and the SoftMax is causal and exact. RoPE is
+         * there when @c BlockShape::rope is set and absent otherwise, which is
+         * the one simplification the caller chooses.
          * Handed the same weights the operator is handed, it computes what
          * the FHE block ideally computes, which makes it both the calibrator
          * and the yardstick the decrypted result is judged against.
@@ -227,6 +237,14 @@ namespace heongpu
             /// Seed of the Hadamard sign vectors. Client-side and public:
             /// the rotation hides nothing, it only spreads.
             std::uint64_t seed = 20260806u;
+            /// Rotary position embedding on Q and K. This is what fills
+            /// BlockShape::rope, so the calibration and the expected output
+            /// both come from the circuit the operator is about to run --
+            /// set it here and in RectAttentionConfig together or the error
+            /// bar measures the difference between two circuits.
+            bool rope = false;
+            double rope_theta = 500000.0;
+            int rope_position_offset = 0;
         };
 
         /** @brief The bounds the folds chose; all one when prescale is off. */

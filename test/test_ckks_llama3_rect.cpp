@@ -299,6 +299,139 @@ TEST(HEonGPU, CKKS_Llama3Rect_ToBatchGivesOneHeadPerBatchSlot)
 }
 
 // ---------------------------------------------------------------------------
+// Rotary position embedding
+// ---------------------------------------------------------------------------
+
+// RoPE rides on the RECT -> BATCH crossing, and the claim it rests on is an
+// index claim: a RECT group puts channel b*d + j in ciphertext j, so with
+// head_dim = d the head is the BLOCK b and the head-dim index is the
+// CIPHERTEXT index j. If that is right, pairing channel c with c + d/2 is a
+// host-side pairing of whole ciphertexts and the whole map costs one level and
+// no rotation. This checks it against the host rotation entry by entry, which
+// a wrong pairing cannot pass -- a transposed head/head-dim reading would
+// rotate the wrong axis and land nowhere near.
+TEST(HEonGPU, CKKS_Llama3Rect_RopeMatchesTheHostRotation)
+{
+    Fixture fx(9, 5);
+    const int d = Fixture::d;
+    const int step = fx.blocks();
+    const int channels = fx.half();
+    const int pairs = d / 2;
+
+    Rect::RectAttentionConfig config;
+    config.in_channels = channels;
+    config.heads = step;
+    config.rope = true;
+    config.rope_theta = 500000.0;
+
+    const std::vector<double> x = random_matrix(d, channels, 90210u);
+
+    // The host answer: head b, head-dim index j, token u.
+    std::vector<double> want = x;
+    for (int u = 0; u < d; ++u)
+    {
+        for (int b = 0; b < step; ++b)
+        {
+            for (int e = 0; e < pairs; ++e)
+            {
+                const double omega =
+                    std::pow(config.rope_theta,
+                             -2.0 * static_cast<double>(e) /
+                                 static_cast<double>(d));
+                const double angle = static_cast<double>(u) * omega;
+                const double cs = std::cos(angle);
+                const double sn = std::sin(angle);
+                const size_t lo =
+                    static_cast<size_t>(u) * channels + b * d + e;
+                const size_t hi = lo + pairs;
+                const double x1 = x[lo];
+                const double x2 = x[hi];
+                want[lo] = x1 * cs - x2 * sn;
+                want[hi] = x2 * cs + x1 * sn;
+            }
+        }
+    }
+
+    heongpu::llama::RectActivation ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+    const int before = ct.column.front().depth();
+
+    heongpu::llama::BatchActivation roped =
+        fx.op->to_batch_roped(ct, 0, *fx.galois, config);
+    ASSERT_EQ(roped.column.size(), static_cast<size_t>(d));
+
+    // One level over the plain crossing, and not two: the pair is a single
+    // plaintext product on each half plus an addition, and additions are free.
+    heongpu::llama::RectActivation plain_ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+    heongpu::llama::BatchActivation plain =
+        fx.op->to_batch(plain_ct, 0, *fx.galois);
+    EXPECT_EQ(roped.column.front().depth(),
+              plain.column.front().depth() + 1);
+    EXPECT_EQ(plain.column.front().depth(), before + 3);
+
+    const std::vector<std::vector<double>> got = fx.batch->decrypt(
+        roped, *fx.decryptor, roped.column.front().scale());
+    ASSERT_EQ(got.size(), static_cast<size_t>(step));
+
+    double worst = 0.0;
+    for (int b = 0; b < step; ++b)
+        for (int u = 0; u < d; ++u)
+            for (int j = 0; j < d; ++j)
+                worst = std::max(
+                    worst,
+                    std::abs(got[b][static_cast<size_t>(u) * d + j] -
+                             want[static_cast<size_t>(u) * channels + b * d +
+                                  j]));
+    std::cout << "rect RoPE worst error: " << worst << std::endl;
+    EXPECT_LT(worst, 1e-3);
+}
+
+// RoPE is a rotation, so it preserves the length of every (c, c + d/2) pair
+// and therefore of every head vector. That is the property attention actually
+// depends on -- the scores stay in the range the SoftMax was fitted over -- and
+// it is checked here on the DECRYPTED result rather than on the host formula,
+// so a scale or level slip shows up as a broken norm rather than as nothing.
+TEST(HEonGPU, CKKS_Llama3Rect_RopePreservesHeadNorms)
+{
+    Fixture fx(9, 5);
+    const int d = Fixture::d;
+    const int step = fx.blocks();
+    const int channels = fx.half();
+
+    Rect::RectAttentionConfig config;
+    config.in_channels = channels;
+    config.heads = step;
+    config.rope = true;
+
+    const std::vector<double> x = random_matrix(d, channels, 24680u);
+    heongpu::llama::RectActivation ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+    heongpu::llama::BatchActivation roped =
+        fx.op->to_batch_roped(ct, 0, *fx.galois, config);
+    const std::vector<std::vector<double>> got = fx.batch->decrypt(
+        roped, *fx.decryptor, roped.column.front().scale());
+
+    double worst = 0.0;
+    for (int b = 0; b < step; ++b)
+        for (int u = 0; u < d; ++u)
+        {
+            double before = 0.0, after = 0.0;
+            for (int j = 0; j < d; ++j)
+            {
+                const double a =
+                    x[static_cast<size_t>(u) * channels + b * d + j];
+                const double c = got[b][static_cast<size_t>(u) * d + j];
+                before += a * a;
+                after += c * c;
+            }
+            worst = std::max(worst, std::abs(after - before));
+        }
+    std::cout << "rect RoPE head-norm drift: " << worst << std::endl;
+    EXPECT_LT(worst, 1e-2);
+}
+
+// ---------------------------------------------------------------------------
 // The fused one-level crossings
 // ---------------------------------------------------------------------------
 

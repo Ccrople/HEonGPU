@@ -609,6 +609,172 @@ namespace heongpu
             return batch_.from_slots(slots, layout_.d, galois_key);
         }
 
+        void Llama3RectOperator::rope_slots(
+            std::vector<Ciphertext<Scheme::CKKS>>& slots,
+            const RectAttentionConfig& config)
+        {
+            const int d = layout_.d;
+            const int step = layout_.batch;
+            const int pairs = d / 2;
+
+            if (static_cast<int>(slots.size()) != d)
+            {
+                throw std::invalid_argument(
+                    "RoPE reads one group at a time: exactly d slot "
+                    "ciphertexts, because in this encoding the head-dim index "
+                    "IS the ciphertext index");
+            }
+            if (pairs < 1 || d % 2 != 0)
+            {
+                throw std::invalid_argument(
+                    "RoPE pairs channel c with c + head_dim / 2, so the head "
+                    "dimension has to be even");
+            }
+
+            Range _r_rope("rope");
+
+            const int depth = slots.front().depth();
+            const double plain_scale = rescale_prime(slots.front());
+            for (const auto& c : slots)
+            {
+                if (c.depth() != depth)
+                {
+                    throw std::invalid_argument(
+                        "RoPE adds two of the group's ciphertexts together, so "
+                        "they have to share a level");
+                }
+            }
+
+            // The tables. cos and sin are indexed by the head-dim PAIR
+            // c = j mod (d/2) and by the token, and the token is the SLOW slot
+            // axis of this reading, so one vector per pair serves every block,
+            // every head and every channel group. d/2 pairs, not d, because
+            // both halves of a pair turn by the same angle.
+            if (static_cast<int>(rope_cos_.size()) != pairs ||
+                rope_theta_built_ != config.rope_theta ||
+                rope_offset_built_ != config.rope_position_offset)
+            {
+                rope_cos_.assign(
+                    pairs,
+                    std::vector<Complex64>(slot_count_, Complex64(0.0, 0.0)));
+                rope_sin_.assign(
+                    pairs,
+                    std::vector<Complex64>(slot_count_, Complex64(0.0, 0.0)));
+                for (int c = 0; c < pairs; ++c)
+                {
+                    // theta^(-2c/d), the inverse frequency of the pair.
+                    const double omega =
+                        std::pow(config.rope_theta,
+                                 -2.0 * static_cast<double>(c) /
+                                     static_cast<double>(d));
+                    for (int u = 0; u < d; ++u)
+                    {
+                        const double angle =
+                            static_cast<double>(u +
+                                                config.rope_position_offset) *
+                            omega;
+                        const Complex64 cs(std::cos(angle), 0.0);
+                        const Complex64 sn(std::sin(angle), 0.0);
+                        for (int b = 0; b < step; ++b)
+                        {
+                            const int slot = b + step * u;
+                            rope_cos_[c][slot] = cs;
+                            rope_sin_[c][slot] = sn;
+                        }
+                    }
+                }
+                rope_theta_built_ = config.rope_theta;
+                rope_offset_built_ = config.rope_position_offset;
+            }
+
+            // Every ciphertext of the group meets the same d/2 pairs at the
+            // same level, so the plaintexts are encoded once per call rather
+            // than once per column -- the block transform's own discipline.
+            std::vector<Plaintext<Scheme::CKKS>> cos_plain, sin_plain;
+            {
+                SuffixRange _r("rope", "encode");
+                cos_plain.reserve(pairs);
+                sin_plain.reserve(pairs);
+                for (int c = 0; c < pairs; ++c)
+                {
+                    cos_plain.push_back(
+                        encode(rope_cos_[c], plain_scale, depth));
+                    sin_plain.push_back(
+                        encode(rope_sin_[c], plain_scale, depth));
+                }
+            }
+
+            // HuggingFace's rotate_half convention, which is the order the
+            // checkpoint's channels are written in: the low half turns into
+            // x1 cos - x2 sin and the high half into x2 cos + x1 sin. The
+            // partner is a whole ciphertext, so this is two plaintext products
+            // and one addition -- no rotation, no key switch, no key.
+            //
+            // The result is built beside the input rather than in place: every
+            // pair reads both of its ciphertexts, and writing the low half
+            // first would hand the high half its own already-rotated partner.
+            std::vector<Ciphertext<Scheme::CKKS>> out;
+            out.reserve(slots.size());
+            {
+                SuffixRange _r("rope", "pairs");
+                for (int j = 0; j < d; ++j)
+                {
+                    const int c = j % pairs;
+                    const int partner = (j < pairs) ? j + pairs : j - pairs;
+
+                    Ciphertext<Scheme::CKKS> direct(context_);
+                    batch_.arith().multiply_plain(slots[j], cos_plain[c],
+                                                  direct);
+                    Ciphertext<Scheme::CKKS> cross(context_);
+                    batch_.arith().multiply_plain(slots[partner], sin_plain[c],
+                                                  cross);
+                    if (j < pairs)
+                    {
+                        batch_.arith().sub_inplace(direct, cross);
+                    }
+                    else
+                    {
+                        batch_.arith().add_inplace(direct, cross);
+                    }
+                    batch_.arith().rescale_inplace(direct);
+                    out.push_back(std::move(direct));
+                }
+            }
+            slots = std::move(out);
+        }
+
+        BatchActivation
+        Llama3RectOperator::to_batch_roped(RectActivation& in, int group,
+                                           Galoiskey<Scheme::CKKS>& galois_key,
+                                           const RectAttentionConfig& config)
+        {
+            if (!config.rope)
+            {
+                return to_batch(in, group, galois_key);
+            }
+            if (group < 0 || group >= in.groups)
+            {
+                throw std::invalid_argument(
+                    "No such channel group in this activation");
+            }
+
+            Range _r("bridge.to_batch_roped");
+
+            // The staged crossing, and only the staged one: the fused map
+            // composes all three stages into a single diagonal set, which
+            // leaves no slot midpoint to insert at. The caller is told so
+            // rather than silently given a crossing without RoPE in it.
+            BatchActivation borrowed = borrow_group(in, group);
+            std::vector<Ciphertext<Scheme::CKKS>> slots =
+                batch_.to_slots(borrowed, galois_key);
+            return_group(in, group, borrowed);
+
+            block_map(slots, /*inverse=*/true, "bridge.block_inverse",
+                      galois_key);
+            rope_slots(slots, config);
+            return batch_.from_slots(slots, layout_.d, galois_key);
+        }
+
         RectActivation
         Llama3RectOperator::from_batch(std::vector<BatchActivation>& groups,
                                        int channels,
@@ -1909,8 +2075,12 @@ namespace heongpu
                 BatchActivation qb, kb, vb;
                 {
                     Range _r("attention.to_batch");
-                    qb = to_batch(q, g, galois_key);
-                    kb = to_batch(k, g, galois_key);
+                    // RoPE rides on the crossing Q and K were going to pay
+                    // for anyway; V is not rotated and takes the plain one,
+                    // and the level it keeps over them is dropped where it
+                    // meets P below.
+                    qb = to_batch_roped(q, g, galois_key, config);
+                    kb = to_batch_roped(k, g, galois_key, config);
                     vb = to_batch(v, g, galois_key);
                 }
 

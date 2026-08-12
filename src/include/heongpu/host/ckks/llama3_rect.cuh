@@ -1081,11 +1081,77 @@ namespace heongpu
                 /// the SoftMax's own half of the same trick. Needs a mask, so
                 /// it needs @c causal.
                 bool fold_softmax_affine_into_mask = true;
+                /// Rotary position embedding on Q and K.
+                ///
+                /// It costs ONE level here and no rotation at all, which is
+                /// what this encoding buys and why it was worth wiring rather
+                /// than approximating. A RECT group holds channel
+                /// g*(N/2) + b*d + j in ciphertext j, so with head_dim = d the
+                /// head is (g, b) and the head-dim index is the CIPHERTEXT
+                /// index j. RoPE pairs head-dim index c with c + d/2, so it
+                /// pairs ciphertext j with ciphertext j +- d/2 -- a host-side
+                /// pairing of whole ciphertexts, not a homomorphic rotation.
+                ///
+                /// What it does need is the token index in SLOTS, because
+                /// cos(u * w_c) varies with the token and a RECT column holds
+                /// tokens in COEFFICIENTS, where a plaintext product is a
+                /// convolution and not a scaling. The sublayer already crosses
+                /// to slots on its way to the batch encoding (to_batch is the
+                /// row bridge, the block map, then the row bridge again), so
+                /// the map goes in at that midpoint and the crossing pays for
+                /// the trip. Two plaintext products and one add per ciphertext,
+                /// one rescale, one level.
+                ///
+                /// The fused one-level crossings cannot carry it: they compose
+                /// all three stages on the host and there is no slot midpoint
+                /// left to insert at. attention() therefore takes the staged
+                /// crossing for Q, K and V whenever this is on, which is a
+                /// choice between two levels and a wrong answer.
+                bool rope = false;
+                /// RoPE base. Llama-3's is 500000, Llama-2's 10000.
+                double rope_theta = 500000.0;
+                /// Absolute position of token 0, for a windowed run.
+                int rope_position_offset = 0;
                 /// bound, iterations and the degrees are the caller's; stride
                 /// and count are fixed by this encoding and overwritten, because
                 /// the key axis is entirely across ciphertexts.
                 Llama3Operator::SoftmaxConfig softmax;
             };
+
+            /**
+             * @brief to_batch with RoPE applied at its slot midpoint.
+             *
+             * The staged crossing is row bridge, block map, row bridge, and the
+             * value between the second and third stages is the SLOT reading
+             * to_slots() documents: slot b + (k/2)*u of ciphertext j is token u
+             * of channel block b, head-dim index j. That is exactly where a
+             * per-token, per-head-dim scaling is a slot-wise plaintext product,
+             * so RoPE goes in there and costs one level over the plain
+             * crossing and no rotation at all.
+             *
+             * With config.rope false this is to_batch(), fused path included.
+             *
+             * @param config Read for rope, rope_theta and rope_position_offset.
+             */
+            BatchActivation to_batch_roped(RectActivation& in, int group,
+                                           Galoiskey<Scheme::CKKS>& galois_key,
+                                           const RectAttentionConfig& config);
+
+            /**
+             * @brief RoPE in place on one group's slot-form ciphertexts.
+             *
+             * @p slots is d ciphertexts in the reading to_slots() returns.
+             * Ciphertext j is head-dim index j, so the pairing j <-> j + d/2 is
+             * a host-side pairing of whole ciphertexts and the angle
+             * (u + offset) * theta^(-2c/d), c = j mod (d/2), depends on the
+             * token u alone once j is fixed -- one slot plaintext per c, shared
+             * by every block, every head and every group.
+             *
+             * One level. The plaintexts are encoded at the prime the following
+             * rescale divides by, so the scale is preserved.
+             */
+            void rope_slots(std::vector<Ciphertext<Scheme::CKKS>>& slots,
+                            const RectAttentionConfig& config);
 
             /**
              * @brief One attention sublayer.
@@ -1312,6 +1378,15 @@ namespace heongpu
             /// index is the diagonal offset shifted by k/2 - 1.
             std::vector<std::vector<Complex64>> forward_block_;
             std::vector<std::vector<Complex64>> inverse_block_;
+
+            /// RoPE's cosine and sine slot vectors, d/2 apiece, indexed by the
+            /// head-dim pair. Built by rope_slots and rebuilt whenever the base
+            /// or the position offset changes, so a second config cannot read a
+            /// stale table.
+            std::vector<std::vector<Complex64>> rope_cos_;
+            std::vector<std::vector<Complex64>> rope_sin_;
+            double rope_theta_built_ = 0.0;
+            int rope_offset_built_ = -1;
 
             // ---------------------------------------------------------------
             // The fused one-level crossings
