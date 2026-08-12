@@ -1204,3 +1204,278 @@ Still open from that investigation: a rotate-after-mod-drop test (the
 leveled key-switch path has no coverage), pointing ReportMemory at the
 pool's live counter, and level-truncated Galois keys (~30% off any dnum
 choice).
+
+## 14. The same block on an A100, re-profiled (2026-08-12)
+
+Everything in §12 was measured on one A6000 at dnum = 1, before the staged
+mod-down and before the plaintext expansion moved to the device. Both landed
+on the union branch and **neither had ever been measured on hardware**. This
+section is that measurement, on the vessl A100-SXM4-80GB at the same real
+shape: Meta-Llama-3-8B layer 2, its true residual stream, d_model 4096, hidden
+14336, 32 heads of 128 over 8 KV heads, 128 tokens, 40 limbs, `sec_level::none`.
+
+Target and command are unchanged — `benchmark/profile_llama3_rect_boot.cpp`,
+stage `block`, `HEONGPU_BOOT_WEIGHTS` pointing at the fetch script's directory.
+
+### 14.1 What one block costs now
+
+| | §12, A6000, dnum 1 | this, A100, dnum 4 |
+|---|---:|---:|
+| block compute | 2,425,507 ms | **149,341 ms** |
+| GPU kernel time | 2304.8 s (94.3% busy) | 132.0 s (**88.4% busy**) |
+| kernel launches | 11,503,929 | 12,728,402 |
+| ciphertext-bootstraps | 2432 at 493.5 ms | 2432 at **23.8 ms** |
+| worst stretch / refreshes | 13 at `attention.softmaxed` / 14 | unchanged: 13 / 14 |
+| output | 1.058e-2, **5.91 bits** | 1.080e-2, **5.88 bits** |
+| Galois key | 2048 indices, 10.0 GiB | 2048 indices, **25 GiB** |
+
+**16.2x end to end**, and the accuracy is the same circuit's, unchanged. Three
+separate things paid for it and they are separable: the staged mod-down
+(§13.1's 5.0x), dnum 1 -> 4 (1.7x more), and the A100 over the A6000 (2.06x on
+the same code and the same dnum, 307.2 -> 149.3 s).
+
+**nsys is no longer free.** The same run under `nsys profile --trace=cuda,nvtx`
+takes 173,550 ms — **16.2% overhead**, against §12's 0.8%. That is what a block
+becoming launch-bound does to a per-launch profiler, and every absolute number
+in §14.3 and §14.4 carries it. The shares do not.
+
+### 14.2 The host is no longer the bottleneck, and the fix is measured
+
+The bottleneck session's trace put `project.*.weight_encode` at **138.7 s of a
+352.5 s block (39.3%)**: `encode_plaintext_matrix` built the whole
+`num_limbs x per_limb` RNS-expanded plaintext on the host and uploaded it
+pageable, 51.9 GiB per block. `2885349` / `cff71c5` moved that expansion into
+`bm_crt_expand_kernel` and uploaded only the int64 coefficients, and the commit
+message says compile-verified only.
+
+Measured now, on the same 58 projections:
+
+| | before | after |
+|---|---:|---:|
+| `project.*.weight_encode` | 138.7 s | **3.6 s** |
+| share of the block | 39.3% | **2.1%** |
+| GPU busy | 45% | **88.4%** |
+
+The device expansion is also checked, not assumed: `HEONGPU_BM_ENCODE_CHECK=1`
+compares every expansion against the host reference word for word, and the
+batch-matrix, batch-matrix-GPU and rect test binaries are all green under it.
+
+### 14.3 Which kernel: the NTT, and the mod-down is no longer first
+
+12,728,402 launches, 132.05 s of kernel time, grouped by family.
+
+| family | s | % | launches |
+|---|---:|---:|---:|
+| **NTT** (5 `gpuntt` kernels) | 49.70 | **37.6** | 6,144,294 |
+| **mod-down** (staged chain + stage two + rescale) | 32.14 | **24.3** | 1,763,584 |
+| **base conversion** (D->Q~ partial + gather) | 18.97 | **14.4** | 1,282,952 |
+| **`bm_gemm_kernel`** — the actual modular GEMM | 10.04 | **7.6** | 132 |
+| key-switch inner product (method II) | 5.33 | 4.0 | 660,932 |
+| plaintext products | 5.02 | 3.8 | 1,170,360 |
+| batch-matrix tweaks / subring transforms | 4.76 | 3.6 | 3,054 |
+| elementwise (add, move, drop) | 4.33 | 3.3 | 1,412,924 |
+| everything else | 1.77 | 1.3 | 290,170 |
+
+**Key switching is 80.4% of GPU time** (NTT + mod-down + BConv + inner product)
+across **660,932 key switches**, at 160 us each. §12.3's headline — "mod-down
+84.6%, and it is not close" — is gone: the staged kernels plus dnum 4 took the
+mod-down from 84.6% to 24.3%, and what surfaced underneath is the NTT.
+
+The single largest kernel is now
+`divide_round_lastq_p_chain_leveled_kernel<16>` at **11.0%** (14.54 s,
+660,932 launches, 22.0 us each, standard deviation 838 ns). It is not
+arithmetic-bound: the whole call moves 1.3 MB. It is **grid-bound** — one
+thread per (coefficient, component) is 8192 threads at N = 4096, i.e. 32
+blocks, so it occupies 32 of the A100's 108 SMs no matter what. §14.6 fixes
+that.
+
+`bm_gemm_kernel` is worth naming for the opposite reason: 132 launches of
+76 ms, and at 3.7 M blocks reading ~120 GB it is running at roughly the card's
+memory bandwidth. **The matrix multiply the layer exists to compute is 7.6% of
+GPU time and is already at the hardware limit.**
+
+### 14.4 Which function, and which layout conversion
+
+`nsys stats --report nvtx_pushpop_sum`, so these are wall times and they nest.
+Percentages are of the 172.4 s profiled block.
+
+| activity | s | % of block |
+|---|---:|---:|
+| **layout conversion, all of it** | **67.6** | **39.2** |
+| &nbsp;&nbsp;row bridge (`bridge.to_slots` + `bridge.from_slots`) | 44.2 | 25.6 |
+| &nbsp;&nbsp;block map (`bridge.block_inverse` + `bridge.block_forward`) | 23.3 | 13.5 |
+| **bootstrapping** (2432 ciphertexts) | **58.1** | **33.7** |
+| &nbsp;&nbsp;`boot.eval_mod` / `boot.coeff_to_slot` / `boot.slot_to_coeff` | 25.2 / 21.1 / 11.6 | |
+| **Algorithm 5, `RectangularPCMM`** (58 calls) | **34.3** | **19.9** |
+| &nbsp;&nbsp;`.summation` — Theorem 3's two CMTs | 22.5 | 13.1 |
+| &nbsp;&nbsp;`.blocks` — the batch PCMM itself | 11.7 | 6.8 |
+| non-linear fits (`chebyshev`, `silu`, `softmax`) | ~5.7 | ~3.3 |
+| plaintext weight encoding | 3.6 | 2.1 |
+
+By half: feed-forward 97.0 s (56.3%), attention 69.3 s (40.2%).
+
+Named crossings, which is the form §12.4 asked for: `bridge.rect_to_slots`
+27.8 s over 16 calls, `bridge.rect_from_slots` 15.8 s over 9,
+`bridge.to_batch` 15.7 s over 6, `bridge.from_batch` 4.0 s over 1, plus the
+standalone `attention.to_slots` / `.from_slots` at 2.1 s each.
+
+**§12.4's finding has inverted.** There it was block map 16.5% against row
+bridge 15.4%, and the block map cost more despite having a quarter of the
+diagonals. Here the row bridge is 25.6% and the block map 13.5% — but *per
+ciphertext* they are still nearly equal (`bridge.to_slots.diagonals` 5.24 ms
+against `bridge.block_inverse.diagonals` 4.94 ms), which is exactly §12.4's
+point restated: 30 unhoisted rotations cost what 22 baby-step/giant-step ones
+do. The row bridge is bigger now only because the block runs 6272
+column-crossings of it against 4736 of the block map.
+
+### 14.5 The dnum answer
+
+Sweep at the real shape, all seven decompositions, `|P|` chosen so
+`dnum = ceil(40 / |P|)`. Key memory is `2 * dnum * (|Q| + |P|) * N * 8` per
+Galois index times 2048 indices, which is why this sweep needs an 80 GiB card:
+the A6000 could not hold dnum 5 and above at all.
+
+| dnum | `\|P\|` | block | vs dnum 4 | Galois keys | bits |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 40 | 380,132 ms | 2.55x slower | 10 GiB | 5.94 |
+| 2 | 20 | 201,186 ms | 1.35x slower | 15 GiB | 5.76 |
+| 3 | 14 | 167,219 ms | 1.12x slower | 20.25 GiB | 5.86 |
+| 4 | 10 | 149,341 ms | — | 25 GiB | 5.88 |
+| **5** | **8** | **141,358 ms** | **1.056x** | **30 GiB** | **5.88** |
+| 6 | 7 | 139,031 ms | 1.074x | 35.25 GiB | 5.84 |
+| 8 | 5 | 137,624 ms | 1.085x | 45 GiB | 5.88 |
+
+**dnum = 4 is not the answer any more; dnum = 5 is the knee.** 4 -> 5 buys 5.3%
+for 5 GiB. 5 -> 8 buys 2.7% more for fifteen. Below 4 the curve is steep and
+above 6 it is flat, so the whole decision is the 4-6 band and the memory-cheap
+end of it wins.
+
+**The accuracy is flat across the entire sweep** — 5.76 to 5.94 bits, and the
+spread is run-to-run noise, not a trend. dnum costs memory and buys time; it
+does not touch precision. That confirms the moddown session's finding at the
+real shape and settles it.
+
+Two things worth keeping:
+
+* **dnum 1 is now 380 s, not 2425 s.** Same decomposition, same shape, same
+  circuit as §12 — the staged mod-down, the device-side expansion and the A100
+  are 6.4x on their own, before any dnum is chosen.
+* **This sweep is not runnable on an A6000.** Key memory is
+  `2 * dnum * (\|Q\| + \|P\|) * N * 8` per index times 2048 indices, so dnum 5
+  is 30 GiB and dnum 8 is 45 — past the 40.88 GiB pool ceiling that killed
+  seven runs there. dnum 8's keygen cleared on this card without a single pool
+  knob, which also retires the keygen-transient trap at this shape.
+
+### 14.6 What was done about it
+
+Three levers were tried against the profile above. Two are wins, one is a
+win only in a range this path does not run in, and saying which is which is
+the point of measuring them separately.
+
+| configuration | block | vs baseline |
+|---|---:|---:|
+| dnum 4, hoisting off — where §14.1 starts | 149,341 ms | — |
+| dnum 5, hoisting off | 141,358 ms | 1.056x |
+| **dnum 5, hoisting on** | **122,303 ms** | **1.221x** |
+
+**Hoisting is 14.1% and it was off by default.** `set_hoisted_crossings`
+shares ONE key-switch decomposition — the INTT, the base extension and the
+forward NTTs of every digit — across a whole rotation train, and every
+crossing on this path is a train: the block map walks `2(k/2) - 1 = 31`
+diagonals off one source, the row bridge's baby steps likewise. Measured
+back to back at dnum 4: **150,131 ms off, 128,930 ms on**, and the same
+again at dnum 5. When the crosstime session measured it the mod-down was
+84.6% of the block and it was worth 3%; §14.3 puts the NTT at 37.6% and the
+base conversion at 14.4%, which is precisely what a shared ModUp removes.
+It is bit-identical (`test_ckks_llama3_rect.cpp` checks the hoisted crossing
+against the staged one and the gap is 0), so this is a default worth
+changing.
+
+**RoPE is free.** The rect path had none — `llama3_prep.cuh` said so, and
+the host reference matched it, so the profiled circuit was the real model in
+every respect but this one. It costs one level and NO rotation, because a
+RECT group holds channel `g*(N/2) + b*d + j` in ciphertext `j`, so with
+`head_dim = d` the head is the block index and the head-dim index is the
+CIPHERTEXT index: RoPE's `c <-> c + d/2` pairing is a host-side pairing of
+whole ciphertexts. The angle needs the token in SLOTS, and the sublayer
+already crosses there on its way to the batch encoding, so `to_batch_roped`
+inserts it at that midpoint. Measured at the real shape: **145,564 ms with
+it against 146,353 ms without, 5.92 bits against 5.94** — inside run-to-run
+noise, and the worst stretch stays 13 at `attention.softmaxed`, so the extra
+level lands in slack the schedule already had.
+
+**The warp mod-down chain wins only at a long chain.** §14.3's largest
+kernel is grid-bound — one thread per (coefficient, component) is 8192
+threads, i.e. 32 blocks on a 108-SM card — so the chain was rewritten one
+WARP per coefficient, lane `j` owning residue `j`, `__shfl_sync` carrying the
+one shared scalar, `O(P^2)` per thread becoming `O(P)` per lane. It is
+bit-exact (`HEONGPU_MODDOWN_CHECK=1` passes on rotation II, relinearization
+and multiplication). It is also **not** a win where this path runs:
+
+| `\|P\|` | dnum | array form | warp form | |
+|---:|---:|---:|---:|---|
+| 20 | 2 | 201,186 ms | **186,385 ms** | 7.4% faster |
+| 10 | 4 | 149,341 ms | 152,315 ms | 2.0% slower |
+| 8 | 5 | 141,539 ms | 146,353 ms | 3.4% slower |
+| 5 | 8 | 137,624 ms | 142,613 ms | 3.6% slower |
+
+The gain scales with `P` and the cost is fixed at `32 - P` idle lanes plus a
+`__shfl_sync` dependency per step, so the crossover is real and lies between
+10 and 20. The kernel is therefore gated at `P_size >= 16`, which keeps every
+decomposition the Llama-3 path runs at on the array form and gives dnum 2 —
+the memory-cheap option at 15 GiB of keys — 7.4% back. The grid argument was
+right about the geometry and wrong about the consequence, and only the
+measurement separates those.
+
+### 14.7 The two-ring 16<->13 memory wall is gone, and the blocker moved
+
+§13.5 and the gpu-watch analysis recorded seven consecutive deaths of the
+real-shape two-ring legs, every one at exactly `cap x free-at-start` during
+island keygen, on an A6000 with 43.03 GiB free. Re-run here with no pool
+knob, no shortened chain and no key-residency trick:
+
+| leg | result |
+|---|---|
+| `norm`, 16<->13 | **runs**, 8340.7 ms, error 7.15e-3 |
+| `attention`, 16<->13, **full 4095-index Alg-5 island set** | **runs**, 69.2 s, `TWORING_RC=0` |
+
+Free memory held flat at 35.26 GiB straight through island keygen — the
+exact point that killed every A6000 attempt. **80 GiB is simply enough**, and
+the keygen-transient pool trap does not exist at this shape on this card.
+
+Two honest negatives come with it:
+
+* **The 16<->13 attention answer is wrong**: `max abs error 4.444e+01`
+  against a signal of order one. The stage is green at 13<->12 per §13, so
+  the blocker has moved from VRAM to correctness, and the open item §13
+  already names — the seam applying the exp domain map as a ciphertext
+  multiply, spending a level the real path does not — is now the thing in
+  the way.
+* **It is not faster here.** 69.2 s for the attention sublayer against
+  ~60 s for the single-ring attention half, because `island.to_batch` alone
+  is 28.7 s (41%) and `island.out` 15.8 s (23%). The predicted win came from
+  16x-packed bootstraps, and the bootstraps are indeed only 19.3 s of it —
+  but the island's own crossings eat the difference.
+
+The `norm` leg is the encouraging half: 8.34 s against 24.63 s recorded on
+the A6000, same shape, 2.95x.
+
+### 14.8 What this says to do next
+
+1. **Turn hoisting on.** 14.1%, bit-identical, already implemented, already
+   tested, and off by default for no reason that survives this profile.
+2. **Run at dnum 5, not 4.** 5.3% for 5 GiB, and nothing above 6 is worth
+   its memory.
+3. **The block map is still the one conversion walking its diagonals one
+   rotation at a time**, and it is 13.5% of the block and 29.1% of the
+   two-ring norm leg. Hoisting covers it now; BSGS on top would need new
+   Galois indices, which is the trade §12.6 named and it is still unmade.
+4. **The remaining 80.4% is key switching, and the lever left is
+   concurrency, not arithmetic.** The CMT's `d` automorphisms are `d`
+   INDEPENDENT rotations of `d` different ciphertexts — a stream or a batched
+   key-switch away from filling a card that a single 4096-coefficient key
+   switch cannot. Every kernel in §14.3 averages 3-22 us; the machine is
+   waiting, not working.
+5. **The two-ring path needs a correctness pass at 16<->13**, not a memory
+   one.
+
