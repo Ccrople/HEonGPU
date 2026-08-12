@@ -2209,6 +2209,40 @@ int main()
                                                 *tr.encryptor_is, tr.scale);
 
         RectActivation stream = std::move(x0);
+
+        // The island's two fused crossing tables are 4096 DENSE diagonals
+        // each -- the composed shift set covers every residue mod N/2 -- and
+        // encoding one is 4096 plaintexts. The encoding is cached on
+        // (map, depth, prime), all four of the block's crossings run at the
+        // same depth, and every layer of a 32-layer model runs the same maps
+        // at the same depths. So it is a per-MODEL cost that a one-block
+        // benchmark charges to whichever crossing happens to run first: it
+        // is why to_batch's three calls and from_batch's one used to cost
+        // 12.7 s and 9.4 s. Do it here, on a throwaway group at the depth
+        // the block will use, and charge it to its own leg.
+        if (EnvInt("HEONGPU_TB_WARM_CROSSINGS", 1) != 0)
+        {
+            const int l_warm = is_l(stream);
+            ledger.charge("crossing.encode", [&]() {
+                RectActivation warm;
+                warm.rows = stream.rows;
+                warm.groups = stream.groups;
+                warm.channels = stream.channels;
+                warm.column = stream.column;
+                for (auto& c : warm.column)
+                    tr.rect_is->arith().mod_drop_inplace(c);
+                BatchActivation wb =
+                    tr.rect_is->to_batch(warm, 0, *tr.galois_is);
+                std::vector<BatchActivation> wg2;
+                wg2.push_back(std::move(wb));
+                RectActivation back =
+                    tr.rect_is->from_batch(wg2, model, *tr.galois_is);
+                (void) back;
+            });
+            ledger.note("crossing.encode", "island", l_warm, l_warm - 1);
+            PrintFree("island crossing tables encoded");
+        }
+
         RectActivation attn_out;
         if (stage == "block")
         {
