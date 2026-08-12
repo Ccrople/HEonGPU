@@ -469,6 +469,16 @@ struct TwoRing
         // row bridge PLUS the block transform, exactly as on the island.
         wide_rect = std::make_unique<heongpu::llama::Llama3RectOperator>(
             big, *encoder_hi, layout_wide, scale);
+        // One decomposition per source for the whole baby train, one fused
+        // multiply-accumulate per giant group. Bit-identical arithmetic; the
+        // only cost is that the packed diagonal buffer doubles a resident
+        // set's device memory, which is why the big ring is separately
+        // gated from the island.
+        if (EnvInt("HEONGPU_TB_HOISTED_WIDE", 1) != 0)
+        {
+            wide->set_hoisted_crossings(true);
+            wide_rect->set_hoisted_crossings(true);
+        }
         int n1 = 1;
         while (n1 * n1 * 2 <= d_wide)
             n1 <<= 1;
@@ -578,6 +588,18 @@ struct TwoRing
         rect_is->set_fused_crossings(true);
         batch_is = std::make_unique<heongpu::llama::Llama3BatchOperator>(
             island, *encoder_is, layout, scale);
+        // The island's crossings are FUSED, and a fused map is DENSE: the
+        // three stages' shift sets are multiples of step plus the +-(step-1)
+        // block window, whose sum covers every residue mod N/2. So to_batch
+        // walks all 4096 diagonals -- 4096 multiply_plain launches and 4096
+        // adds per ciphertext, times d of them. Hoisting turns each giant
+        // group into ONE launch over n1 packed diagonals, which is where the
+        // crossing's cost actually is.
+        if (EnvInt("HEONGPU_TB_HOISTED_ISLAND", 1) != 0)
+        {
+            rect_is->set_hoisted_crossings(true);
+            batch_is->set_hoisted_crossings(true);
+        }
 
         if (key_level > 0)
         {
