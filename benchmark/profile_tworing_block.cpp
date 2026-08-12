@@ -107,6 +107,14 @@ namespace
     {
         std::map<std::string, double> ms;
         std::map<std::string, int> calls;
+        // Which ring a phase runs on, and the limbs it starts and ends with.
+        // A time alone does not say whether a phase is expensive because it
+        // is big or because it is high in the chain, and on a two-ring block
+        // it does not even say which chain.
+        std::map<std::string, std::string> ring;
+        std::map<std::string, int> lvl_in, lvl_out;
+        int order_next = 0;
+        std::map<std::string, int> order;
 
         template <typename F> void charge(const std::string& leg, F&& f)
         {
@@ -118,6 +126,26 @@ namespace
             ms[leg] +=
                 std::chrono::duration<double, std::milli>(t1 - t0).count();
             calls[leg] += 1;
+            if (!order.count(leg))
+                order[leg] = order_next++;
+        }
+
+        /// Record the modulus levels a phase spans. Called with the limbs the
+        /// phase's operand has on entry and on exit; repeated calls keep the
+        /// widest span seen, which is the one the chain has to cover.
+        void note(const std::string& leg, const char* on, int in, int out)
+        {
+            ring[leg] = on;
+            if (!lvl_in.count(leg))
+            {
+                lvl_in[leg] = in;
+                lvl_out[leg] = out;
+            }
+            else
+            {
+                lvl_in[leg] = std::max(lvl_in[leg], in);
+                lvl_out[leg] = std::min(lvl_out[leg], out);
+            }
         }
 
         void print(const char* tag) const
@@ -125,12 +153,32 @@ namespace
             double total = 0.0;
             for (const auto& kv : ms)
                 total += kv.second;
-            std::cout << "[tb] ---- " << tag << " ledger ----" << std::endl;
+            // Walked in the order the block runs them, not alphabetically:
+            // the sequence is what a level ledger is read for.
+            std::vector<std::pair<int, std::string>> seq;
             for (const auto& kv : ms)
-                std::cout << "[tb]   " << std::left << std::setw(24)
-                          << kv.first << std::right << std::fixed
-                          << std::setprecision(1) << std::setw(10) << kv.second
-                          << " ms  x" << calls.at(kv.first) << std::endl;
+                seq.push_back({order.count(kv.first) ? order.at(kv.first) : 0,
+                               kv.first});
+            std::sort(seq.begin(), seq.end());
+
+            std::cout << "[tb] ---- " << tag << " ledger ----" << std::endl;
+            std::cout << "[tb]   " << std::left << std::setw(24) << "phase"
+                      << std::right << std::setw(10) << "ms" << std::setw(6)
+                      << "x" << std::setw(8) << "ring" << std::setw(12)
+                      << "limbs" << std::endl;
+            for (const auto& os : seq)
+            {
+                const std::string& leg = os.second;
+                std::cout << "[tb]   " << std::left << std::setw(24) << leg
+                          << std::right << std::fixed << std::setprecision(1)
+                          << std::setw(10) << ms.at(leg) << std::setw(6)
+                          << calls.at(leg) << std::setw(8)
+                          << (ring.count(leg) ? ring.at(leg) : "-");
+                if (lvl_in.count(leg))
+                    std::cout << std::setw(8) << lvl_in.at(leg) << " -> "
+                              << lvl_out.at(leg);
+                std::cout << std::endl;
+            }
             std::cout << "[tb]   " << std::left << std::setw(24) << "TOTAL"
                       << std::right << std::fixed << std::setprecision(1)
                       << std::setw(10) << total << " ms" << std::endl;
@@ -1194,6 +1242,19 @@ int main()
             while (tr.L_hi - c.depth() > l)
                 tr.arith_hi->mod_drop_inplace(c);
     };
+    // Limbs left, on whichever chain the operand lives on. The island and
+    // the big ring have different chain lengths, so a bare depth is not
+    // comparable across a crossing and these are what the ledger records.
+    auto is_l = [&](const RectActivation& a) {
+        return a.column.empty() ? 0 : tr.shared - a.column.front().depth();
+    };
+    auto is_lb = [&](const BatchActivation& a) {
+        return a.column.empty() ? 0 : tr.shared - a.column.front().depth();
+    };
+    auto hi_l = [&](const std::vector<Ct>& c) {
+        return c.empty() ? 0 : tr.L_hi - c.front().depth();
+    };
+
     auto from_slots_low = [&](std::vector<Ct>& slots) {
         drop_big_to(slots, FROM_L);
         return tr.wide_from_slots(slots);
@@ -1208,12 +1269,18 @@ int main()
     auto wide_rms_norm = [&](RectActivation& x, const std::vector<double>& g,
                              double s_lo, double s_hi, RectActivation& normed,
                              RectActivation& skip) {
+        const int l_nx = is_l(x);
         std::vector<Ct> big = tr.ascend(x.column);
+        ledger.note("cross.up", "13->16", l_nx, hi_l(big));
         drop_big_to(big, 2);
         PrintFree("norm: ascended+dropped");
+        const int l_nt = hi_l(big);
         std::vector<Ct> slots = tr.wide_to_slots(big); // l = 1
+        ledger.note("wide.to_slots", "16", l_nt, hi_l(slots));
         PrintFree("norm: to_slots done (bridge set built)");
+        const int l_nb = hi_l(slots);
         tr.refresh(slots, "norm"); // boot -> 17
+        ledger.note("boot.norm", "16", l_nb, hi_l(slots));
         PrintFree("norm: 16 boots done");
 
         // The skip copy: the raw bridged slots go straight back down --
@@ -1259,10 +1326,12 @@ int main()
             tr.encoder_hi->encode(P1, w, tr.scale);
             weights.push_back(std::move(P1));
         }
+        const int l_rn = hi_l(slots);
         ledger.charge("rmsnorm", [&]() {
             slots = tr.arith_hi->rms_norm(slots, weights, cfg, *tr.galois_hi,
                                           *tr.relin_hi);
         });
+        ledger.note("rmsnorm", "16", l_rn, hi_l(slots));
         PrintFree("norm: rms_norm done");
         // The norm's multiplies drifted the scale; everything the normed
         // stream feeds (projections -> to_batch -> the next boots)
@@ -1310,6 +1379,7 @@ int main()
                              double bound, double sum_lo, double sum_hi,
                              bool causal) -> RectActivation {
         RectActivation q, kk, v;
+        const int l_in = is_l(x);
         ledger.charge("island.project_qkv", [&]() {
             q = tr.rect_is->project(x, wq, model, model, "attn.q",
                                     *tr.galois_is);
@@ -1318,20 +1388,27 @@ int main()
             v = tr.rect_is->project(x, wv, model, model, "attn.v",
                                     *tr.galois_is);
         });
+        ledger.note("island.project_qkv", "island", l_in, is_l(q));
         BatchActivation qb, kb, vb, kt, scores;
+        const int l_tb = is_l(q);
         ledger.charge("island.to_batch", [&]() {
             qb = tr.rect_is->to_batch(q, 0, *tr.galois_is);
             kb = tr.rect_is->to_batch(kk, 0, *tr.galois_is);
             vb = tr.rect_is->to_batch(v, 0, *tr.galois_is);
         });
+        ledger.note("island.to_batch", "island", l_tb, is_lb(qb));
+        const int l_bq = is_lb(qb);
         island_refresh(qb.column, "qkv");
         island_refresh(kb.column, "qkv");
         island_refresh(vb.column, "qkv"); // idles at shared until PV
+        ledger.note("boot.qkv", "16->13", l_bq, is_lb(qb));
+        const int l_qk = is_lb(qb);
         ledger.charge("island.qk", [&]() {
             kt = tr.batch_is->transpose(kb, "attn.kt", *tr.galois_is);
             scores = tr.batch_is->matmul(qb, kt, "attn.qk", *tr.galois_is,
                                          *tr.relin_is);
         });
+        ledger.note("island.qk", "island", l_qk, is_lb(scores));
         const double a_dbg =
             heongpu::llama::Llama3Operator::domain_scale(-bound, 0.0);
         if (dbg)
@@ -1360,18 +1437,25 @@ int main()
         // 2^33*1.00036 boots to garbage, exact boots to 5e-7), bridge on
         // the cheap side at l = 2, then boot the exact-scale slot form.
         // Softmax enters at the full window, E = 17.
+        const int l_sc = is_lb(scores);
         std::vector<Ct> sbig = tr.ascend(scores.column);
+        ledger.note("cross.up", "13->16", l_sc, hi_l(sbig));
         ledger.charge("scale_norm", [&]() {
             for (auto& c : sbig)
                 tr.arith_hi->match_scale(c, tr.scale);
         });
+        const int l_ts = hi_l(sbig);
         std::vector<Ct> sslots = tr.wide_to_slots(sbig);
+        ledger.note("wide.to_slots", "16", l_ts, hi_l(sslots));
+        const int l_bq2 = hi_l(sslots);
         tr.refresh(sslots, "post_qk");
+        ledger.note("boot.post_qk", "16", l_bq2, hi_l(sslots));
         dbg_slots_vs(sslots, "scores.slots(post-boot)",
                      [&](int b, int u, int key) {
                          return a_dbg *
                                 scores_dbg[(std::size_t(b) * d + u) * d + key];
                      });
+        const int l_sm = hi_l(sslots);
         ledger.charge("softmax", [&]() {
             // The exp fit's domain scale is already folded into the query
             // weight; the score shift rides the same map as a free constant.
@@ -1390,6 +1474,7 @@ int main()
                          EnvInt("HEONGPU_TB_INV_DEGREE", 15), sum_lo, sum_hi,
                          masks, /*pre_scaled=*/true);
         });
+        ledger.note("softmax", "16", l_sm, hi_l(sslots));
         dbg_slots_vs(sslots, "softmax.P",
                      [&](int b, int u, int key) {
                          return p_host[(std::size_t(b) * d + u) * d + key];
@@ -1406,13 +1491,22 @@ int main()
             for (auto& c : sslots)
                 tr.arith_hi->match_scale(c, tr.scale);
         });
+        const int l_fs = hi_l(sslots);
         std::vector<Ct> pbig = from_slots_low(sslots);
+        ledger.note("wide.from_slots", "16", l_fs, hi_l(pbig));
         // The PV window needs P at l = shared with 2 products ahead. If a
         // deeper-than-budgeted softmax fit ate the slack, refresh P here
         // (the D4 fallback); with the S = 12 budget this never fires.
         if (!pbig.empty() && tr.L_hi - pbig.front().depth() < shared)
+        {
+            const int l_ps = hi_l(pbig);
             tr.refresh(pbig, "post_softmax");
+            ledger.note("boot.post_softmax", "16", l_ps, hi_l(pbig));
+        }
+        const int l_dn = hi_l(pbig);
         std::vector<Ct> pcols = tr.descend(pbig, shared);
+        ledger.note("cross.down", "16->13", l_dn,
+                    pcols.empty() ? 0 : tr.shared - pcols.front().depth());
         BatchActivation P, V2;
         P.rows = d;
         P.column = std::move(pcols);
@@ -1455,6 +1549,7 @@ int main()
 
         BatchActivation outb;
         RectActivation out;
+        const int l_pv = is_lb(P);
         ledger.charge("island.pv", [&]() {
             int depth = 0;
             for (auto& c : P.column)
@@ -1468,6 +1563,7 @@ int main()
             outb = tr.batch_is->matmul(P, V2, "attn.pv", *tr.galois_is,
                                        *tr.relin_is);
         });
+        ledger.note("island.pv", "island", l_pv, is_lb(outb));
         if (dbg)
         {
             const auto got = tr.batch_is->decrypt(
@@ -1481,22 +1577,28 @@ int main()
                       << outb.column.front().depth() << " of " << tr.shared
                       << ")" << std::endl;
         }
-        ledger.charge("island.out", [&]() {
+        const int l_fb = is_lb(outb);
+        ledger.charge("island.from_batch", [&]() {
             std::vector<BatchActivation> groups;
             groups.push_back(std::move(outb));
             out = tr.rect_is->from_batch(groups, model, *tr.galois_is);
         });
+        ledger.note("island.from_batch", "island", l_fb, is_l(out));
         // The PV product drifted the scale; the tail refresh must see the
         // exact nominal or the boot corrupts it.
         ledger.charge("scale_norm", [&]() {
             for (auto& c : out.column)
                 tr.rect_is->arith().match_scale(c, tr.scale);
         });
+        const int l_at = is_l(out);
         island_refresh(out.column, "attn_tail");
-        ledger.charge("island.out", [&]() {
+        ledger.note("boot.attn_tail", "13->16", l_at, is_l(out));
+        const int l_po = is_l(out);
+        ledger.charge("island.project_o", [&]() {
             out = tr.rect_is->project(out, wo, model, model, "attn.o",
                                       *tr.galois_is);
         });
+        ledger.note("island.project_o", "island", l_po, is_l(out));
         return out;
     };
 
@@ -1532,26 +1634,38 @@ int main()
                         up_bound;
                 }
             RectActivation gate, up;
+            const int l_pf = is_l(x);
             ledger.charge("island.project_ffn", [&]() {
                 gate = tr.rect_is->project(x, wg_c, model, model, "ffn.gate",
                                            *tr.galois_is);
                 up = tr.rect_is->project(x, wu_c, model, model, "ffn.up",
                                          *tr.galois_is);
             });
+            ledger.note("island.project_ffn", "island", l_pf, is_l(gate));
+            const int l_gu = is_l(gate);
             std::vector<Ct> gbig = tr.ascend(gate.column);
             std::vector<Ct> ubig = tr.ascend(up.column);
+            ledger.note("cross.up", "13->16", l_gu, hi_l(gbig));
             drop_big_to(gbig, 2);
             drop_big_to(ubig, 2);
+            const int l_gs = hi_l(gbig);
             std::vector<Ct> gslots = tr.wide_to_slots(gbig);
             std::vector<Ct> uslots = tr.wide_to_slots(ubig);
+            ledger.note("wide.to_slots", "16", l_gs, hi_l(gslots));
+            const int l_bg = hi_l(gslots);
             tr.refresh(gslots, "ffn_gate");
             tr.refresh(uslots, "ffn_up");
+            ledger.note("boot.ffn_gate", "16", l_bg, hi_l(gslots));
+            ledger.note("boot.ffn_up", "16", l_bg, hi_l(uslots));
+            const int l_bm = hi_l(gslots);
             ledger.charge("wide.block_map", [&]() {
                 tr.wide_rect->block_map(gslots, true, "wide.block_inverse",
                                         *tr.galois_hi);
                 tr.wide_rect->block_map(uslots, true, "wide.block_inverse",
                                         *tr.galois_hi);
             });
+            ledger.note("wide.block_map", "16", l_bm, hi_l(gslots));
+            const int l_sw = hi_l(gslots);
             ledger.charge("swiglu", [&]() {
                 const int silu_degree = EnvInt("HEONGPU_TB_SILU_DEGREE", 31);
                 for (std::size_t j = 0; j < gslots.size(); ++j)
@@ -1566,12 +1680,19 @@ int main()
                         act, uslots[j], *tr.relin_hi);
                 }
             });
+            ledger.note("swiglu", "16", l_sw, hi_l(gslots));
             ledger.charge("wide.block_map", [&]() {
                 tr.wide_rect->block_map(gslots, false, "wide.block_forward",
                                         *tr.galois_hi);
             });
+            const int l_hf = hi_l(gslots);
             std::vector<Ct> hbig = from_slots_low(gslots);
+            ledger.note("wide.from_slots", "16", l_hf, hi_l(hbig));
+            const int l_hd = hi_l(hbig);
             std::vector<Ct> hcols = tr.descend(hbig, shared);
+            ledger.note("cross.down", "16->13", l_hd,
+                        hcols.empty() ? 0
+                                      : tr.shared - hcols.front().depth());
             RectActivation h;
             h.column = std::move(hcols);
             h.rows = d;
@@ -1585,10 +1706,12 @@ int main()
                         wdn[std::size_t(ch * model + i) * model + o] *
                         up_bound;
             RectActivation part;
+            const int l_pd = is_l(h);
             ledger.charge("island.project_down", [&]() {
                 part = tr.rect_is->project(h, wd_c, model, model, "ffn.down",
                                            *tr.galois_is);
             });
+            ledger.note("island.project_down", "island", l_pd, is_l(part));
             if (ch == 0)
                 acc = std::move(part);
             else
