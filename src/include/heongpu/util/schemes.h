@@ -7,6 +7,7 @@
 #define HEONGPU_SCHEMES_H
 
 #include <heongpu/kernel/defines.h>
+#include <cstdint>
 #include <memory>
 #include <utility>
 
