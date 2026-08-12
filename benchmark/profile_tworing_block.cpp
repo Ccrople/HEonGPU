@@ -609,8 +609,26 @@ struct TwoRing
                 // mattered -- post_softmax, behind an exp fit, a reciprocal
                 // fit and their product -- was among the four.
                 const double drift = std::abs(c.scale() / scale - 1.0);
-                if (L_hi - c.depth() > 1 && drift > 1e-12)
-                    arith_hi->match_scale(c, scale);
+                if (drift > 1e-12)
+                {
+                    if (L_hi - c.depth() > 1)
+                    {
+                        arith_hi->match_scale(c, scale);
+                    }
+                    else
+                    {
+                        // One limb left and a drifted scale: a match_scale is
+                        // a plaintext product and there is no level to spend
+                        // on it, so this boot is about to return garbage and
+                        // nothing downstream will say so. The caller has to
+                        // normalise earlier -- say which caller.
+                        std::cerr << "[tb] WARNING: boot." << name
+                                  << " sees scale drift " << drift
+                                  << " with one limb left; normalise before "
+                                     "the bridge that got it here"
+                                  << std::endl;
+                    }
+                }
                 while (L_hi - c.depth() > 1)
                     arith_hi->mod_drop_inplace(c);
                 c = arith_hi->regular_bootstrapping_v2(
@@ -1376,6 +1394,18 @@ int main()
                      [&](int b, int u, int key) {
                          return p_host[(std::size_t(b) * d + u) * d + key];
                      });
+        // The SoftMax leaves the worst scale drift in the sublayer -- an exp
+        // fit, a reciprocal fit and their product -- and the post-SoftMax
+        // refresh behind it is a v2 boot, which turns a drifted scale into
+        // garbage rather than into noise. Normalise HERE, where P still has
+        // levels: from_slots_low drops to 2 and the bridge spends 1, so by
+        // the time refresh() sees P there is one limb left and no room for
+        // the plaintext product a match_scale is. This mirrors what the
+        // scores get before the post-QK boot.
+        ledger.charge("scale_norm", [&]() {
+            for (auto& c : sslots)
+                tr.arith_hi->match_scale(c, tr.scale);
+        });
         std::vector<Ct> pbig = from_slots_low(sslots);
         // The PV window needs P at l = shared with 2 products ahead. If a
         // deeper-than-budgeted softmax fit ate the slack, refresh P here
