@@ -1579,7 +1579,7 @@ namespace heongpu
                 return;
             }
             const int keep = level_budget(seam);
-            const int total = context_.get_ciphertext_modulus_count();
+            const int total = context_->get_ciphertext_modulus_count();
             if (keep <= 0 || keep >= total)
             {
                 return;
