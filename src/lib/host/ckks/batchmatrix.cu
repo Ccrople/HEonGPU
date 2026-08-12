@@ -576,16 +576,24 @@ namespace heongpu
         // of a 352 s block, against 2.5 s of GPU work in the same 58 calls.
         // t.modulus is the first num_limbs primes of the key modulus, which is
         // exactly what the host loop indexed, so the result is unchanged.
-        DeviceVector<int64_t> source(coeffs);
+        // Staged in the first limb's slice of the destination and expanded in
+        // place, so this costs no device memory beyond the plaintext itself.
+        // A separate upload buffer would add per_limb words on top -- hundreds
+        // of MiB at the wide sweep shapes, on a pool that other work on this
+        // machine already drives to its ceiling.
         plain_ = DeviceVector<Data64>(static_cast<size_t>(num_limbs) *
                                       per_limb);
+        HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+            plain_.data(), coeffs.data(), per_limb * sizeof(int64_t),
+            cudaMemcpyHostToDevice, cudaStreamDefault));
         {
             const int expand_threads = 256;
             const dim3 expand_grid(static_cast<unsigned>(
                 (per_limb + expand_threads - 1) / expand_threads));
             bm_crt_expand_kernel<<<expand_grid, expand_threads>>>(
-                plain_.data(), source.data(), t.modulus.data(), per_limb,
-                num_limbs);
+                plain_.data(),
+                reinterpret_cast<const int64_t*>(plain_.data()),
+                t.modulus.data(), per_limb, num_limbs);
             HEONGPU_CUDA_CHECK(cudaGetLastError());
         }
 
@@ -632,12 +640,6 @@ namespace heongpu
             plain_.data(), t.psi.data(), t.modulus.data(), k,
             static_cast<int>(per_limb / k));
         HEONGPU_CUDA_CHECK(cudaGetLastError());
-
-        // The uploaded coefficients are freed when this returns, so as
-        // everywhere else in this file the launch that reads them has to have
-        // consumed them first. One drain per projection -- 58 in a block, in
-        // exchange for the 51 GiB of uploads the expansion above removes.
-        HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
 
         plain_rows_ = rows;
         plain_cols_ = cols;

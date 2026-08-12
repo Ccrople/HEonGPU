@@ -30,6 +30,9 @@ namespace heongpu
      *
      * @param out      [num_limbs][per_limb] destination.
      * @param coeffs   [per_limb] centred coefficients, shared by every limb.
+     *                 May alias out's first limb, which is how the caller
+     *                 expands in place; each thread loads its element before
+     *                 the loop stores, and owns index i in every limb.
      */
     __global__ void bm_crt_expand_kernel(Data64* out, const int64_t* coeffs,
                                          const Modulus64* modulus,

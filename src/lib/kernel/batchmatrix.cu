@@ -22,6 +22,14 @@ namespace heongpu
         // keeps this loop on the path every shape takes -- spreading limbs
         // over blockIdx.y would leave it dead below 33 limbs, which is every
         // shape the tests cover and none of the ones the Llama chain runs.
+        //
+        // coeffs is allowed to alias the first limb of out, which is how the
+        // caller avoids a second buffer. That is safe in exactly one way and
+        // it is load-before-store: this thread reads its own element once,
+        // here, before the loop writes anything, and no other thread touches
+        // index i in any limb. Neither pointer is __restrict__, and int64_t
+        // and Data64 are the corresponding signed/unsigned types, so the
+        // compiler has to keep this load ahead of the stores.
         const int64_t v = coeffs[i];
         for (int limb = 0; limb < num_limbs; ++limb)
         {
