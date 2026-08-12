@@ -1522,3 +1522,152 @@ the A6000, same shape, 2.95x.
 5. **The two-ring path needs a correctness pass at 16<->13**, not a memory
    one.
 
+
+---
+
+## 15. The level budget, and what it says about security (2026-08-12)
+
+§14 measured the block by kernel, by function and by their join. This section
+measures it by **modulus level**, which is the axis none of those show — and
+which turns out to be the axis the security question is asked on.
+
+Same machine, same shape, same weights as §14: vessl A100-SXM4-80GB, real
+Meta-Llama-3-8B layer 2, logN 12, 40 limbs, dnum 5, hoisting on.
+
+### 15.1 A refresh hands back 15 limbs; one stretch of seven wants them
+
+The schedule refreshes to a fixed depth wherever it refreshes, because that is
+what a bootstrap does. What the stretch behind the seam actually spends is not
+fixed, and the printed depth ledger has always said so:
+
+| stretch | spends | handed back | needs |
+|---|---:|---:|---:|
+| entry -> RMSNorm | 11 | **40** | 12 |
+| post-norm -> QK^T | 6 | 15 | 7 |
+| post-QK -> SoftMax | **13** | 15 | 14 |
+| post-SoftMax -> PV + O + residual | 7 | 15 | 8 |
+| mid -> FFN norm | 11 | 15 | 12 |
+| post-FFN-norm -> SwiGLU | 9 | 15 | 10 |
+| post-hidden -> down + residual | 4 | 15 | **5** |
+
+"Needs" is one MORE than the stretch spends, because a bootstrap reads a
+ciphertext with one prime left.
+
+Those unspent limbs are not free to hold. `apply_galois_ckks_method_II` reads
+its digit count from `d_leveled[depth]` and its RNS width from
+`Q_prime_size - depth`, so a limb the stretch will never reach is carried by
+every key switch until the next seam and then discarded — across **660,932
+key switches** in a block.
+
+`level_budget` (a42df7c) is the fix, and it is a hook rather than a schedule:
+the operator asks, at each seam, what the stretch behind it needs and drops to
+that. Empty by default, so nothing changes for an existing caller. The
+benchmark derives all seven stretches from the same configuration the circuit
+runs on, which makes the ledger the check on itself: **every stretch must land
+on exactly one limb left**, and it does.
+
+### 15.2 Measured
+
+| run | crossings | budget | block | vs base | bits |
+|---|---|---|---:|---:|---:|
+| base | staged 2/2/3/3 | 15 flat | 123,266 ms | — | 5.93 |
+| **budgeted** | staged 2/2/3/3 | 12/7/14/8/12/10/5 | **107,455 ms** | **-12.8%** | 5.92 |
+| budgeted + fused | fused 1/1/1/1 | 10/5/14/6/10/9/4 | 142,573 ms | +15.7% | 5.96 |
+
+**-12.8%, and it is free.** 5.92 against 5.93 bits is run-to-run noise:
+discarding a limb the stretch cannot reach leaves the scale untouched, so
+there is nothing for it to cost.
+
+**It is also sublinear, and the reason matters.** The digit arithmetic says
+the feed-forward tail alone (15 -> 5 limbs) should be ~3.5x cheaper; the block
+moved 12.8%. §14.4bis says why: inside a crossing,
+`divide_round_lastq_p_chain_leveled_kernel<16>` runs at 22,998 ns with a
+**477 ns standard deviation** — flat at every level, because 8192 threads is
+32 blocks on a 108-SM card. At N = 4096 a large part of the cost is
+launch-bound and cannot be addressed by removing arithmetic. **At logN 16,
+where each kernel does 16x the work, the same change should convert far
+closer to the arithmetic** — which is an argument for the two-ring split on
+speed grounds, independent of the security one below.
+
+### 15.3 The one-level crossings lose, now measured where it counts
+
+`575b76e` composes each crossing's stage matrices on the host into one dense
+N/2-diagonal map: `to_batch`/`from_batch` 3 -> 1, rect `to_slots`/`from_slots`
+2 -> 1, no new Galois keys. It has been off by default since the crossing-time
+session found it a wall-time regression at d = 64 (staged+hoist 54.8 s
+against fused+hoist 61.1 s, +11.5%).
+
+That verdict was measured **without** a level budget, which was the obvious
+objection to it: a shorter stretch buys nothing when the seam hands back 15
+limbs regardless. The third row above is that objection tested at the real
+8B shape with the budget in place. The level accounting is exactly right —
+every stretch still lands on one limb, two levels cheaper each, deepest point
+in the block 14 limbs instead of 15 — and fused is **still 32.7% slower than
+staged**. The dense map's 2048 plaintext products per crossing cost more than
+the two levels save, and at d = 128 the penalty is worse than the d = 64
+measurement predicted.
+
+**Run staged. The fused crossings are correct, are the level floor, and are
+the wrong choice at this shape** — for a second, independent reason now.
+
+### 15.4 Neither lever shortens the chain, and that is the security problem
+
+The budget changes what is carried WITHIN a stretch. It does not change the
+worst stretch, and the worst stretch is what sets the chain: 25 (bootstrap) +
+13 (SoftMax) = 38, run at 40. The fused crossings shorten five of the seven
+stretches and leave the SoftMax at 13, so they do not shorten it either.
+
+That matters because **the chain length is the security parameter.**
+`context.cu:113` checks `sum(log Q) + sum(log P)` against
+`heongpu_128bit_std_parms(N)`. For the configuration every number in §14 and
+§15 was measured on:
+
+* Q = 60 + 39 x 50 = **2010 bits**, P = 8 x 60 = **480 bits**, log QP = **2490**
+* `heongpu_128bit_std_parms(4096)` = **109**
+
+**Over the 128-bit budget by 22.8x**, on top of a sparse h = 16 secret that
+the ternary-uniform table does not cover. Every profile in this document is a
+cost model, not a parameter set, and §7 said so before any of them were run.
+
+The caps the design has to fit inside:
+
+| ring | 128-bit cap on log QP | usable levels |
+|---|---:|---|
+| logN 12 | 109 | 1 comfortable, 2 tight (§7) |
+| logN 13 | 218 | 4-6, by prime size |
+| logN 16 | 1761 | 38 at 33-bit primes |
+
+**So the island is logN 13, not 12.** logN 12 holds Stage 3's two low-ring
+levels only at 27-bit primes, which §7 flags as precision-unverified against
+a d = 128 contraction. logN 13 has real headroom.
+
+A two-ring set that closes at 128 bits, ternary:
+
+* **High, logN 16** — Q = 41 + 38 x 33 = 1295, P = 8 x 33 = 264,
+  log QP = **1559 <= 1761** ✔
+* **Island, logN 13** — Q = 41 + 4 x 33 = 173, P = 33,
+  log QP = **206 <= 218** ✔
+
+Note what forces the prime size: 50-bit primes do not fit at logN 16 either
+(60 + 38 x 50 = 1960 > 1761 before P is counted). The chain has to come down
+to ~33-bit primes, which forces bootstrap **v2** (`q0 = p + 8 = 41`) and its
+measured 16.75 bits at logN 16 — clearing Sylph's 12-bit target and missing
+20, exactly the conflict §7.4 named.
+
+### 15.5 What this says to do next
+
+1. **The SoftMax's 13 levels are the blocking item for both remaining goals.**
+   They set the chain, the chain sets log QP, and log QP is what puts the
+   configuration 22.8x outside 128-bit security. The reciprocal is **6 of the
+   13**, at degree 63, purely because its calibrated range spans 139x
+   (`[0.7597, 105.7]`). Narrowing that range is worth more than any kernel in
+   §14.3.
+2. **Move the QKV seam behind the projections.** The refresh currently sits
+   between the norm and the projections, so an Algorithm-5 PCMM worth 8.5 s
+   runs at the top of the next budget. Folding it into the norm's stretch
+   (11 + 1 = 12, budget 13) puts it at 2 limbs instead of 7 — a better
+   schedule than 15.1 implements, and not yet built.
+3. **Re-test the fused crossings only after (1).** They are the tool for
+   turning a shorter stretch into a shorter CHAIN, and they are worth their
+   wall-time penalty only when the chain actually moves.
+4. §14.8 items 1-5 are unchanged.
