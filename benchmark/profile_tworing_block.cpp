@@ -116,6 +116,25 @@ namespace
         int order_next = 0;
         std::map<std::string, int> order;
 
+        /// One OCCURRENCE of a phase: the time charged to its leg since that
+        /// leg's previous note, and the limbs THAT occurrence spanned.
+        ///
+        /// The rollup below aggregates a leg over the whole block, which is
+        /// what a cost table wants and what a level table must not be: a leg
+        /// that runs eleven times at four different points in the chain has
+        /// no single "limbs in -> out", and printing the envelope makes
+        /// consecutive rows look discontinuous when the real path between
+        /// them ran some other leg. So the two are kept apart.
+        struct Step
+        {
+            std::string leg, ring;
+            double ms;
+            int calls, in, out;
+        };
+        std::vector<Step> steps;
+        std::map<std::string, double> pending_ms;
+        std::map<std::string, int> pending_calls;
+
         template <typename F> void charge(const std::string& leg, F&& f)
         {
             cudaDeviceSynchronize();
@@ -123,9 +142,12 @@ namespace
             f();
             cudaDeviceSynchronize();
             const auto t1 = Clock::now();
-            ms[leg] +=
+            const double dt =
                 std::chrono::duration<double, std::milli>(t1 - t0).count();
+            ms[leg] += dt;
             calls[leg] += 1;
+            pending_ms[leg] += dt;
+            pending_calls[leg] += 1;
             if (!order.count(leg))
                 order[leg] = order_next++;
         }
@@ -146,10 +168,51 @@ namespace
                 lvl_in[leg] = std::max(lvl_in[leg], in);
                 lvl_out[leg] = std::min(lvl_out[leg], out);
             }
+            // Close this occurrence: everything charged to the leg since its
+            // last note belongs to it, and nothing else does.
+            steps.push_back(Step{leg, on, pending_ms[leg], pending_calls[leg],
+                                 in, out});
+            pending_ms[leg] = 0.0;
+            pending_calls[leg] = 0;
+        }
+
+        /// The charges no note ever claimed -- the level-free seams
+        /// (scale_norm, residual, accumulate) and any leg whose last
+        /// occurrence had no note behind it.
+        void print_timeline(const char* tag) const
+        {
+            double walked = 0.0;
+            std::cout << "[tb] ---- " << tag
+                      << " timeline (execution order) ----" << std::endl;
+            std::cout << "[tb]   " << std::left << std::setw(4) << "#"
+                      << std::setw(22) << "phase" << std::right
+                      << std::setw(10) << "ms" << std::setw(5) << "x"
+                      << std::setw(9) << "ring" << std::setw(11) << "limbs"
+                      << std::endl;
+            int i = 0;
+            for (const Step& s : steps)
+            {
+                walked += s.ms;
+                std::cout << "[tb]   " << std::left << std::setw(4) << ++i
+                          << std::setw(22) << s.leg << std::right
+                          << std::fixed << std::setprecision(1)
+                          << std::setw(10) << s.ms << std::setw(5) << s.calls
+                          << std::setw(9) << s.ring << std::setw(7) << s.in
+                          << " -> " << s.out << std::endl;
+            }
+            double total = 0.0;
+            for (const auto& kv : ms)
+                total += kv.second;
+            std::cout << "[tb]   walked " << std::fixed << std::setprecision(1)
+                      << walked << " ms of " << total << " ms; the "
+                      << (total - walked)
+                      << " ms difference is the level-free seams below"
+                      << std::endl;
         }
 
         void print(const char* tag) const
         {
+            print_timeline(tag);
             double total = 0.0;
             for (const auto& kv : ms)
                 total += kv.second;
@@ -182,6 +245,10 @@ namespace
             std::cout << "[tb]   " << std::left << std::setw(24) << "TOTAL"
                       << std::right << std::fixed << std::setprecision(1)
                       << std::setw(10) << total << " ms" << std::endl;
+            std::cout << "[tb]   (the limbs column is the ENVELOPE over a "
+                         "leg's calls -- widest in, narrowest out. For the "
+                         "chain as it actually runs, read the timeline.)"
+                      << std::endl;
         }
     };
 
@@ -1390,10 +1457,22 @@ int main()
     };
 
     // ---- The pure refresh crossing for island data: up, boot, down. -----
+    // Noted leg by leg rather than as one opaque refresh: the timeline is
+    // only honest if every charge is claimed by the occurrence that made it,
+    // and this helper makes three.
+    auto island_l = [&](const std::vector<Ct>& c) {
+        return c.empty() ? 0 : tr.shared - c.front().depth();
+    };
     auto island_refresh = [&](std::vector<Ct>& cols, const char* name) {
+        const int l_up = island_l(cols);
         std::vector<Ct> big = tr.ascend(cols);
+        ledger.note("cross.up", "13->16", l_up, hi_l(big));
+        const int l_bt = hi_l(big);
         tr.refresh(big, name);
+        ledger.note(std::string("boot.") + name, "16", l_bt, hi_l(big));
+        const int l_dn = hi_l(big);
         cols = tr.descend(big, shared);
+        ledger.note("cross.down", "16->13", l_dn, island_l(cols));
     };
 
     // ---- Attention sublayer, two-ring. ---------------------------------
@@ -1438,7 +1517,7 @@ int main()
         island_refresh(qb.column, "qkv");
         island_refresh(kb.column, "qkv");
         island_refresh(vb.column, "qkv"); // idles at shared until PV
-        ledger.note("boot.qkv", "16->13", l_bq, is_lb(qb));
+        (void) l_bq; // island_refresh notes its own three legs
         const int l_qk = is_lb(qb);
         ledger.charge("island.qk", [&]() {
             kt = tr.batch_is->transpose(kb, "attn.kt", *tr.galois_is);
@@ -1629,7 +1708,7 @@ int main()
         });
         const int l_at = is_l(out);
         island_refresh(out.column, "attn_tail");
-        ledger.note("boot.attn_tail", "13->16", l_at, is_l(out));
+        (void) l_at; // island_refresh notes its own three legs
         const int l_po = is_l(out);
         ledger.charge("island.project_o", [&]() {
             out = tr.rect_is->project(out, wo, model, model, "attn.o",
