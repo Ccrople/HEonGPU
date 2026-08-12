@@ -1903,3 +1903,153 @@ The buckets at the end of it (58,949 ms):
 Bootstrapping was 32.4% of the §13 block and is 53.7% of this one, having
 barely moved in absolute terms (35,909 -> 31,647). Everything else has been
 cut roughly in half around it. It is now the only thing worth attacking.
+
+## 17. Why the island boots so often, and what it would take to stop
+
+The question this section answers, asked directly: *the bootstrap should come
+after RMS and QKV are done, but we lack the modulus to reach `island.qk`, so
+we boot before it. Can we not adjust the modulus and skip the boots between
+`pv` and `project_o` as well? Can we use smaller primes?*
+
+The premise is right, the arithmetic backs it, and the fix is not smaller
+primes.
+
+### 17.1 What the restructuring costs in levels
+
+The island enters each sublayer at `shared - 1` (the norm's `from_slots_at`
+bridge spends one). Walking the code with `S = shared`:
+
+| step | level after |
+|---|---|
+| entry from the norm | `S-1` |
+| `island.project_qkv` | `S-2` |
+| `island.to_batch` (q, k, v) | `S-3` |
+| `island.qk` | `S-4` |
+| ascend + `scale_norm` | `S-5` |
+| `wide.to_slots` | `S-6` |
+| the boot needs >= 1 in | **`S >= 7`** |
+
+So **running `island.qk` before any refresh needs `shared >= 7`**, and that
+deletes `boot.qkv` x3 -- 7,913 ms, **13.4% of the block**.
+
+Continuing through the tail, with V left unrefreshed at `S-3` and P descending
+from the SoftMax boot to `S`:
+
+| step | level after |
+|---|---|
+| `island.pv` (aligns to min = `S-3`) | `S-4` |
+| `island.from_batch` | `S-5` |
+| `island.project_o` | `S-6` |
+| `residual` (its `match_scale`) | `S-7` |
+| norm2 needs >= 2 to enter | **`S >= 9`** |
+
+**`pv` -> `project_o` with no boot between needs `shared >= 9`**, which also
+deletes `boot.attn_tail`: **10,550 ms, 17.9% of the block**, four of the
+twelve boots.
+
+(The tail's pre-boot `scale_norm` goes with it. It exists only because a v2
+boot corrupts a drifted scale; with no boot there is nothing to protect, and
+the level it spends is the one `project_o` wants. `HEONGPU_TB_LAZY_REFRESH`
+folds the two decisions into one.)
+
+### 17.2 The island's budget is bits, and the primes cannot shrink
+
+`build_big` lays the chain out as `q0 = 41`, then `nbase` primes at `p = 33`,
+then the boot's own StC/sine/CtS primes. The island takes the bottom `shared`
+of them plus one special: `Q = 41 + 33*(S-1)`, `P = 61`.
+
+| S | log QP | logN 13 (218) | logN 14 (438) |
+|---|---|---|---|
+| 4 | 201 | fits, 17 spare | fits |
+| 5 | 234 | **over by 16** | fits |
+| 7 | 300 | over | fits |
+| 9 | 366 | over | fits, 72 spare |
+| 11 | 432 | over | fits, 6 spare |
+
+**Smaller primes do not work, for three independent reasons.**
+
+1. **`p` IS the scale.** `scale = 2^p` at `profile_tworing_block.cpp:443`. A
+   rescale divides by one prime; a prime below the scale makes the scale
+   collapse instead of returning to nominal. 33 bits is a floor set by the
+   scale, not a free parameter.
+2. **Lowering the scale destroys the answer.** The block delivers 9.77 bits at
+   `2^33`. Dropping to `2^25` to fit 25-bit primes costs about 8 of them, so
+   ~1.8 bits. `q0/scale` must also stay near `2^8` or the v2 boot returns
+   silent noise, and the boot's own precision ceiling is ~20 bits.
+3. **Mixed prime sizes break the fixed-scale invariant.** The island's primes
+   ARE the big ring's bottom primes -- the ring switch requires a shared
+   prefix -- and the Llama path `match_scale`s to exactly `2^33` everywhere. A
+   rescale by a 25-bit prime at scale `2^33` leaves `2^41`, not `2^33`.
+
+And even setting all three aside: at `S = 6` with *every* prime at 33 bits,
+`Q = 198`, leaving 20 bits for `P`. A special prime smaller than the largest Q
+prime makes method-I key switching diverge. **`shared >= 6` is unreachable at
+logN 13 under any prime assignment.** The 218-bit cap is the whole story.
+
+### 17.3 So the island ring has to grow -- and it does not fit
+
+logN 14 raises the cap to 438, which holds `shared` up to 11, and it is
+**secure**: `S = 9` is 366 <= 438, the big ring is unchanged at 1758 <= 1761.
+Security is not the blocker here.
+
+Key memory is. Algorithm 5 needs the full `N/2 - 1` rotation group, which
+**doubles to 8191 indices** at logN 14 while each key also doubles in size:
+`2 * dnum * (Q+P) * N * 8` = 2.5 MiB at `S = 9`, so **20.5 GiB** against
+2.5 GiB at logN 13.
+
+Measured on the 80 GiB A100, both dying on the same 22.5 MiB key allocation:
+
+| config | pool cap | died at |
+|---|---|---|
+| logN 14, `S = 9` | 90% | 70.947 / 70.952 GiB |
+| logN 14, `S = 9` | 97% | 76.460 / 76.471 GiB |
+
+The cap moved 5.5 GiB and the wall did not. The budget explains why: big
+context 43.6 + wide operator tables 13.8 + island keys 20.5 = **77.9 GiB on a
+79.3 GiB card**, before any transient. Unlike the failures in
+`rmm_pool_ceiling_not_working_set`, this one is real demand, not ballooning.
+
+Three attempts, each dying on the same Galois key allocation:
+
+| config | pool cap | died at | request |
+|---|---|---|---|
+| logN 14, `shared = 9` | 90% | 70.947 / 70.952 GiB | 22.5 MiB |
+| logN 14, `shared = 9` | 97% | 76.460 / 76.471 GiB | 22.5 MiB |
+| logN 14, `shared = 7` | 95% | 74.892 / 74.894 GiB | 14.0 MiB |
+
+The cap moved 5.5 GiB between the first two and the wall did not move with it.
+The budget says why: big-ring context 43.6 + wide operator tables 13.8 +
+island keys 16.4 (S=7) to 20.5 (S=9) = **73.8 to 77.9 GiB on a 79.3 GiB
+card**, before any transient. Note this is the OPPOSITE diagnosis from
+`rmm_pool_ceiling_not_working_set`: there `max` equalled cap x free-at-start
+while live data varied by gigabytes, which is ballooning. Here the demand is
+real, and lowering `shared` from 9 to 7 moved the death point by exactly the
+4.1 GiB the smaller keys account for.
+
+**So the restructuring needs roughly 96 GiB and the card has 80.** It is an
+H100/H200 change, or it needs the Algorithm 5 key set to stop being resident
+-- streamed per rotation, or replaced by a decomposition that does not demand
+the full `N/2 - 1` group.
+
+### 17.4 What was implemented anyway
+
+`HEONGPU_TB_LAZY_REFRESH` (default off, `ff62042`) makes the four island
+refreshes conditional: each fires only when the walk behind it spends more
+than the stream holds (`q`/`k` need 4, `v` needs 6, the tail needs 4). The
+tail's pre-boot `scale_norm` is folded into the same decision, because it
+exists only to protect a v2 boot from a drifted scale and the level it spends
+is the one `project_o` wants.
+
+It is fail-safe by construction -- when the levels are absent the boot still
+fires -- and a **no-op at `shared = 4`**, which is what the shipping config
+runs. It is the piece that turns "more island levels" into "fewer boots", and
+it is in place for whenever the memory exists.
+
+### 17.5 The answer, in one line
+
+The premise was right and the mechanism is understood: four of the twelve
+boots are avoidable, worth 17.9%, and they persist because a 2^13 island holds
+four limbs. Smaller primes cannot add limbs because the prime size IS the
+scale. A 2^14 island can, is secure, and does not fit an 80 GiB card by about
+16 GiB. **The blocker moved from modulus to key memory, and that is a
+different machine, not a different parameter.**
