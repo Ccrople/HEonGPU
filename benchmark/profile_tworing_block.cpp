@@ -58,6 +58,8 @@
 
 #include <heongpu/heongpu.hpp>
 
+#include <nvtx3/nvToolsExt.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -135,12 +137,19 @@ namespace
         std::map<std::string, double> pending_ms;
         std::map<std::string, int> pending_calls;
 
+        /// Every leg is also an NVTX range under its own name, so an nsys
+        /// capture attributes kernels to exactly the phases this table costs.
+        /// The range has to outlive f() -- the kernels f() launches are
+        /// asynchronous, and nsys assigns them to a range by overlap on the
+        /// timeline -- so it closes after the trailing sync, not before it.
         template <typename F> void charge(const std::string& leg, F&& f)
         {
             cudaDeviceSynchronize();
             const auto t0 = Clock::now();
+            nvtxRangePushA(leg.c_str());
             f();
             cudaDeviceSynchronize();
+            nvtxRangePop();
             const auto t1 = Clock::now();
             const double dt =
                 std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -529,16 +538,29 @@ struct TwoRing
         // level -- so holding the up and down sets together is what
         // exhausts the pool at 2^16. Whole-set eviction costs re-encodes,
         // never correctness.
+        //
+        // Keeping a SECOND set resident would pay: wide.to_slots is 3.6 s
+        // over seven calls that all want the same 2-limb set and all miss.
+        // It does not fit. Measured on the 80 GiB A100, at the secure
+        // nbase = 13 chain, dying at the same allocation every time:
+        //
+        //   BRIDGE_SETS=2                      OOM (pool cap 86%)
+        //   BRIDGE_SETS=3, LIMBS=3, pool 93%   OOM  73.32 / 73.32 GiB
+        //   BRIDGE_SETS=3, LIMBS=2, pool 97%   OOM  74.40 / 76.47 GiB
+        //
+        // The width cap is the right POLICY -- a 2-limb set seven calls want
+        // should not be evicted by a 7-limb set four do -- but it raises the
+        // peak, because refusing to cache a wide set does not stop it being
+        // built, and holding the narrow one through that build is what runs
+        // out. Both levers were pushed to their limit and the wall did not
+        // move: the wide bridge's re-encode is memory-bound at 2^16 on this
+        // card, not policy-bound. So the default stays at one set, and the
+        // library's width-aware eviction stays opt-in, strictly better only
+        // where the memory exists to use it.
         wide->set_bridge_plain_capacity(
-            std::size_t(EnvInt("HEONGPU_TB_BRIDGE_SETS", 3)));
-        // A set costs d_wide plaintexts of N words PER LIVE LIMB, and its
-        // value is how often that (direction, level) pair recurs. Those are
-        // unrelated: to_slots sits at 2 limbs and SEVEN calls want it, while
-        // a from_slots set at 7 limbs is 3.5x the memory for four. Counting
-        // sets alone let the second evict the first and OOM'd at
-        // BRIDGE_SETS=2; capping the WIDTH keeps the cheap set resident.
+            std::size_t(EnvInt("HEONGPU_TB_BRIDGE_SETS", 1)));
         wide->set_bridge_plain_limb_limit(
-            EnvInt("HEONGPU_TB_BRIDGE_LIMBS", 3));
+            EnvInt("HEONGPU_TB_BRIDGE_LIMBS", 0));
         // The wide-layout rect operator supplies block_map: a RECT stream's
         // coefficients are raw (not interpolated), so its crossing is the
         // row bridge PLUS the block transform, exactly as on the island.
@@ -2261,6 +2283,21 @@ int main()
             ledger.note("crossing.encode", "island", l_warm, l_warm - 1);
             PrintFree("island crossing tables encoded");
         }
+
+        // One range around the block PROPER, so a capture can skip the ~10
+        // minutes of key generation and table building that precede it:
+        //   nsys profile -t cuda,nvtx --capture-range=nvtx \
+        //        --nvtx-capture=tb.block --capture-range-end=stop
+        // It opens after the crossing warm-up on purpose. That leg is a
+        // per-model cost, it is already understood, and tracing its 4096
+        // plaintext encodes buys nothing but trace size. Scoped so the
+        // stage == "attention" return closes it too.
+        struct BlockRange
+        {
+            BlockRange() { nvtxRangePushA("tb.block"); }
+            BlockRange(const BlockRange&) = delete;
+            ~BlockRange() { nvtxRangePop(); }
+        } block_range;
 
         RectActivation attn_out;
         if (stage == "block")
