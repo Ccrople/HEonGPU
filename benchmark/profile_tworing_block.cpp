@@ -546,6 +546,17 @@ struct TwoRing
             wide->set_hoisted_crossings(true);
             wide_rect->set_hoisted_crossings(true);
         }
+        // BSGS over the wide block map's 2*step_h - 1 diagonals: 62 rotations
+        // per ciphertext become n1 - 1 babies plus one giant per live group,
+        // 14 at step_h = 32 with n1 = 8. Every index it needs is already in
+        // the set built below -- the babies and the positive giants sit
+        // inside the +-(step_h - 1) window this map always needed, and the
+        // one giant at -step_h is the SoftMax comb's -step_h.
+        {
+            const int bsgs_n1 = EnvInt("HEONGPU_TB_BSGS_BLOCKMAP", 8);
+            if (bsgs_n1 > 1)
+                wide_rect->set_bsgs_block_map(bsgs_n1);
+        }
         int n1 = 1;
         while (n1 * n1 * 2 <= d_wide)
             n1 <<= 1;

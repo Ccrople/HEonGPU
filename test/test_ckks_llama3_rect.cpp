@@ -691,6 +691,117 @@ TEST(HEonGPU, CKKS_Llama3Rect_HoistedFusedCrossingsMatch)
 }
 
 // ---------------------------------------------------------------------------
+// The block transform's baby-step / giant-step walk
+// ---------------------------------------------------------------------------
+
+// Splitting eps = n1*i + b takes the block map's 2*step - 2 key switches to
+// (n1 - 1) baby shifts plus one giant per live group -- at step = 16, n1 = 4,
+// that is 30 rotations to 10. The diagonals and their coefficients are
+// untouched; only the factorisation of the shifts changes, so the result has
+// to agree with the plain walk to within the extra rescales' rounding, and it
+// has to cost exactly the same one level.
+TEST(HEonGPU, CKKS_Llama3Rect_BsgsBlockMapMatchesThePlainWalk)
+{
+    Fixture fx(6, 3);
+    const int channels = fx.half();
+    const int step = fx.blocks();
+    ASSERT_GT(step, 1) << "a step of 1 makes the block map the identity";
+
+    const std::vector<double> x =
+        random_matrix(Fixture::d, channels, 5150321u);
+    heongpu::llama::RectActivation ct =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+
+    // The index set the split needs, and the one it does NOT need: every
+    // baby and every non-negative giant is inside the +-(step-1) window the
+    // plain walk already covers; the giant at -step is the single index
+    // outside it.
+    const std::vector<int> want = fx.op->block_bsgs_rotation_indices(4);
+    const int n = fx.half();
+    ASSERT_FALSE(want.empty());
+    EXPECT_NE(std::find(want.begin(), want.end(), n - step), want.end())
+        << "the most negative giant is -step and has to be asked for";
+    for (const int s : want)
+    {
+        const int signed_shift = (s > n / 2) ? s - n : s;
+        EXPECT_LE(std::abs(signed_shift), step)
+            << "no shift may leave the +-step window";
+    }
+
+    std::vector<heongpu::Ciphertext<S>> plain_slots =
+        fx.op->to_slots(ct, *fx.galois);
+
+    for (const bool hoist : {false, true})
+    {
+        fx.op->set_hoisted_crossings(hoist);
+        fx.op->set_bsgs_block_map(4);
+        EXPECT_EQ(fx.op->bsgs_block_map(), 4);
+        std::vector<heongpu::Ciphertext<S>> bsgs_slots =
+            fx.op->to_slots(ct, *fx.galois);
+        fx.op->set_bsgs_block_map(0);
+        fx.op->set_hoisted_crossings(false);
+
+        ASSERT_EQ(bsgs_slots.size(), plain_slots.size());
+        EXPECT_EQ(bsgs_slots.front().depth(), plain_slots.front().depth())
+            << "the split must not change what the crossing costs";
+
+        double worst = 0.0;
+        for (size_t j = 0; j < plain_slots.size(); ++j)
+        {
+            heongpu::Plaintext<S> pa(fx.context), pb(fx.context);
+            fx.decryptor->decrypt(pa, plain_slots[j]);
+            fx.decryptor->decrypt(pb, bsgs_slots[j]);
+            std::vector<double> va, vb;
+            fx.encoder->decode(va, pa);
+            fx.encoder->decode(vb, pb);
+            ASSERT_EQ(va.size(), vb.size());
+            for (size_t s = 0; s < va.size(); ++s)
+            {
+                worst = std::max(worst, std::abs(va[s] - vb[s]));
+            }
+        }
+        std::cout << "bsgs vs plain block map worst gap (hoisted=" << hoist
+                  << "): " << worst << std::endl;
+        // Not bit-identical and it cannot be: the plain walk sums every
+        // diagonal and rescales once, the split rescales each giant group.
+        // The gap is rescale rounding, orders below the encoding error.
+        EXPECT_LT(worst, 1e-7);
+    }
+
+    // And the crossing still inverts, end to end, with the split on.
+    fx.op->set_bsgs_block_map(4);
+    std::vector<heongpu::Ciphertext<S>> slots =
+        fx.op->to_slots(ct, *fx.galois);
+    heongpu::llama::RectActivation back =
+        fx.op->from_slots(slots, channels, *fx.galois);
+    const std::vector<double> got =
+        fx.op->decrypt(back, *fx.decryptor, back.column.front().scale());
+    const double round = worst_diff(x, got);
+    std::cout << "bsgs block map round trip worst error: " << round
+              << std::endl;
+    EXPECT_LT(round, 1e-3);
+    fx.op->set_bsgs_block_map(0);
+}
+
+TEST(HEonGPU, CKKS_Llama3Rect_BsgsBlockMapRefusesASplitItCannotWalk)
+{
+    Fixture fx(3, 1);
+    const int step = fx.blocks();
+
+    EXPECT_THROW(fx.op->set_bsgs_block_map(-1), std::invalid_argument);
+    EXPECT_THROW(fx.op->set_bsgs_block_map(6), std::invalid_argument);
+    EXPECT_THROW(fx.op->set_bsgs_block_map(2 * step), std::invalid_argument);
+
+    // 0 and 1 both mean "no split", and neither is an error.
+    fx.op->set_bsgs_block_map(0);
+    EXPECT_EQ(fx.op->bsgs_block_map(), 0);
+    fx.op->set_bsgs_block_map(1);
+    EXPECT_EQ(fx.op->bsgs_block_map(), 1);
+    EXPECT_TRUE(fx.op->block_bsgs_rotation_indices(1).empty());
+    fx.op->set_bsgs_block_map(0);
+}
+
+// ---------------------------------------------------------------------------
 // Algorithm 5 as the projection
 // ---------------------------------------------------------------------------
 

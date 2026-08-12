@@ -269,6 +269,66 @@ namespace heongpu
             return indices;
         }
 
+        void Llama3RectOperator::set_bsgs_block_map(int n1)
+        {
+            const int step = layout_.batch;
+            if (n1 < 0)
+            {
+                throw std::invalid_argument(
+                    "A negative baby step count is not a split");
+            }
+            if (n1 > 1)
+            {
+                if ((n1 & (n1 - 1)) != 0)
+                {
+                    throw std::invalid_argument(
+                        "The block map's baby step count has to be a power of "
+                        "two, because the giant shifts are its multiples and "
+                        "the slot ring's rotations are a two-group");
+                }
+                if (n1 > step)
+                {
+                    throw std::invalid_argument(
+                        "More baby steps than the block transform has "
+                        "diagonals on one side leaves the giant side empty");
+                }
+            }
+            bsgs_block_steps_ = n1;
+        }
+
+        std::vector<int>
+        Llama3RectOperator::block_bsgs_rotation_indices(int n1) const
+        {
+            const int step = layout_.batch;
+            std::vector<int> indices;
+            if (step == 1 || n1 <= 1)
+            {
+                return indices;
+            }
+            // eps = n1*i + b with b in [0, n1), so i runs over the floors of
+            // the window's two ends. i_lo reaches -step exactly when n1
+            // divides step -- one index outside block_rotation_indices().
+            const int i_lo = -((step - 1 + n1 - 1) / n1);
+            const int i_hi = (step - 1) / n1;
+            for (int b = 1; b < n1; ++b)
+            {
+                indices.push_back(b);
+            }
+            for (int i = i_lo; i <= i_hi; ++i)
+            {
+                const int g = i * n1;
+                if (g == 0)
+                {
+                    continue;
+                }
+                indices.push_back(g > 0 ? g : slot_count_ + g);
+            }
+            std::sort(indices.begin(), indices.end());
+            indices.erase(std::unique(indices.begin(), indices.end()),
+                          indices.end());
+            return indices;
+        }
+
         std::vector<int> Llama3RectOperator::rotation_indices() const
         {
             std::vector<int> all = get_rectangular_rotation_indices(layout_);
@@ -337,6 +397,15 @@ namespace heongpu
                 }
             }
 
+            // The baby-step / giant-step walk, when it has been asked for.
+            // See set_bsgs_block_map: 2*step - 2 key switches per ciphertext
+            // become (n1 - 1) + (live giants - 1), 62 to 14 at step = 32.
+            if (bsgs_block_steps_ > 1)
+            {
+                block_map_bsgs(ct, diagonal, name, galois_key);
+                return;
+            }
+
             // Every ciphertext in the call meets the same diagonals at the same
             // level, so they are encoded once rather than once per column.
             //
@@ -348,11 +417,15 @@ namespace heongpu
             // at a time, and the row bridge's d = 128 are walked baby-step /
             // giant-step. So the smaller map costs MORE: measured over one 8B
             // block, this one is 16.5% of GPU time against the row bridge's
-            // 15.4%, 142080 rotations against 137984. BSGS applies here too --
-            // it would take 30 rotations per ciphertext to about 10 -- but the
-            // giant shifts run past the +-(k/2 - 1) window this map's Galois
+            // 15.4%, 142080 rotations against 137984.
+            //
+            // BSGS applies here too and is now implemented -- see
+            // set_bsgs_block_map above. The old note here said its giant
+            // shifts "run past the +-(k/2 - 1) window this map's Galois
             // indices cover, so unlike the row bridge it is not free of new
-            // keys. That is the trade, and it has not been made yet.
+            // keys". That is true of exactly ONE index: the most negative
+            // giant, -step. Everything else is inside the window the plain
+            // walk already needs.
             std::vector<Plaintext<Scheme::CKKS>> plain;
             std::vector<int> shift;
             {
@@ -437,6 +510,192 @@ namespace heongpu
                 }
                 batch_.arith().rescale_inplace(acc);
                 source = std::move(acc);
+            }
+        }
+
+        void Llama3RectOperator::block_map_bsgs(
+            std::vector<Ciphertext<Scheme::CKKS>>& ct,
+            const std::vector<std::vector<Complex64>>& diagonal,
+            const char* name, Galoiskey<Scheme::CKKS>& galois_key)
+        {
+            const int step = layout_.batch;
+            const int n = slot_count_;
+            const int n1 = bsgs_block_steps_;
+            const int depth = ct.front().depth();
+            const double plain_scale = rescale_prime(ct.front());
+
+            // eps = n1*i + b, b in [0, n1). The window is
+            // [-(step-1), step-1], so i runs between the floors of its ends;
+            // i_lo * n1 reaches -step when n1 divides step, and the (i, b)
+            // pairs that fall outside the window are structurally zero.
+            const int i_lo = -((step - 1 + n1 - 1) / n1);
+            const int i_hi = (step - 1) / n1;
+            const int groups = i_hi - i_lo + 1;
+
+            // Stored in BSGS order and PRE-ROTATED by the giant step that will
+            // be applied to the accumulator, exactly as the row bridge stores
+            // its own: rot(v, -g)[p] = v[p - g], the inverse of the shift
+            // below, which is what makes the two compose to the shift the
+            // diagonal wanted. A shift of a known vector is a relabelling on
+            // the host.
+            std::vector<Plaintext<Scheme::CKKS>> plain;
+            std::vector<char> live(static_cast<size_t>(groups), 0);
+            {
+                SuffixRange _r(name, "encode_diagonals");
+                plain.reserve(static_cast<size_t>(groups) * n1);
+                std::vector<Complex64> shifted(static_cast<size_t>(n));
+                const std::vector<Complex64> zero(static_cast<size_t>(n),
+                                                  Complex64(0.0, 0.0));
+                for (int i = i_lo; i <= i_hi; ++i)
+                {
+                    const int g = i * n1;
+                    for (int b = 0; b < n1; ++b)
+                    {
+                        const int eps = g + b;
+                        if (eps < -(step - 1) || eps > step - 1)
+                        {
+                            // Outside the window: no diagonal exists. Encoded
+                            // as zero so the packed layout stays dense, which
+                            // is what lets one launch take a whole group.
+                            plain.push_back(encode(zero, plain_scale, depth));
+                            continue;
+                        }
+                        live[static_cast<size_t>(i - i_lo)] = 1;
+                        const std::vector<Complex64>& src =
+                            diagonal[static_cast<size_t>(eps + step - 1)];
+                        for (int p = 0; p < n; ++p)
+                        {
+                            const int q = ((p - g) % n + n) % n;
+                            shifted[static_cast<size_t>(p)] =
+                                src[static_cast<size_t>(q)];
+                        }
+                        plain.push_back(
+                            encode(shifted, plain_scale, depth));
+                    }
+                }
+            }
+
+            DeviceVector<Data64> packed;
+            if (hoisted_crossings_)
+            {
+                packed = batch_.arith().pack_bsgs_plaintexts(plain, depth);
+            }
+
+            for (auto& source : ct)
+            {
+                // The n1 - 1 baby shifts are shared by every giant group of
+                // this column, so they are taken once.
+                std::vector<Ciphertext<Scheme::CKKS>> baby;
+                DeviceVector<Data64> babies;
+                {
+                    SuffixRange _r(name, "rotations");
+                    if (hoisted_crossings_)
+                    {
+                        std::vector<int> shifts(static_cast<size_t>(n1));
+                        for (int b = 0; b < n1; ++b)
+                        {
+                            shifts[static_cast<size_t>(b)] = b;
+                        }
+                        babies = batch_.arith().hoisted_rotation_train(
+                            source, shifts, n1, galois_key);
+                    }
+                    else
+                    {
+                        baby.reserve(static_cast<size_t>(n1));
+                        for (int b = 0; b < n1; ++b)
+                        {
+                            if (b == 0)
+                            {
+                                baby.push_back(source);
+                                continue;
+                            }
+                            Ciphertext<Scheme::CKKS> shifted(context_);
+                            batch_.arith().rotate_rows(source, shifted,
+                                                       galois_key, b);
+                            baby.push_back(std::move(shifted));
+                        }
+                    }
+                }
+
+                Ciphertext<Scheme::CKKS> total(context_);
+                bool total_started = false;
+                {
+                    SuffixRange _r(name, "diagonals");
+                    for (int i = i_lo; i <= i_hi; ++i)
+                    {
+                        const int gi = i - i_lo;
+                        if (!live[static_cast<size_t>(gi)])
+                        {
+                            continue;
+                        }
+                        const int first = gi * n1;
+
+                        Ciphertext<Scheme::CKKS> acc(context_);
+                        if (hoisted_crossings_)
+                        {
+                            acc = batch_.arith().hoisted_bsgs_group_sum(
+                                babies, packed, first, n1, source,
+                                plain_scale);
+                        }
+                        else
+                        {
+                            bool started = false;
+                            for (int b = 0; b < n1; ++b)
+                            {
+                                const int eps = i * n1 + b;
+                                if (eps < -(step - 1) || eps > step - 1)
+                                {
+                                    continue;
+                                }
+                                Ciphertext<Scheme::CKKS> term(context_);
+                                batch_.arith().multiply_plain(
+                                    baby[static_cast<size_t>(b)],
+                                    plain[static_cast<size_t>(first + b)],
+                                    term);
+                                if (!started)
+                                {
+                                    acc = std::move(term);
+                                    started = true;
+                                }
+                                else
+                                {
+                                    batch_.arith().add_inplace(acc, term);
+                                }
+                            }
+                        }
+
+                        // The rescale before the giant shift, exactly as the
+                        // row bridge does it: it commutes with the rotation
+                        // and takes the rotation one limb cheaper.
+                        batch_.arith().rescale_inplace(acc);
+
+                        const int g = i * n1;
+                        if (g != 0)
+                        {
+                            Ciphertext<Scheme::CKKS> moved(context_);
+                            batch_.arith().rotate_rows(acc, moved, galois_key,
+                                                       g > 0 ? g : n + g);
+                            acc = std::move(moved);
+                        }
+
+                        if (!total_started)
+                        {
+                            total = std::move(acc);
+                            total_started = true;
+                        }
+                        else
+                        {
+                            batch_.arith().add_inplace(total, acc);
+                        }
+                    }
+                }
+                if (!total_started)
+                {
+                    throw std::runtime_error(
+                        "The block transform multiplied no diagonal at all, "
+                        "which means the window and the split disagree");
+                }
+                source = std::move(total);
             }
         }
 

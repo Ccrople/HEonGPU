@@ -917,6 +917,36 @@ namespace heongpu
             }
             bool hoisted_crossings() const { return hoisted_crossings_; }
 
+            /**
+             * @brief Baby-step / giant-step over the block transform.
+             *
+             * The block map walks 2*step - 1 diagonals at shifts
+             * eps in [-(step-1), step-1], one rotation each. Splitting
+             * eps = n1*i + b turns those 2*step - 2 key switches into
+             * (n1 - 1) baby shifts of the source plus one giant shift per
+             * live group -- 62 to 14 at step = 32. The plaintext count is
+             * unchanged; a plaintext product is not what this costs.
+             *
+             * The index set is NOT a subset of block_rotation_indices():
+             * the babies {1..n1-1} and the non-negative giants are inside
+             * the +-(step-1) window, but the most negative giant is
+             * -n1*ceil((step-1)/n1), which reaches -step exactly when n1
+             * divides step. Ask block_bsgs_rotation_indices() for the set and
+             * generate keys for it, or accept that a missing key falls back
+             * to multi-hop rotation -- slower, never wrong.
+             *
+             * @param n1 baby steps; 0 or 1 turns the split off (the default),
+             *           and it must be a power of two no larger than step.
+             */
+            void set_bsgs_block_map(int n1);
+            int bsgs_block_map() const { return bsgs_block_steps_; }
+
+            /// The rotation indices a BSGS block map needs at baby count
+            /// @p n1, as positive shifts mod N/2. A superset of what the
+            /// one-rotation-per-diagonal walk needs is NOT implied: this set
+            /// is smaller except for the one giant at -step.
+            std::vector<int> block_bsgs_rotation_indices(int n1) const;
+
             // ---------------------------------------------------------------
             // The products
             // ---------------------------------------------------------------
@@ -1473,6 +1503,17 @@ namespace heongpu
 
             /// @see set_hoisted_crossings.
             bool hoisted_crossings_ = false;
+
+            /// @see set_bsgs_block_map. 0 and 1 both mean the plain walk.
+            int bsgs_block_steps_ = 0;
+
+            /// The BSGS walk of block_map, split out because the plain walk
+            /// stays as it was: same diagonals, same order of accumulation,
+            /// a different factorisation of the shifts.
+            void block_map_bsgs(std::vector<Ciphertext<Scheme::CKKS>>& ct,
+                                const std::vector<std::vector<Complex64>>& diag,
+                                const char* name,
+                                Galoiskey<Scheme::CKKS>& galois_key);
         };
 
     } // namespace llama
