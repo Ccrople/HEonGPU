@@ -1671,3 +1671,164 @@ measured 16.75 bits at logN 16 — clearing Sylph's 12-bit target and missing
    turning a shorter stretch into a shorter CHAIN, and they are worth their
    wall-time penalty only when the chain actually moves.
 4. §14.8 items 1-5 are unchanged.
+
+## 16. The crossing bottleneck, and a chain that fits the security cap (2026-08-12)
+
+Session `tworing-crossings`. Three questions from the user: what the island
+ring is, why the ledger's limb columns did not join up, and whether
+`island.to_batch` / `island.from_batch` — 38.5% of the block between them —
+can be made cheaper, "always regarding the security".
+
+### 16.1 The ledger was reporting an envelope, not a chain
+
+§13's table printed one row per leg with the **widest in and narrowest out**
+over that leg's calls. For a leg that runs once that is exact; `cross.up`
+runs eleven times, `wide.to_slots` seven and `wide.block_map` eight, at
+different points in the chain, and each appeared once at the position where
+it FIRST ran. So `island.qk` ending at 3 limbs sat directly above a
+`boot.post_qk` starting at 1, and the three legs actually in between —
+`cross.up`, a `match_scale` and `wide.to_slots` — were printed elsewhere in
+the same table.
+
+The ledger now records OCCURRENCES: every `charge` accumulates against its
+leg, every `note` closes an occurrence with exactly the time charged to that
+leg since its previous note, and the timeline prints in execution order ahead
+of the rollup. The walked total is printed against the charged total so
+nothing can go unclaimed (`0050ce0`).
+
+### 16.2 A fused crossing is DENSE, and that is the whole cost
+
+`rect_is` runs with `set_fused_crossings(true)` because `shared = 4` cannot
+afford a 3-level staged crossing. But `to_batch` composes `bridge_inv`
+(shifts = multiples of `step`), `block_inv` (shifts in `+-(step-1)`) and
+`bridge_fwd` (multiples of `step`), and **that sum covers every residue mod
+N/2**. The composed table therefore keeps all 4096 diagonals, and the
+unhoisted BSGS loop launched a `multiply_plain` and an `add` for each — per
+ciphertext, 128 of them, four crossings a block. 4.2 M launches.
+
+Any fuse touching the block map is dense for the same reason: the
+`+-(step-1)` window breaks the multiple-of-`step` lattice. This is not a
+tuning accident, it is what fusing costs.
+
+`set_hoisted_crossings(true)` on both rings (`a20dd45`) replaces that with
+one shared decomposition per source and **one fused multiply-accumulate per
+giant group**. Bit-identical — 6.39 bits before and after.
+
+### 16.3 The diagonal encode is a per-MODEL cost
+
+The 4096-diagonal plaintext table is cached on `(map, depth, prime)`, all
+four of a block's crossings run at the same depth, and every layer of a
+32-layer model runs the same two maps at the same depths. A one-block
+benchmark was charging a per-model cost to whichever crossing ran first in
+each direction — which is exactly why `to_batch` measured 9.4 s per call and
+`from_batch` 14.5 s for ONE call at the same size and level.
+
+The arithmetic said so before the instrument was built: `3X + E = 12738` and
+`X + E = 9401` give `X = 1.7 s`, `E = 7.7 s`. Charged to its own leg
+(`a3c3822`): `crossing.encode` 18,708 ms once, `to_batch` **1,614 ms per
+call**, `from_batch` **1,864 ms**.
+
+| leg | §13 | hoisted | hoisted + encode split |
+|---|---:|---:|---:|
+| `island.to_batch` (3 calls) | 28,160 | 12,738 | **4,842** |
+| `island.from_batch` (1 call) | 14,528 | 9,401 | **1,864** |
+| `wide.block_map` (8) | 11,050 | 5,895 | 5,889 |
+| `wide.from_slots` (7) | 5,960 | 4,699 | 4,646 |
+| `wide.to_slots` (7) | 4,451 | 3,609 | 3,561 |
+| `crossing.encode` | — | — | 18,708 (once per model) |
+
+**The crossing pair: 42,689 -> 6,705 ms, 6.4x.**
+
+### 16.4 Paying the 96 bits: cut Q, not P
+
+The configuration §13 measured is over the 128-bit modulus budget, and only
+on one ring:
+
+| ring | Q | P | log QP | cap | |
+|---|---|---|---:|---:|---|
+| high 2^16 | 41 + 16x33 + 3x32 + 8x60 + 4x56 = 1369 | 8x61 = 488 | **1857** | 1761 | **96 over** |
+| island 2^13 | 41 + 3x33 = 140 | 61 | **201** | 218 | OK |
+
+Two ways to pay it, and they are not equivalent:
+
+* **Cut P** (`SPECIALS` 8 -> 6, log QP 1735 OK). HEonGPU derives
+  `dnum = ceil(Q_size / P_size)`, so dnum goes 4 -> 6 and every big key goes
+  167.8 -> 239.1 MB. At 178 resident keys that is **+11.8 GiB**. Measured
+  twice on the 80 GiB A100: OOM at the first wide bridge, both times.
+* **Cut Q** (`NBASE` 16 -> 13, log QP **1758** OK). dnum stays 4, `Q_prime`
+  40 -> 37, and each key *shrinks* to 155.2 MB. The cost is the bootstrap
+  window: 17 limbs -> 14, which every stretch then has to fit.
+
+Fitting the 14-limb window took two fit degrees, and the level audit is the
+whole of it. At `NORM_DEGREE=15` the norm leg is
+`14 -> block_map 13 -> rmsnorm 5 -> scale_norm 4 -> bridge 3`, and the island
+needs 4 — one short, which the chain reports as
+`ntt.cu:2624 invalid argument` inside the QK matmul. Degree 7 gives back
+exactly that limb. The SoftMax needs the same treatment: degree-15 exp and
+reciprocal cost 12 levels against a window of 14, degree 7 costs 10.
+
+### 16.5 The measured result: faster AND more accurate
+
+Whole block, 16 <-> 13, d = 128, model 4096, 32 heads (8 KV),
+A100-SXM4-80GB.
+
+| configuration | log QP | fits cap | first block | steady state | bits |
+|---|---:|---|---:|---:|---:|
+| §13 baseline | 1857 | no | 110,856 | — | 6.39 |
+| + hoisted crossings | 1857 | no | 85,084 | — | 6.39 |
+| + encode charged apart | 1857 | no | 88,061 | 69,353 | 6.39 |
+| **NBASE 13, degree-7 fits** | **1758** | **yes** | 81,490 | **62,551** | **9.78** |
+
+**110,856 -> 62,551 ms per layer, -43.6%, +3.4 bits, inside the modulus
+budget.** The accuracy going UP with lower-degree fits is not a fluke of
+this run: shorter stretches mean fewer rescales and less accumulated noise,
+and a high-degree Chebyshev over a deliberately widened interval is itself a
+noise source — the same lesson §11 recorded when the reciprocal's range was
+found to be wrong by 98.6%.
+
+The secure block by bucket (steady state, 62,551 ms):
+
+| | ms | % |
+|---|---:|---:|
+| **Bootstrapping** (11 calls) | **31,550** | **50.4** |
+| Layout conversion | 20,054 | 32.1 |
+| Matrix products | 9,997 | 16.0 |
+| Non-linear fits | 719 | 1.1 |
+| Ring switching (22 crossings) | 176 | 0.3 |
+
+**Ring switching is 0.3%.** The two-ring structure itself is free; what it
+costs is the refreshes it enables.
+
+### 16.6 What the security cap forces, structurally
+
+`shared = 4` is not a tuning choice. The island's Q is a literal prefix of
+the big chain, so `shared = 5` is 41 + 4x33 + 61 = **234 > 218**. And
+`shared = 4` is exactly what makes V's bootstrap load-bearing: entry 4,
+projection -1, `to_batch` -1 leaves V at 2 limbs while the PV product needs
+3. That is `boot.qkv`'s third call, 2,629 ms a block. Shrinking the island's
+own P is not available either — it is the big chain's first special at 61
+bits, and method-I key-switch noise scales with Q/P.
+
+**Caveat, and it is not a small one.** log QP now satisfies
+`heongpu_128bit_std_parms`, which is the only check the library makes. That
+table assumes a **uniform ternary** secret. This driver uses
+`Secretkey(big, 192)` and, for the v2 bootstrap's dense-to-sparse switch,
+`Secretkey(big, 32)`. Sparse secrets are not covered by the table, so this
+configuration clears the modulus-budget half of 128-bit security and not the
+secret-distribution half.
+
+### 16.7 Next
+
+1. **Bootstrapping is now the block, at 50.4%** — 11 calls x 16 big
+   ciphertexts x ~164 ms. Every other bucket is under a third of it.
+2. **BSGS on `wide.block_map`** (4,909 ms, 7.8%), analysed and not built.
+   The comment at `llama3_rect.cu:348` says it needs new Galois indices; at
+   `step_h = 32` it does not. With `n1 = 8`, `eps = 8i + j` needs babies
+   `{1..7}` and giants `{+-8, +-16, +-24, +-32}`, and `build_wide()` already
+   generates `+-1..+-31` for the block map and `+-32` for the SoftMax comb.
+   Rotations per ciphertext 62 -> 14.
+3. The FFN here is `hidden = 8192` against the real 14336 (2 chunks against
+   4). The FFN legs scale per chunk; §16.5 is not directly comparable to
+   §15's single-ring 107,455 ms, which ran the full width.
+4. §15.5 items 1-3 are unchanged, and (1) is now partly done: the SoftMax
+   runs in 10 levels rather than 13, at better accuracy.
