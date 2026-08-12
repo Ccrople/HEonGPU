@@ -249,13 +249,18 @@ class Schedule
     void operator()(const char* name, int depth)
     {
         const bool refresh = std::strstr(name, "refresh") != nullptr;
+        // A budgeted drop is not a refresh -- it hands back nothing -- but it
+        // IS where the stretch behind it starts, so it resets the base the
+        // same way. Counting it as a spend instead makes the entry's 40 -> 12
+        // look like a 28-level stretch and the chain it asks for absurd.
+        const bool budgeted = std::strstr(name, "budgeted") != nullptr;
         std::cout << "[boot] " << std::setw(34) << std::left << name
                   << std::right << " depth " << std::setw(3) << depth
                   << "   limbs left " << std::setw(3) << (limbs_ - depth);
-        if (refresh)
+        if (refresh || budgeted)
         {
-            std::cout << "   REFRESH";
-            refreshes_++;
+            std::cout << (refresh ? "   REFRESH" : "   BUDGET");
+            refreshes_ += refresh ? 1 : 0;
             base_ = depth;
         }
         else
