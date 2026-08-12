@@ -688,6 +688,29 @@ namespace heongpu
             std::function<void(const char* name, int depth)> depth_trace;
 
             /**
+             * @brief Limbs to keep after the refresh at each named seam.
+             *
+             * A bootstrap hands back the same depth wherever it is taken, and
+             * a stretch almost never wants all of it. The limbs a stretch will
+             * not spend are not free to hold: METHOD_II reads its digit count
+             * from @c d_leveled[depth] and its RNS width from
+             * @c Q_prime_size - depth, so an unspent limb is carried by every
+             * key switch until the next refresh and then discarded. On this
+             * path that is hundreds of thousands of key switches per block.
+             *
+             * Called with the seam's name once the refresh is done. Returns
+             * the limbs the stretch behind it needs -- one MORE than it
+             * spends, because the next bootstrap reads a ciphertext with one
+             * prime left. Return <= 0, or leave this empty, to keep whatever
+             * the bootstrap handed back, which is the old behaviour.
+             *
+             * A budget that is too small does not corrupt anything silently:
+             * the stretch runs out and the operation that wanted the level
+             * throws. Too large is merely the default again.
+             */
+            std::function<int(const char* seam)> level_budget;
+
+            /**
              * @brief Report every seam's raw ciphertext, for debugging.
              *
              * Called alongside @c depth_trace with the SAME vector, empty by
@@ -1356,6 +1379,12 @@ namespace heongpu
             void note_depth(const char* name,
                             const std::vector<Ciphertext<Scheme::CKKS>>& ct)
                 const;
+
+            /// Ask level_budget what the stretch behind @p seam needs and drop
+            /// to it. A no-op when no budget is set, which is the default.
+            /// @see level_budget
+            void apply_level_budget(std::vector<Ciphertext<Scheme::CKKS>>& ct,
+                                    const char* seam);
 
             /// The prime the next rescale of @p ct will divide by.
             double rescale_prime(const Ciphertext<Scheme::CKKS>& ct) const;

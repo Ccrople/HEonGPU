@@ -1563,6 +1563,35 @@ namespace heongpu
             {
                 c = bootstrap(c, boot_key, relin_key);
             }
+
+            apply_level_budget(ct, name);
+        }
+
+        void Llama3RectOperator::apply_level_budget(
+            std::vector<Ciphertext<Scheme::CKKS>>& ct, const char* seam)
+        {
+            // The seam hands back a fixed depth. What the stretch behind it
+            // wants is not fixed, and the difference is not free to hold:
+            // every key switch between here and the next refresh sizes its
+            // digits and its RNS width off the ciphertext's current level.
+            if (!level_budget || ct.empty())
+            {
+                return;
+            }
+            const int keep = level_budget(seam);
+            const int total = context_.get_ciphertext_modulus_count();
+            if (keep <= 0 || keep >= total)
+            {
+                return;
+            }
+            const int target = total - keep;
+            for (auto& c : ct)
+            {
+                if (c.depth() < target)
+                {
+                    batch_.arith().drop_to_depth(c, target);
+                }
+            }
         }
 
         void Llama3RectOperator::bootstrap(RectActivation& x, const char* name,
@@ -2547,6 +2576,17 @@ namespace heongpu
             {
                 bootstrap(stream, "block.refresh_entry", *boot_key, relin_key);
                 note_depth("block.refresh_entry", stream.column);
+            }
+            else
+            {
+                // Not refreshed on the way in, so the stream arrives with
+                // whatever the block before it left -- or, standalone, with a
+                // whole fresh chain it has no use for. The norm behind it is
+                // the deepest stretch on this path and still wants a fraction
+                // of that, and the residual copy held across the sublayer
+                // comes back down to meet the sublayer's output regardless.
+                apply_level_budget(stream.column, "block.entry");
+                note_depth("block.entry_budgeted", stream.column);
             }
 
             {

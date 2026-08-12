@@ -1058,6 +1058,95 @@ int main(int argc, char* argv[])
                    c.feed_forward.silu_bound);
         }
 
+        // -------------------------------------------------------------------
+        // The level budget
+        // -------------------------------------------------------------------
+        // A refresh hands back the same depth wherever it is taken, and only
+        // ONE of this block's seven stretches wants all of it. The rest carry
+        // the unspent limbs through every key switch behind them -- METHOD_II
+        // reads its digit count from d_leveled[depth] and its RNS width from
+        // Q_prime_size - depth, so an unspent limb is paid for at each of the
+        // hundreds of thousands of key switches in the stretch and then
+        // thrown away at the next seam.
+        //
+        // Every stretch below is derived from the same configuration the
+        // circuit runs on -- the crossing mode and the degrees calibration
+        // just chose -- so the depth ledger printed after the run is the
+        // check on it: each stretch must land on exactly one limb left.
+        if (EnvFlag("HEONGPU_BOOT_LEVEL_AWARE", false))
+        {
+            using heongpu::llama::chebyshev_levels;
+
+            const int cx_slot = fused_crossings ? 1 : 2;  // RECT <-> SLOT
+            const int cx_batch = fused_crossings ? 1 : 3; // RECT <-> BATCH
+            const int cx_bridge = 1;                      // BATCH <-> SLOT
+
+            // square + blocked mask + the fit + the rescale product.
+            const int l_norm =
+                2 + chebyshev_levels(c.attention_norm.degree) + 1;
+            // exp + causal mask + square + reciprocal + normalise product.
+            const int l_soft =
+                chebyshev_levels(c.attention.softmax.exp_degree) + 2 +
+                chebyshev_levels(c.attention.softmax.inverse_degree) + 1;
+            // The fit, plus its own affine map unless that rode in on the
+            // gate weight. The gate product is counted where it happens.
+            const bool silu_folded =
+                c.feed_forward.fold_silu_domain_into_gate &&
+                c.feed_forward.silu_bound > 0.0;
+            const int l_silu = chebyshev_levels(c.feed_forward.silu_degree) +
+                               (silu_folded ? 0 : 1);
+
+            const bool act_seam = c.feed_forward.refresh_activation;
+
+            // The stretches, in the order the block walks them.
+            const int s_norm = cx_slot + l_norm + cx_slot;
+            const int s_qk = 1 + cx_batch + 1 + cx_bridge;
+            const int s_pv = cx_bridge + 1 + cx_batch + 1 + 1;
+            const int s_swiglu =
+                1 + cx_slot + l_silu + (act_seam ? 0 : 1);
+            const int s_down = cx_slot + 1 + 1;
+
+            // One limb MORE than the stretch spends: a bootstrap reads a
+            // ciphertext with one prime left. The margin is a knob because a
+            // budget that is too small throws rather than lying, and this is
+            // how such a thing gets chased without a rebuild.
+            const int margin = EnvInt("HEONGPU_BOOT_LEVEL_MARGIN", 0);
+            const auto budget = [&](const char* seam) -> int
+            {
+                const std::string s(seam);
+                int need = 0;
+                if (s == "block.entry" || s == "block.refresh_mid")
+                    need = s_norm;
+                else if (s == "block.refresh_attention_norm")
+                    need = s_qk;
+                else if (s == "attention.refresh_post_qk")
+                    need = l_soft;
+                else if (s == "attention.refresh_post_softmax" ||
+                         s == "attention.refresh_value")
+                    need = s_pv;
+                else if (s == "block.refresh_feed_forward_norm")
+                    need = s_swiglu;
+                else if (s == "ffn.refresh_activation")
+                    need = 1 + cx_slot + 1 + 1;
+                else if (s == "ffn.refresh_hidden")
+                    need = s_down;
+                else
+                    return 0; // an unnamed seam keeps what it was handed
+                return need + 1 + margin;
+            };
+            op.level_budget = budget;
+
+            std::cout << "[boot] level budget    : entry/mid " << budget("block.entry")
+                      << ", post-norm " << budget("block.refresh_attention_norm")
+                      << ", post-QK " << budget("attention.refresh_post_qk")
+                      << ", post-softmax " << budget("attention.refresh_post_softmax")
+                      << ", post-FFN-norm "
+                      << budget("block.refresh_feed_forward_norm")
+                      << ", hidden " << budget("ffn.refresh_hidden")
+                      << " limbs (was " << limbs - 25 << " everywhere)"
+                      << std::endl;
+        }
+
         const bool refreshed = EnvFlag("HEONGPU_BOOT_REFRESHED", true);
         std::cout << "[boot] refreshes       : " << c.refresh.count()
                   << " seams, norm scale "
