@@ -234,6 +234,12 @@ struct TwoRing
 {
     // Shapes.
     int logn_hi, logn_is, d, k, d_wide, step_h, shared;
+    // Which big-ring rotation groups to key ("all", "attention", "ffn",
+    // "norm"): the full union (~127 keys) plus the v2 boot matrices plus
+    // the island's 4095 Alg-5 keys exceeds a 48 GiB card, but each
+    // sublayer's own subset fits -- attention never runs the block map,
+    // the norm/ffn paths never run the softmax comb.
+    std::string keyset = "all";
     std::size_t n_hi;
     int n_is;
     double scale;
@@ -257,6 +263,29 @@ struct TwoRing
     std::unique_ptr<heongpu::Galoiskey<S>> boot_galois;
     std::unique_ptr<heongpu::Secretkey<S>> sparse;
     std::unique_ptr<heongpu::Switchkey<S>> swk_d2s, swk_s2d;
+
+    // Pool-shaping reserve: carved out of the RMM pool before any key
+    // generation and released after, so the thousands of keygen transients
+    // fragment the region AROUND it and the runtime inherits a contiguous
+    // block instead of a shredded freelist.
+    void* reserve_ = nullptr;
+    std::size_t reserve_bytes_ = 0;
+
+    void take_reserve(std::size_t bytes)
+    {
+        reserve_bytes_ = bytes;
+        reserve_ = heongpu::MemoryPool::instance().allocate(bytes);
+    }
+
+    void release_reserve()
+    {
+        if (reserve_ != nullptr)
+        {
+            heongpu::MemoryPool::instance().deallocate(reserve_,
+                                                       reserve_bytes_);
+            reserve_ = nullptr;
+        }
+    }
 
     // Island ring.
     heongpu::HEContext<S> island{nullptr};
@@ -323,6 +352,8 @@ struct TwoRing
             big->generate(pool_cfg);
         }
         PrintFree("big context generated (pool grabbed)");
+        take_reserve(std::size_t(EnvInt("HEONGPU_TB_RESERVE_GB", 8)) << 30);
+        PrintFree("runtime reserve carved");
 
         keygen = std::make_unique<heongpu::HEKeyGenerator<S>>(big);
         secret = std::make_unique<heongpu::Secretkey<S>>(big, 192);
@@ -378,6 +409,13 @@ struct TwoRing
         step_h = layout_wide.k / 2;
         wide = std::make_unique<heongpu::llama::Llama3BatchOperator>(
             big, *encoder_hi, layout_wide, scale);
+        // One diagonal set resident at a time: a set is d_wide plaintexts
+        // of N words per live limb -- 4.3 GiB at l = 1 and linear in the
+        // level -- so holding the up and down sets together is what
+        // exhausts the pool at 2^16. Whole-set eviction costs re-encodes,
+        // never correctness.
+        wide->set_bridge_plain_capacity(
+            std::size_t(EnvInt("HEONGPU_TB_BRIDGE_SETS", 1)));
         // The wide-layout rect operator supplies block_map: a RECT stream's
         // coefficients are raw (not interpolated), so its crossing is the
         // row bridge PLUS the block transform, exactly as on the island.
@@ -390,6 +428,10 @@ struct TwoRing
         const int n2 = d_wide / n1;
         const int slots = int(n_hi) / 2;
 
+        const bool want_comb = (keyset == "all" || keyset == "attention");
+        const bool want_norm_ffn = (keyset == "all" || keyset == "ffn" ||
+                                    keyset == "norm");
+
         std::vector<int> shifts;
         for (int j = 1; j < n1; ++j)
             shifts.push_back(j * step_h);
@@ -397,22 +439,26 @@ struct TwoRing
             shifts.push_back(i * n1 * step_h);
         // Key-axis comb for the SoftMax denominator: rotate by step_h*2^i
         // forward for the sliding sum, backward to fan the total out.
-        for (int s = step_h; s < step_h * k; s <<= 1)
+        if (want_comb)
+            for (int s = step_h; s < step_h * k; s <<= 1)
+            {
+                shifts.push_back(s);
+                shifts.push_back(slots - s);
+            }
+        if (want_norm_ffn)
         {
-            shifts.push_back(s);
-            shifts.push_back(slots - s);
-        }
-        // Blocked reduction (sum_blocked) for RMSNorm at span step_h*k.
-        for (int s = 1; s < step_h * k; s <<= 1)
-        {
-            shifts.push_back(s);
-            shifts.push_back(slots - s);
-        }
-        // The wide block map walks the whole batch axis: +-1..+-(step_h-1).
-        for (int s = 1; s < step_h; ++s)
-        {
-            shifts.push_back(s);
-            shifts.push_back(slots - s);
+            // Blocked reduction (sum_blocked) for RMSNorm at span step_h*k.
+            for (int s = 1; s < step_h * k; s <<= 1)
+            {
+                shifts.push_back(s);
+                shifts.push_back(slots - s);
+            }
+            // The wide block map walks the batch axis: +-1..+-(step_h-1).
+            for (int s = 1; s < step_h; ++s)
+            {
+                shifts.push_back(s);
+                shifts.push_back(slots - s);
+            }
         }
         std::sort(shifts.begin(), shifts.end());
         shifts.erase(std::unique(shifts.begin(), shifts.end()), shifts.end());
@@ -447,7 +493,9 @@ struct TwoRing
         return wide_from_slots(slot_cts);
     }
 
-    void build_island()
+    // keys: 2 = the full Alg-5 rectangular set (4095 at 2^13), 1 = the
+    // batch CMT set alone (d-1 = 127, all the CCMM path needs), 0 = none.
+    void build_island(int key_level = 2)
     {
         island = heongpu::GenHEContext<S>(heongpu::sec_level_type::none);
         {
@@ -483,14 +531,30 @@ struct TwoRing
         batch_is = std::make_unique<heongpu::llama::Llama3BatchOperator>(
             island, *encoder_is, layout, scale);
 
-        std::vector<int> shifts = rect_is->rotation_indices();
-        galois_is = std::make_unique<heongpu::Galoiskey<S>>(island, shifts);
-        keygen_is->generate_galois_key(*galois_is, pair->small);
-        relin_is = std::make_unique<heongpu::Relinkey<S>>(island);
-        keygen_is->generate_relin_key(*relin_is, pair->small);
-        std::cout << "[tb] island keys: " << shifts.size()
-                  << " Galois indices + relin (method I, " << shared
-                  << " limbs)" << std::endl;
+        if (key_level > 0)
+        {
+            heongpu::BatchMatrixLayout layout_is(n_is, d);
+            std::vector<int> shifts =
+                (key_level == 2)
+                    ? rect_is->rotation_indices()
+                    : heongpu::get_batch_cmt_rotation_indices(layout_is);
+            galois_is =
+                std::make_unique<heongpu::Galoiskey<S>>(island, shifts);
+            keygen_is->generate_galois_key(*galois_is, pair->small);
+            relin_is = std::make_unique<heongpu::Relinkey<S>>(island);
+            keygen_is->generate_relin_key(*relin_is, pair->small);
+            std::cout << "[tb] island keys: " << shifts.size()
+                      << " Galois indices + relin (method I, " << shared
+                      << " limbs, "
+                      << (key_level == 2 ? "Alg-5 set" : "CMT set only")
+                      << ")" << std::endl;
+        }
+        else
+        {
+            std::cout << "[tb] island: contexts + ring switch only (no "
+                         "product keys)"
+                      << std::endl;
+        }
     }
 
     // ---- Seam 1: island columns -> big SinC ciphertexts. --------------
@@ -669,6 +733,10 @@ int main()
 
     const bool unit_stage = (stage == "softmax" || stage == "rmsnorm");
     const bool with_boot = !unit_stage;
+    tr.keyset = (stage == "attention" || stage == "attnseam")   ? "attention"
+                : (stage == "ffn" || stage == "ffnseam")        ? "ffn"
+                : (stage == "norm")                             ? "norm"
+                                                                : "all";
 
     std::cout << "[tb] two-ring block: high 2^" << logn_hi << " / island 2^"
               << logn_is << " (k = " << tr.k << "), d = " << d
@@ -697,9 +765,18 @@ int main()
     vram("after wide ops+keys");
     if (!unit_stage)
     {
-        tr.build_island();
+        // The Alg-5 rectangular key set (4095 at 2^13) is only needed by
+        // project(); the seam stages price the crossings, the refresh and
+        // the non-linears, whose island side is the CMT set alone.
+        const int key_level = (stage == "norm") ? 0
+                              : (stage == "attnseam" || stage == "ffnseam")
+                                  ? 1
+                                  : 2;
+        tr.build_island(key_level);
         vram("after island");
     }
+    tr.release_reserve();
+    vram("reserve released (runtime region freed)");
 
     std::mt19937_64 rng(20260810u);
     const int slots_hi = int(tr.n_hi) / 2;
@@ -1078,7 +1155,10 @@ int main()
     // holds exactly two small sets (l=2 up, l=5 down) instead of the
     // ~8.6 GiB a single high-level set costs. Only the 63-diagonal block
     // map runs high.
-    const int FROM_L = 5;
+    // The bridge needs one level for its own product, so l = 2 is the
+    // floor -- and a diagonal set's size is linear in the live limbs, so
+    // the floor is also the cheapest set.
+    const int FROM_L = EnvInt("HEONGPU_TB_FROM_L", 2);
     auto drop_big_to = [&](std::vector<Ct>& cts, int l) {
         for (auto& c : cts)
             while (tr.L_hi - c.depth() > l)
@@ -1100,8 +1180,11 @@ int main()
                              RectActivation& skip) {
         std::vector<Ct> big = tr.ascend(x.column);
         drop_big_to(big, 2);
+        PrintFree("norm: ascended+dropped");
         std::vector<Ct> slots = tr.wide_to_slots(big); // l = 1
-        tr.refresh(slots, "norm");                     // boot -> 17
+        PrintFree("norm: to_slots done (bridge set built)");
+        tr.refresh(slots, "norm"); // boot -> 17
+        PrintFree("norm: 16 boots done");
 
         // The skip copy: the raw bridged slots go straight back down --
         // from_slots(to_slots(x)) is the identity, so this IS the
@@ -1115,12 +1198,14 @@ int main()
             skip.groups = 1;
             skip.channels = model;
         }
+        PrintFree("norm: skip descended (from set built)");
 
         // The block map completes the RECT crossing at the top.
         ledger.charge("wide.block_map", [&]() {
             tr.wide_rect->block_map(slots, true, "wide.block_inverse",
                                     *tr.galois_hi);
         });
+        PrintFree("norm: block map applied");
 
         heongpu::llama::Llama3Operator::RMSNormConfig cfg;
         cfg.stride = slots_hi;
@@ -1148,6 +1233,7 @@ int main()
             slots = tr.arith_hi->rms_norm(slots, weights, cfg, *tr.galois_hi,
                                           *tr.relin_hi);
         });
+        PrintFree("norm: rms_norm done");
         // The norm's multiplies drifted the scale; everything the normed
         // stream feeds (projections -> to_batch -> the next boots)
         // preserves scale, so normalize once here.
@@ -1422,6 +1508,7 @@ int main()
                         tr.rect_is->arith().add_inplace(acc.column[j],
                                                         part.column[j]);
                 });
+            PrintFree("after ffn chunk");
         }
         return acc;
     };
@@ -1578,6 +1665,214 @@ int main()
         attn_sub_host = HostMatmul(ctx, d, model, wo, model);
     }
 
+    if (stage == "attnseam")
+    {
+        // The attention SEAMS at the real shape: QK, the ascent, the wide
+        // bridge, the v2 refresh, the wide SoftMax, the descent and PV --
+        // everything the two-ring structure introduces. The Alg-5
+        // projections around them are excluded (their cost is a separate,
+        // already-measured product) so the island needs only the CMT keys
+        // and the leg fits one card.
+        const double amp = 1.0 / std::sqrt(double(d));
+        std::vector<std::vector<double>> qh(heads), kh(heads), vh(heads);
+        for (int h = 0; h < heads; ++h)
+        {
+            qh[h] = RandomMatrix(std::size_t(d) * d, amp, rng);
+            kh[h] = RandomMatrix(std::size_t(d) * d, amp, rng);
+            vh[h] = RandomMatrix(std::size_t(d) * d, amp, rng);
+        }
+        BatchActivation qb =
+            tr.batch_is->encrypt(qh, d, d, *tr.encryptor_is, tr.scale);
+        BatchActivation kb =
+            tr.batch_is->encrypt(kh, d, d, *tr.encryptor_is, tr.scale);
+        BatchActivation vb =
+            tr.batch_is->encrypt(vh, d, d, *tr.encryptor_is, tr.scale);
+
+        // Host scores, conditioning and reference (same recipe as the
+        // full path: fold the exp domain map into Q on the host).
+        std::vector<double> sc(std::size_t(heads) * d * d);
+        double s_lo = 1e30, s_hi = -1e30;
+        for (int h = 0; h < heads; ++h)
+            for (int u = 0; u < d; ++u)
+                for (int j = 0; j < d; ++j)
+                {
+                    double s = 0.0;
+                    for (int m = 0; m < d; ++m)
+                        s += qh[h][std::size_t(u) * d + m] *
+                             kh[h][std::size_t(j) * d + m];
+                    sc[(std::size_t(h) * d + u) * d + j] = s;
+                    s_lo = std::min(s_lo, s);
+                    s_hi = std::max(s_hi, s);
+                }
+        const double shift = -s_hi;
+        const double bound = (s_hi - s_lo) * 2.5;
+        const bool causal2 = EnvInt("HEONGPU_TB_CAUSAL", 1) != 0;
+        std::vector<double> ph(sc.size());
+        double dlo = 1e30, dhi = 0.0;
+        for (int h = 0; h < heads; ++h)
+            for (int u = 0; u < d; ++u)
+            {
+                double den = 0.0;
+                for (int j = 0; j < d; ++j)
+                {
+                    const bool live = !causal2 || j <= u;
+                    const double e =
+                        live ? std::exp(sc[(std::size_t(h) * d + u) * d + j] +
+                                        shift)
+                             : 0.0;
+                    ph[(std::size_t(h) * d + u) * d + j] = e;
+                    den += e;
+                }
+                const double dc =
+                    causal2 ? den * double(d) / double(u + 1) : den;
+                dlo = std::min(dlo, dc);
+                dhi = std::max(dhi, dc);
+                for (int j = 0; j < d; ++j)
+                    ph[(std::size_t(h) * d + u) * d + j] /= den;
+            }
+
+        BatchActivation kt, scores;
+        ledger.charge("island.qk", [&]() {
+            kt = tr.batch_is->transpose(kb, "seam.kt", *tr.galois_is);
+            scores = tr.batch_is->matmul(qb, kt, "seam.qk", *tr.galois_is,
+                                         *tr.relin_is);
+        });
+        ledger.charge("scale_norm", [&]() {
+            for (auto& c : scores.column)
+                tr.rect_is->arith().match_scale(c, tr.scale);
+        });
+        std::vector<Ct> sbig = tr.ascend(scores.column);
+        drop_big_to(sbig, 2);
+        std::vector<Ct> sslots = tr.wide_to_slots(sbig);
+        tr.refresh(sslots, "post_qk");
+        PrintFree("attnseam: after boot");
+        ledger.charge("softmax", [&]() {
+            const double a =
+                heongpu::llama::Llama3Operator::domain_scale(-bound, 0.0);
+            // The domain scale rides Q on the real path; here the scores
+            // arrive unfolded, so apply the whole affine map as one free
+            // constant plus the fit's own pre-scale.
+            for (auto& c : sslots)
+            {
+                tr.arith_hi->multiply_vector(
+                    c, std::vector<double>(std::size_t(slots_hi), a));
+                tr.arith_hi->add_constant(c, a * shift);
+            }
+            std::vector<std::vector<double>> masks;
+            if (causal2)
+                for (int gi = 0; gi < nct_wide; ++gi)
+                    masks.push_back(WideCausalMask(tr, gi, d));
+            wide_softmax(sslots, bound, EnvInt("HEONGPU_TB_EXP_DEGREE", 15),
+                         EnvInt("HEONGPU_TB_INV_DEGREE", 15), dlo, dhi, masks,
+                         /*pre_scaled=*/true);
+        });
+        if (check)
+        {
+            double e = 0.0;
+            for (int g = 0; g < nct_wide; ++g)
+            {
+                heongpu::Plaintext<S> Pr(tr.big);
+                tr.decryptor_hi->decrypt(Pr, sslots[g]);
+                std::vector<double> got;
+                tr.encoder_hi->decode(got, Pr);
+                for (int b = 0; b < tr.step_h && b < heads; ++b)
+                    for (int u = 0; u < d; ++u)
+                        for (int jp = 0; jp < tr.k; ++jp)
+                            e = std::max(
+                                e, std::abs(got[tr.wide_slot(b, u, jp)] -
+                                            ph[(std::size_t(b) * d + u) * d +
+                                               g * tr.k + jp]));
+            }
+            std::cout << "[tb] wide softmax(P) max abs error "
+                      << std::scientific << std::setprecision(3) << e
+                      << std::defaultfloat << std::endl;
+        }
+        std::vector<Ct> pbig = from_slots_low(sslots);
+        std::vector<Ct> pcols = tr.descend(pbig, shared);
+        BatchActivation P, V2;
+        P.rows = d;
+        P.column = std::move(pcols);
+        V2.rows = d;
+        V2.column = std::move(vb.column);
+        BatchActivation outb;
+        ledger.charge("island.pv", [&]() {
+            int depth = 0;
+            for (auto& c : P.column)
+                depth = std::max(depth, c.depth());
+            for (auto& c : V2.column)
+                depth = std::max(depth, c.depth());
+            for (auto& c : P.column)
+                tr.rect_is->arith().drop_to_depth(c, depth);
+            for (auto& c : V2.column)
+                tr.rect_is->arith().drop_to_depth(c, depth);
+            outb = tr.batch_is->matmul(P, V2, "seam.pv", *tr.galois_is,
+                                       *tr.relin_is);
+        });
+        if (check)
+        {
+            const auto got = tr.batch_is->decrypt(
+                outb, *tr.decryptor_is, outb.column.front().scale());
+            double e = 0.0;
+            for (int h = 0; h < heads && h < int(got.size()); ++h)
+                for (int u = 0; u < d; ++u)
+                    for (int m = 0; m < d; ++m)
+                    {
+                        double want = 0.0;
+                        for (int j = 0; j < d; ++j)
+                            want += ph[(std::size_t(h) * d + u) * d + j] *
+                                    vh[h][std::size_t(j) * d + m];
+                        e = std::max(
+                            e, std::abs(got[h][std::size_t(u) * d + m] - want));
+                    }
+            std::cout << "[tb] attention seam (PV) max abs error "
+                      << std::scientific << std::setprecision(3) << e
+                      << std::defaultfloat << std::endl;
+        }
+        ledger.print("attention seams (QK, cross, boot, softmax, PV)");
+        return 0;
+    }
+
+    if (stage == "norm")
+    {
+        // One full norm leg at the real shape: ascend, cheap-side bridge,
+        // v2 boot, block map, RMSNorm, match, block map, bridge, descend --
+        // plus the skip copy. This is the B0/B2 building block, measured
+        // standalone because the monolithic block's keys + boot matrices
+        // exceed the shared card.
+        RectActivation x0 = tr.rect_is->encrypt(x_plain, model,
+                                                *tr.encryptor_is, tr.scale);
+        double s_lo = 1e30, s_hi = 0.0;
+        for (int u = 0; u < d; ++u)
+        {
+            double s = 0.0;
+            for (int c = 0; c < model; ++c)
+            {
+                const double v = x_plain[std::size_t(u) * model + c];
+                s += v * v;
+            }
+            s_lo = std::min(s_lo, s);
+            s_hi = std::max(s_hi, s);
+        }
+        RectActivation normed, skip;
+        wide_rms_norm(x0, gain1, 0.8 * s_lo, 1.2 * s_hi, normed, skip);
+        if (check)
+        {
+            const auto want = HostRmsNorm(x_plain, d, model, gain1, eps_norm);
+            const auto got = tr.rect_is->decrypt(
+                normed, *tr.decryptor_is, normed.column.front().scale());
+            std::cout << "[tb] norm leg max abs error " << std::scientific
+                      << std::setprecision(3) << MaxAbsDiff(got, want)
+                      << std::defaultfloat << std::endl;
+            const auto got_skip = tr.rect_is->decrypt(
+                skip, *tr.decryptor_is, skip.column.front().scale());
+            std::cout << "[tb] skip copy max abs error " << std::scientific
+                      << std::setprecision(3) << MaxAbsDiff(got_skip, x_plain)
+                      << std::defaultfloat << std::endl;
+        }
+        ledger.print("norm leg (one refresh + norm, 16 big cts)");
+        return 0;
+    }
+
     if (stage == "attention" || stage == "block")
     {
         RectActivation x0 = tr.rect_is->encrypt(x_plain, model,
@@ -1603,9 +1898,11 @@ int main()
             RectActivation normed, skip;
             wide_rms_norm(stream, gain1, 0.8 * s_lo, 1.2 * s_hi, normed,
                           skip);
+            PrintFree("after norm1");
 
             attn_out = run_attention(normed, wq, wk, wv, wo, score_shift,
                                      score_bound, den_lo, den_hi, causal);
+            PrintFree("after attention");
             ledger.charge("residual", [&]() {
                 stream.column = tr.rect_is->arith().residual_add(
                     skip.column, attn_out.column);

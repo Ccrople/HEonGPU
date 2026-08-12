@@ -658,6 +658,27 @@ namespace heongpu
                 bridge_plain_.clear();
             }
 
+            /// Encoded diagonal sets kept at once. @see bridge_plain_. A set
+            /// is d plaintexts of N words per live limb, so at a big ring it
+            /// is the largest single allocation the bridge makes: 4.3 GiB at
+            /// (N = 65536, d = 1024, one limb), linear in the level. Holding
+            /// both directions resident is what exhausts a device pool
+            /// there; one costs a re-encode per direction change and never
+            /// changes a result.
+            void set_bridge_plain_capacity(std::size_t sets)
+            {
+                if (sets == 0)
+                {
+                    throw std::invalid_argument(
+                        "The bridge needs room for at least one diagonal set");
+                }
+                bridge_plain_capacity_ = sets;
+                while (bridge_plain_.size() > bridge_plain_capacity_)
+                {
+                    bridge_plain_.erase(bridge_plain_.begin());
+                }
+            }
+
             /**
              * @brief Hoist the bridge's rotation trains.
              *
