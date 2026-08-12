@@ -1196,6 +1196,60 @@ TEST(HEonGPU, CKKS_Llama3Rect_RefreshPreservesTheRectangularEncoding)
     EXPECT_LT(worst, 5e-2);
 }
 
+// A refresh hands back the same depth wherever it is taken, and a stretch
+// almost never wants all of it. level_budget is asked, per seam, what the
+// stretch behind it needs; the limbs it does not ask for are dropped, because
+// METHOD_II carries them through every key switch until the next refresh. The
+// values have to survive the drop -- discarding a top limb is exact, and this
+// is the test that says so rather than assuming it.
+TEST(HEonGPU, CKKS_Llama3Rect_LevelBudgetDropsToTheStretchAndKeepsTheValues)
+{
+    BootFixture fx(31);
+    const int channels = fx.half();
+
+    const std::vector<double> x =
+        random_matrix(BootFixture::d, channels, 60607u);
+
+    heongpu::llama::RectActivation full =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+    fx.op->bootstrap(full, "test.refresh", *fx.galois, *fx.relin);
+    const int handed_back = fx.limbs - full.column.front().depth();
+    ASSERT_GT(handed_back, 3) << "nothing to budget against";
+
+    // Two limbs fewer than the seam offered, asked for by name.
+    const int keep = handed_back - 2;
+    std::string asked;
+    heongpu::llama::RectActivation budgeted =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+    fx.op->level_budget = [&](const char* seam)
+    {
+        asked = seam;
+        return keep;
+    };
+    fx.op->bootstrap(budgeted, "test.budgeted", *fx.galois, *fx.relin);
+    fx.op->level_budget = nullptr;
+
+    EXPECT_EQ(asked, "test.budgeted") << "the seam names itself to the budget";
+    EXPECT_EQ(fx.limbs - budgeted.column.front().depth(), keep);
+
+    // A seam that asks for nothing keeps what it was handed: the hook is
+    // additive, and an empty or zero budget is the old behaviour exactly.
+    heongpu::llama::RectActivation untouched =
+        fx.op->encrypt(x, channels, *fx.encryptor, fx.scale);
+    fx.op->level_budget = [](const char*) { return 0; };
+    fx.op->bootstrap(untouched, "test.zero", *fx.galois, *fx.relin);
+    fx.op->level_budget = nullptr;
+    EXPECT_EQ(fx.limbs - untouched.column.front().depth(), handed_back);
+
+    const std::vector<double> got = fx.op->decrypt(
+        budgeted, *fx.decryptor, budgeted.column.front().scale());
+    const double worst = worst_diff(x, got);
+    std::cout << "rect level budget: handed back " << handed_back
+              << " limbs, kept " << keep << ", worst error " << worst
+              << std::endl;
+    EXPECT_LT(worst, 5e-2);
+}
+
 // The same claim for the encoding Algorithm 4 consumes. The crossing on either
 // side of the refresh is itself lossy, so this is checked against a run of the
 // same crossings WITHOUT a refresh between them: what is being measured is the
