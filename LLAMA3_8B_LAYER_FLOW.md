@@ -2198,3 +2198,197 @@ removes work (one `match_scale` per ciphertext) and adds none.
 **E1 alone frees no boot.** It is one of the four preconditions in §18.1; E2,
 S1, `shared = 5` and `P <= 45` are still needed together. The next step is E2,
 which is a host-side weight fold and needs no library change at all.
+
+---
+
+## 25. B = 1 on Bae's PCMM: the product stops being a key-switch problem and becomes a GEMM (2026-08-13)
+
+Branch `HEonGPU_LLama3_8B_nobatch_baepcmm`, forked from
+`origin/HEonGPU_LLama3_8B_nobatch` @ `209e42d`. New module
+`src/include/heongpu/host/ckks/baepcmm.cuh` + `src/lib/host/ckks/baepcmm.cu`
+plus its kernels; `test/test_ckks_baepcmm.cpp` (11 tests, **11/11 green**,
+Sicily GPU 2); `benchmark/profile_baepcmm.cpp`.
+
+**Bae, Cheon, Hanrot, Park, Stehlé, CRYPTO 2024, eprint 2024/1284.** Read end
+to end, and the first thing to say is that it is *not another packing*.
+
+### 25.1 It is an identity about `(a, b)`, not an encoding
+
+Lemma 3: for `u, s, v, w` in `R_{q,N}`,
+
+    u*s + v = w   <=>   Vec(u)*Toep(s) + Vec(v) = Vec(w)
+
+with `Vec` the raw coefficient **row** vector and `Toep(s)` the negacyclic
+Toeplitz matrix whose row `i` is `Vec(X^i * s)`. So decryption of a *stack* of
+ciphertexts is literally a matrix identity over `Z_q`:
+
+    A*Toep(sk) + B = M      =>      (UA)*Toep(sk) + (UB) = UM
+
+where `A` and `B` are the ciphertexts' own a-part and b-part coefficient
+arrays. `(UA, UB)` is already a valid ciphertext stack for `U*M`. **The
+product is two dense GEMMs on the ciphertext limbs.** The plaintext `U` is
+never encoded, never NTT'd, never encrypted — it is an integer matrix.
+
+Counted against Algorithm 5, whose own doc comment says it "needs N/2 of them
+per call, one per intermediate column":
+
+| | rotations | Galois keys | relin | levels |
+|---|---:|---:|---:|---:|
+| Kang Algorithm 5 | `N/2` per call | **2047** at logN 12 | 0 | 1 |
+| Bae Algorithm 1/2 | **0** | **0** | 0 | 1 |
+
+The word `Galois` does not occur in the paper. Neither does `automorphism`,
+`monomial` or `relinear`. That absence is the result.
+
+### 25.2 The one shape parameter, and it decides everything
+
+Write `U (d1 x d2)` times encrypted `M (d2 x d3)`. Then
+
+    b-part GEMM   d1 x d2 x d3
+    a-part GEMM   d1 x d2 x N        <- does NOT shrink with d3
+
+so with `k = N/d3`, **cost per column = `d1*d2*(k+1)`**. And `d3` is the
+**column count of the encrypted matrix**, which in a transformer is the
+**token axis** — because `U` is the weight and must act on the channel axis,
+so channels are the *rows*. Right-multiplication is not available: `Toep(sk)`
+sits on the right of the identity and does not commute past a right factor.
+
+Cost model per 8B block, per RNS limb (`benchmark/profile_baepcmm`, exact
+arithmetic, no hardware in it):
+
+| tokens `d3` | `k` | Bae key switches | Alg 5 key switches | Bae MACs | Alg 5 MACs |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 32 | 43,008 | 117,450 | 9.21e11 | 1.16e11 |
+| 4096 | **1** | **0** | 3,758,400 | 1.79e12 | 3.71e12 |
+
+**At the current path's 128 tokens Bae is 2.7x fewer key switches and 7.9x
+more arithmetic. At 4096 tokens it is ZERO key switches and 2.1x LESS
+arithmetic.** Per token the product is 16.5x cheaper at `k = 1` than at
+`k = 32`; measured wall clock on an idle GPU 2 makes it **121x**, because the
+narrow shape is also launch-bound at `N = 4096` — the same effect §15.2
+recorded for the crossings.
+
+`k = 1` is not a special case, it is *the* case: there ModDecomp and ModPack
+are both the identity and nothing but the two GEMMs remains.
+
+### 25.3 So: is there a layout conversion at B = 1? Yes, and the answer has two halves
+
+**Between projections: none.** Bae's output encoding is bit-for-bit its input
+encoding, so `Q/K/V` and `gate/up/down` chain with no conversion. *Measured*,
+`BaePcmm.ProductChainsWithNoConversion`: two projections back to back,
+decrypted against a host reference. This matches Algorithm 5, which also
+chains free (§4). **Neither product is where the conversions come from.**
+
+**At every seam to something that is not a projection: yes — and they are the
+seams the rect path already has, because the PCMM never caused them.** The
+B = 1 rect block's inventory, re-read on this branch:
+
+| crossing | where | levels |
+|---|---|---:|
+| `RECT -> SLOT` | both RMSNorms; FFN gate and up | 2 staged, 1 fused |
+| `SLOT -> RECT` | both RMSNorms; FFN hidden | 2 staged, 1 fused |
+| `RECT -> BATCH` | attention, on Q, K and V | 3 staged, 1 fused |
+| `BATCH -> RECT` | attention, after the value product | 3 staged, 1 fused |
+| `BATCH -> SLOT` | scores, before the SoftMax | 1 |
+| `SLOT -> BATCH` | P, before the value product | 1 |
+| CMT transpose | `K^T` | **0** |
+| **projection** | **`RECT -> RECT`, Algorithm 5** | **0** |
+
+Those exist because **the non-linear layers want CKKS slots and Kang's
+Algorithm 4 CCMM wants the BATCH/SinC encoding**, and neither is the encoding
+the projection runs in. Swapping the PCMM removes none of them.
+
+What it *does* do is **change which encoding the projection runs in**, so each
+seam has to cross something different. Kang's RECT holds `(token i, channel
+t*d+j)` at coefficient `i + d*t` of ciphertext `j`; Bae holds channel `r` in
+ciphertext `r` and token `t` at coefficient `t`. Both are coefficient
+encodings of the same matrix and they differ by a transpose plus a
+regrouping — so **the crossings are not the same crossings**, and Bae's are:
+
+* **to the non-linear layers:** coefficient -> slot, i.e. exactly
+  CoeffToSlot. This is the crossing **MaMBo is built to absorb**, and §5
+  recorded that the *Kang* path cannot absorb its crossing into a bootstrap
+  ("a Kang matrix entry is an `R_k` **slot**, not a coefficient"). Bae has no
+  such obstruction because everything is coefficients. Largest structural
+  advantage of the whole construction, and **not implemented here**.
+* **to Kang's Algorithm 4 CCMM:** `Q K^T` and `P V` are ciphertext-ciphertext
+  and Bae offers nothing for them — the paper says outright "we will not use
+  ciphertext-ciphertext multiplication". So a Bae/Kang hybrid pays a
+  coefficient -> BATCH crossing at the attention seam that neither paper
+  prices. **Not implemented, and it is the real integration cost.**
+
+### 25.4 B = 1 against B = 16, now that both products are priced
+
+§24 established that on the *Kang* path the batch **is** the security
+parameter: `batch = k/2`, `d = head_dim = 128`, so `N = 256*batch`, and
+per-input cost is **flat** in the batch. Bae inverts that.
+
+* Kang's batch PCMM (Algorithm 1) at B = 16 is already **zero key switches**
+  (§20.2), so on key switching there is nothing left for Bae to win. The
+  batch-16 path's cost is the **row bridge** — 88.3% of its key switches — and
+  that is a *conversion*, not a product.
+* Bae's cost falls as `d3 = tokens x batch` grows, and **tokens and batch are
+  interchangeable in `d3`**. A batch of 16 at 128 tokens (`d3 = 2048`,
+  `k = 2`) and a single input at 2048 tokens (`d3 = 2048`, `k = 2`) cost Bae
+  *exactly the same*. The Kang path cannot spend the ring on tokens at all —
+  §20.1: `d` is the sequence length, pinned at 128, "and it is not tunable".
+
+**So the honest comparison is not B = 1 against B = 16. It is: what fills the
+ring?** Kang can only fill it with a batch. Bae fills it with a batch *or* a
+longer sequence — and a longer sequence is what the model actually wants, and
+what §20 recorded as having "no code path at all".
+
+On memory the worry is the right shape but points the other way at B = 1.
+Sicily GPU 2's RMM pool ceiling is **40.88 GiB**, and the batch-16 path at the
+real 8B width needs **77.5 GiB of ciphertexts alone** at 62 limbs — it **does
+not run on this card**, and §23.2 already said so. B = 1 does run. What B = 1
+on Bae runs *out of* is not memory but **arithmetic**: at 128 tokens the
+a-part GEMM is 32x the b-part and the block is 9.21e11 MACs per limb, which an
+A6000 with 1/32-rate FP64 is the wrong machine for. Bae is a BLAS-shaped
+algorithm and the paper's own thesis is a CPU-with-OpenBLAS one.
+
+### 25.5 What is implemented, and what is not
+
+**Implemented and validated (11/11, Sicily GPU 2):**
+
+* the full product for any `k` — ModDecomp (free decimation, App. A Eq. 14,
+  including the signed cyclic shift of the a-vector and the `Y^cols = -1` sign
+  at the wrap), both GEMMs, the re-assembly, the rescale;
+* `k = 1` end to end, **decrypted against a host reference**, one level,
+  chaining, and constructed with **no Galois key, no relin key and no
+  switching key of any kind**;
+* the `d3 >= sqrt(N)` floor and the `k > 1` rejection of the RLWE entry point;
+* the cost model, as arithmetic rather than prose.
+
+**Not implemented, stated rather than implied:**
+
+* **ModPack** (`k > 1` back to degree-`N` RLWE). It needs `k` switching keys
+  carrying the sub-secrets `s_j` — the `X^j` components of `sk` — and this
+  library has no entry point that hands those out. Cost if built: `k` key
+  switches per output ciphertext, `d1` per projection; that is the 43,008 in
+  §25.2's table and it is *already counted there*. At `k = 1` it is the
+  identity and the 0 is real.
+* **MaMBo**, the bootstrap fusion (§25.3). The big one.
+* **wiring into `Llama3RectOperator`**. `project()` still calls Algorithm 5.
+  The two operators are not interchangeable yet because they do not agree on
+  the activation layout (§25.3), and making them agree is that transpose and
+  regrouping, not a signature change.
+* Algorithms 3 and 4 (precomputation), which delete the a-part GEMM entirely
+  at the price of switching keys that depend on `U`. **This is the fix for
+  §25.2's `k = 32` blowup** and is the obvious next step if the token axis
+  cannot be widened.
+
+### 25.6 Two things a reader should not take from this section
+
+**No timing here is a block time.** Nothing in this section ran a Llama-3
+block. The measured half of `profile_baepcmm` times the product at small
+shapes to establish the *shape trend*; every block-level number is the exact
+count model and is labelled as a count where it appears.
+
+**Security is unchanged and still absent.** This branch inherits
+`sec_level_type::none` and logN 12 like the rest of the rect path, so §15.3
+and §24 apply verbatim. But Bae's MLWE rank `k` is chosen so that
+`k*d3 = N` keeps the lattice dimension — the paper is explicit that "the
+security of MLWE is determined by `d*k`" — so the `k > 1` path is **not** the
+security downgrade that a ring switch down to degree 128 would be. That is a
+point in its favour which this branch does not yet cash.
