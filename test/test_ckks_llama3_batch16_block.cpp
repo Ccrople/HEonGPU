@@ -457,6 +457,49 @@ TEST(HEonGPU,
         softmax.sum_lo = lo * 0.8;
         softmax.sum_hi = hi * 1.25;
     }
+
+    // Section 4.3 again, and for the same reason -- this one is what the
+    // blocked seam actually needs. `concentration` bounds the post-round sum
+    // of squares as a multiple of its uniform value 1/D, and zero keeps the
+    // WORST case, D. At D = 2d = 256 that asks a reciprocal to cover 768:1,
+    // which no affordable degree fits and which this data does not remotely
+    // visit. After round zero the coordinates are exp(x/2)/S over the visible
+    // keys -- the mask weight is constant along the key axis and cancels
+    // exactly, which is the property the weight was chosen for -- so the
+    // bound is computable here.
+    {
+        const double D = 2.0 * d;
+        double top = 0.0;
+        for (int b = 0; b < inst; ++b)
+            for (int u = 0; u < d; ++u)
+            {
+                double total = 0.0;
+                double squares = 0.0;
+                for (int q = 0; q <= 1; ++q)
+                    for (int j = 0; j < d; ++j)
+                    {
+                        if (q == 1 && j > u)
+                            continue;
+                        total += std::exp(
+                            raw[q][b][static_cast<size_t>(u) * d + j] / 2.0);
+                    }
+                for (int q = 0; q <= 1; ++q)
+                    for (int j = 0; j < d; ++j)
+                    {
+                        if (q == 1 && j > u)
+                            continue;
+                        const double p =
+                            std::exp(raw[q][b][static_cast<size_t>(u) * d + j] /
+                                     2.0) /
+                            total;
+                        squares += p * p;
+                    }
+                top = std::max(top, D * squares);
+            }
+        softmax.concentration = top * 1.25;
+        std::cout << "calibrated concentration " << softmax.concentration
+                  << " against a worst case of " << D << std::endl;
+    }
     seam.score_shift = shift;
 
     // 23 levels at these degrees, plus the three the encryption and the two
@@ -513,6 +556,7 @@ TEST(HEonGPU,
 
     double worst = 0.0;
     double worst_masked = 0.0;
+    double peak = 0.0;
     for (int q = 0; q < 2; ++q)
     {
         std::vector<std::vector<double>> out =
@@ -523,21 +567,27 @@ TEST(HEonGPU,
                 {
                     const size_t at = static_cast<size_t>(u) * d + j;
                     const double delta = std::abs(out[b][at] - want[q][b][at]);
+                    peak = std::max(peak, want[q][b][at]);
                     if (q == 1 && j > u)
                         worst_masked = std::max(worst_masked, delta);
                     else
                         worst = std::max(worst, delta);
                 }
     }
-    std::cout << "blocked seam over 2 blocks: worst " << worst
-              << ", worst inside the mask " << worst_masked << std::endl;
+    std::cout << "blocked seam over 2 blocks: worst " << worst << " ("
+              << 100.0 * worst / peak << "% of the peak probability " << peak
+              << "), worst inside the mask " << worst_masked << std::endl;
 
     ASSERT_FALSE(std::isnan(worst));
-    // A probability of a 256-long row averages 1/256 = 3.9e-3, so this is a
-    // few percent of what the fits are approximating.
-    EXPECT_LT(worst, 5e-4);
-    // Causality from the arithmetic side: a masked-off key is really zero, not
-    // merely small.
+    // Judged on the RATIO, which is this project's own rule: an absolute error
+    // means nothing across shapes, and a 256-long row's probabilities are half
+    // the size of a 128-long row's before anything goes wrong. The SoftMax and
+    // reciprocal fits carry a few per cent here; what this bound is really
+    // guarding is the DENOMINATOR, and a seam that summed only its own block
+    // would be 50-100% out rather than a few per cent.
+    EXPECT_LT(worst, 0.05 * peak);
+    // Causality from the arithmetic side, and this one IS sharp: a masked-off
+    // key is really zero, not merely small.
     EXPECT_LT(worst_masked, 5e-5);
 
     // A schedule that hands over the wrong number of blocks is refused, not
