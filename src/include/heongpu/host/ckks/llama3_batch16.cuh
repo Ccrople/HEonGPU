@@ -709,6 +709,66 @@ namespace heongpu
                                Relinkey<Scheme::CKKS>& relin_key);
 
             // ---------------------------------------------------------------
+            // The whole block
+            // ---------------------------------------------------------------
+
+            /** @brief Plaintext weights of one batch-16 transformer block. */
+            struct TransformerBlockWeights
+            {
+                /// One learned scale per channel, or empty. With
+                /// @c TransformerBlockConfig::fold_norm_scale these never
+                /// reach the ciphertext at all -- they are multiplied into
+                /// the projections that read the normalised stream, on the
+                /// host, which is exact and saves a level per norm.
+                std::vector<double> attention_norm;
+                std::vector<double> feed_forward_norm;
+                Llama3BatchOperator::BatchAttentionWeights attention;
+                FeedForwardWeights feed_forward;
+            };
+
+            /** @brief Shape and approximation settings for one block. */
+            struct TransformerBlockConfig
+            {
+                RMSNormConfig attention_norm;
+                Llama3BatchOperator::BatchAttentionConfig attention;
+                RMSNormConfig feed_forward_norm;
+                FeedForwardConfig feed_forward;
+                /// Fold the learned gains into the projections rather than
+                /// applying them homomorphically. Exact, host-side, and worth
+                /// a level and d_model plaintext encodes per norm.
+                bool fold_norm_scale = true;
+            };
+
+            /**
+             * @brief One pre-norm transformer block on sixteen inputs.
+             *
+             * Norm, attention, residual; then norm, SwiGLU, residual. The
+             * residual needs no crossing: it reconciles level and scale with a
+             * mod drop and a multiplication by a CONSTANT, and a constant is
+             * the constant polynomial, which scales every coefficient of a
+             * matrix encryption exactly as it scales every slot of a slot
+             * encoding. The stream is therefore in the same encoding at both
+             * ends of the block and the only crossings are the ones the
+             * non-linearities force.
+             *
+             * This differs from Llama3BatchOperator::transformer_block in what
+             * it spends rather than in what it computes: the norms are this
+             * module's, so the block takes the four exact level savings the
+             * batch path never wired through, and releases the slot copy the
+             * other one holds across its return crossing.
+             *
+             * The attention half is NOT reimplemented -- it is
+             * Llama3BatchOperator::attention, whose seam belongs to another
+             * module.
+             */
+            BatchActivation
+            transformer_block(BatchActivation& x,
+                              const TransformerBlockWeights& weights,
+                              const TransformerBlockConfig& config,
+                              Galoiskey<Scheme::CKKS>& galois_key,
+                              Relinkey<Scheme::CKKS>& relin_key);
+
+            // ---------------------------------------------------------------
             // The bridge, which is the only thing here that costs anything
             // ---------------------------------------------------------------
 

@@ -33,7 +33,7 @@
 //   HEONGPU_B16_KV_HEADS   key/value heads (GQA)                    1
 //   HEONGPU_B16_LIMBS      chain length                            62
 //   HEONGPU_B16_HIDDEN_BLOCK  hidden channels held at once         64
-//   HEONGPU_B16_STAGE      norm | attention | ffn | block        block
+//   HEONGPU_B16_STAGE      norm|attention|ffn|block|block_op    block
 //   HEONGPU_B16_SLOT_RESIDENT  keep the stream in slot form         0
 //   HEONGPU_B16_ROPE       apply rotary embedding to Q and K        0
 //
@@ -446,6 +446,10 @@ int main()
         return std::chrono::duration<double, std::milli>(b - a).count();
     };
 
+    // "block" walks the composition stage by stage, which says WHERE a
+    // fault is. "block_op" runs the same thing through the module own
+    // transformer_block, which says whether the wrapper wires it the same way.
+    const bool do_op = (stage == "block_op");
     const bool do_norm = (stage == "norm" || stage == "block");
     const bool do_attn = (stage == "attention" || stage == "block");
     const bool do_ffn = (stage == "ffn" || stage == "block");
@@ -738,6 +742,200 @@ int main()
                 ref[b][e] += ref_sub[b][e];
         note("residual2", ms(t4, t5), fout, stream.column.front().depth(),
              ref, decrypt(stream), model);
+    }
+
+    // ================= the whole block, through one call ===============
+    if (do_op)
+    {
+        // Everything the calibration needs, off the host, before anything is
+        // encrypted -- exactly as a calibration pass supplies it.
+        Batch ref_n1(instances);
+        for (int b = 0; b < instances; ++b)
+            ref_n1[b] = rms_norm_host(x[b], d, model, {}, norm_cfg.eps);
+
+        AttnWeights gw = aw;
+        llama::Llama3Batch16Operator::fold_gain(gw.q, gain1, model,
+                                                q_channels);
+        llama::Llama3Batch16Operator::fold_gain(gw.k, gain1, model,
+                                                kv_channels);
+        const double hscale = 1.0 / std::sqrt(static_cast<double>(hd));
+        const int group = heads / kv_heads;
+
+        auto scores_of = [&](int b, Mat& q, Mat& k)
+        {
+            q = matmul(ref_n1[b], gw.q, d, model, q_channels);
+            k = matmul(ref_n1[b], gw.k, d, model, kv_channels);
+            if (use_rope)
+            {
+                rope_host(q, d, q_channels, hd, 500000.0, 0);
+                rope_host(k, d, kv_channels, hd, 500000.0, 0);
+            }
+        };
+
+        double smax = -1e300, smin = 1e300;
+        for (int b = 0; b < instances; ++b)
+        {
+            Mat q, k;
+            scores_of(b, q, k);
+            for (int h = 0; h < heads; ++h)
+                for (int u = 0; u < d; ++u)
+                    for (int j = 0; j <= u; ++j)
+                    {
+                        double acc = 0.0;
+                        for (int c = 0; c < hd; ++c)
+                            acc += q[static_cast<size_t>(u) * q_channels +
+                                     h * hd + c] *
+                                   k[static_cast<size_t>(j) * kv_channels +
+                                     (h / group) * hd + c];
+                        acc *= hscale;
+                        smax = std::max(smax, acc);
+                        smin = std::min(smin, acc);
+                    }
+        }
+
+        // Same model calibration the staged path takes; see the note there.
+        const double target =
+            static_cast<double>(EnvInt("HEONGPU_B16_SCORE_SPAN", 4));
+        const double qscale =
+            ((smax - smin) > 1e-9) ? target / (smax - smin) : 1.0;
+        for (auto& w : aw.q)
+            w *= qscale;
+        for (auto& w : gw.q)
+            w *= qscale;
+        smax *= qscale;
+        smin *= qscale;
+
+        // The host block, with the gains where transformer_block will put
+        // them: on the projections that read each norm, never on the down
+        // projection, which reads the hidden.
+        AttnWeights hw = aw;
+        llama::Llama3Batch16Operator::fold_gain(hw.q, gain1, model,
+                                                q_channels);
+        llama::Llama3Batch16Operator::fold_gain(hw.k, gain1, model,
+                                                kv_channels);
+        llama::Llama3Batch16Operator::fold_gain(hw.v, gain1, model,
+                                                kv_channels);
+        Mat fg = wg, fu = wu;
+        llama::Llama3Batch16Operator::fold_gain(fg, gain2, model, hidden);
+        llama::Llama3Batch16Operator::fold_gain(fu, gain2, model, hidden);
+
+        Batch ref_block(instances), ref_n2(instances);
+        double gmax = 0.0;
+        for (int b = 0; b < instances; ++b)
+        {
+            Mat s1 =
+                attention_host(ref_n1[b], hw, d, model, q_channels, kv_channels,
+                               heads, kv_heads, hd, use_rope, 500000.0, 0);
+            for (size_t e = 0; e < s1.size(); ++e)
+                s1[e] += x[b][e];
+            ref_n2[b] = rms_norm_host(s1, d, model, {}, norm_cfg.eps);
+            const Mat g = matmul(ref_n2[b], fg, d, model, hidden);
+            for (double v : g)
+                gmax = std::max(gmax, std::abs(v));
+            Mat f = ffn_host(ref_n2[b], fg, fu, wd, d, model, hidden);
+            for (size_t e = 0; e < f.size(); ++e)
+                f[e] += s1[e];
+            ref_block[b] = f;
+        }
+
+        llama::Llama3Batch16Operator::TransformerBlockWeights bwt;
+        bwt.attention_norm = gain1;
+        bwt.feed_forward_norm = gain2;
+        bwt.attention.query = aw.q;
+        bwt.attention.key = aw.k;
+        bwt.attention.value = aw.v;
+        bwt.attention.output = aw.o;
+        bwt.feed_forward.gate = wg;
+        bwt.feed_forward.up = wu;
+        bwt.feed_forward.down = wd;
+
+        llama::Llama3Batch16Operator::TransformerBlockConfig bcfg;
+        bcfg.fold_norm_scale = true;
+        bcfg.attention_norm = norm_cfg;
+        bcfg.feed_forward_norm = norm_cfg;
+        bracket_sum(ref_n2, model, bcfg.feed_forward_norm.sum_lo,
+                    bcfg.feed_forward_norm.sum_hi);
+        bcfg.attention.in_channels = model;
+        bcfg.attention.q_channels = q_channels;
+        bcfg.attention.kv_channels = kv_channels;
+        bcfg.attention.heads = heads;
+        bcfg.attention.kv_heads = kv_heads;
+        bcfg.attention.causal = true;
+        bcfg.attention.rope = use_rope;
+        bcfg.attention.score_shift = smax;
+        bcfg.attention.softmax.bound = (smax - smin) * 1.05 + 1e-6;
+        bcfg.attention.softmax.iterations = 2;
+        bcfg.attention.softmax.exp_degree = 15;
+        bcfg.attention.softmax.inverse_degree = 63;
+        bcfg.attention.softmax.inverse_newton = 0;
+        bcfg.attention.seam.causal = true;
+        bcfg.attention.seam.scores_carry_exp_domain = true;
+        bcfg.attention.seam.fold_affine_into_mask = true;
+        bcfg.attention.seam.hoisted_crossings = true;
+        bcfg.attention.seam.cache_masks = true;
+        {
+            const double divisor =
+                std::pow(2.0, bcfg.attention.softmax.iterations);
+            double lo = 1e300, hi = 0.0, sharpest = 0.0;
+            for (int b = 0; b < instances; ++b)
+            {
+                Mat q, k;
+                scores_of(b, q, k);
+                for (int h = 0; h < heads; ++h)
+                    for (int u = 0; u < d; ++u)
+                    {
+                        const double w = static_cast<double>(d) /
+                                         static_cast<double>(u + 1);
+                        double total = 0.0, squares = 0.0;
+                        std::vector<double> e(static_cast<size_t>(u) + 1);
+                        for (int j = 0; j <= u; ++j)
+                        {
+                            double acc = 0.0;
+                            for (int c = 0; c < hd; ++c)
+                                acc += q[static_cast<size_t>(u) * q_channels +
+                                         h * hd + c] *
+                                       k[static_cast<size_t>(j) * kv_channels +
+                                         (h / group) * hd + c];
+                            acc = acc * hscale - bcfg.attention.score_shift;
+                            e[static_cast<size_t>(j)] = std::exp(acc / divisor);
+                            const double sq = e[static_cast<size_t>(j)] *
+                                              e[static_cast<size_t>(j)];
+                            total += w * sq;
+                            squares += sq;
+                        }
+                        lo = std::min(lo, total);
+                        hi = std::max(hi, total);
+                        double after = 0.0;
+                        for (int j = 0; j <= u; ++j)
+                        {
+                            const double y = e[static_cast<size_t>(j)] *
+                                             e[static_cast<size_t>(j)] /
+                                             squares;
+                            after += y * y;
+                        }
+                        sharpest = std::max(sharpest, after);
+                    }
+            }
+            bcfg.attention.softmax.sum_lo = lo * 0.95;
+            bcfg.attention.softmax.sum_hi = hi * 1.05;
+            bcfg.attention.softmax.concentration =
+                std::min(static_cast<double>(d),
+                         sharpest * static_cast<double>(d) * 1.05);
+        }
+        bcfg.feed_forward.silu_bound = gmax * 1.15 + 1e-6;
+        bcfg.feed_forward.silu_degree = 15;
+        bcfg.feed_forward.fold_silu_domain_into_gate = true;
+        bcfg.feed_forward.hidden_block = hidden_block;
+        bcfg.feed_forward.slot_resident = slot_resident;
+
+        auto t0 = tick();
+        const int din = stream.column.front().depth();
+        llama::BatchActivation out =
+            nl.transformer_block(stream, bwt, bcfg, galois, relin);
+        const int dout = out.column.front().depth();
+        auto t1 = tick();
+        note("transformer_block", ms(t0, t1), din, dout, ref_block,
+             decrypt(out), model);
     }
 
     // ---- report -------------------------------------------------------

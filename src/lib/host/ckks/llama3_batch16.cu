@@ -856,6 +856,84 @@ namespace heongpu
         }
 
         // -------------------------------------------------------------------
+        // The whole block
+        // -------------------------------------------------------------------
+
+        BatchActivation Llama3Batch16Operator::transformer_block(
+            BatchActivation& x, const TransformerBlockWeights& weights,
+            const TransformerBlockConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            validate(x, shape_.d_model, "transformer_block");
+
+            Range _r("b16.transformer_block");
+
+            BatchActivation stream;
+            stream.rows = x.rows;
+            stream.column = x.column;
+
+            {
+                Range _r_half("b16.block.attention_half");
+                Llama3BatchOperator::BatchAttentionWeights aw =
+                    weights.attention;
+                std::vector<double> gain = weights.attention_norm;
+                if (config.fold_norm_scale && !gain.empty())
+                {
+                    // Q, K and V all read the normalised stream, so all three
+                    // carry the gain. Doing it here rather than in the caller
+                    // keeps the two halves of the identity together: the gain
+                    // that leaves the norm is the gain that enters the weight.
+                    fold_gain(aw.query, gain, shape_.d_model,
+                              config.attention.q_channels);
+                    fold_gain(aw.key, gain, shape_.d_model,
+                              config.attention.kv_channels);
+                    fold_gain(aw.value, gain, shape_.d_model,
+                              config.attention.kv_channels);
+                    gain.clear();
+                }
+
+                BatchActivation normed = rms_norm(
+                    stream, gain, config.attention_norm, galois_key, relin_key);
+                BatchActivation sub = batch_.attention(
+                    normed, aw, config.attention, galois_key, relin_key);
+                normed.column.clear();
+                // The two operands have been through completely different
+                // circuits, so neither the level nor the scale lines up; this
+                // is the one level a pre-norm residual pays.
+                stream.column =
+                    arith().residual_add(stream.column, sub.column);
+                note_depth("block.after_attention", stream);
+            }
+
+            {
+                Range _r_half("b16.block.feed_forward_half");
+                FeedForwardWeights fw = weights.feed_forward;
+                std::vector<double> gain = weights.feed_forward_norm;
+                if (config.fold_norm_scale && !gain.empty())
+                {
+                    // Only the gate and the up projection read the norm; the
+                    // down projection reads the hidden and must NOT carry it.
+                    fold_gain(fw.gate, gain, shape_.d_model, shape_.hidden);
+                    fold_gain(fw.up, gain, shape_.d_model, shape_.hidden);
+                    gain.clear();
+                }
+
+                BatchActivation normed =
+                    rms_norm(stream, gain, config.feed_forward_norm,
+                             galois_key, relin_key);
+                BatchActivation sub = feed_forward(
+                    normed, fw, config.feed_forward, galois_key, relin_key);
+                normed.column.clear();
+                stream.column =
+                    arith().residual_add(stream.column, sub.column);
+                note_depth("block.out", stream);
+            }
+
+            return stream;
+        }
+
+        // -------------------------------------------------------------------
         // The bridge
         // -------------------------------------------------------------------
 
