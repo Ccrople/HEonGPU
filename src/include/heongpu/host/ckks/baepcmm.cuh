@@ -293,7 +293,9 @@ namespace heongpu
                        DeviceVector<Data64>& a_out, DeviceVector<Data64>& b_out,
                        int& limbs, int& depth, double& scale);
 
-        HEContext<Scheme::CKKS>* context_;
+        /// Held by value: HEContext is a shared_ptr handle, so this is a
+        /// reference count and not a copy of the context.
+        HEContext<Scheme::CKKS> context_;
         BaeLayout layout_;
         int n_;
         int n_power_;

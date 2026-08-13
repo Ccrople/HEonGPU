@@ -52,6 +52,7 @@ namespace
         std::unique_ptr<heongpu::Publickey<S>> pub;
         std::unique_ptr<heongpu::HEEncryptor<S>> encryptor;
         std::unique_ptr<heongpu::HEDecryptor<S>> decryptor;
+        std::unique_ptr<heongpu::HEEncoder<S>> encoder;
         std::unique_ptr<heongpu::HEArithmeticOperator<S>> ops;
         std::unique_ptr<heongpu::HEBaePcmmOperator<S>> bae;
 
@@ -77,8 +78,9 @@ namespace
                 std::make_unique<heongpu::HEEncryptor<S>>(context, *pub);
             decryptor =
                 std::make_unique<heongpu::HEDecryptor<S>>(context, *secret);
+            encoder = std::make_unique<heongpu::HEEncoder<S>>(context);
             ops = std::make_unique<heongpu::HEArithmeticOperator<S>>(
-                context, heongpu::HEEncoder<S>(context));
+                context, *encoder);
             bae = std::make_unique<heongpu::HEBaePcmmOperator<S>>(context,
                                                                   cols);
         }

@@ -177,7 +177,7 @@ namespace heongpu
 
     HEBaePcmmOperator<Scheme::CKKS>::HEBaePcmmOperator(
         HEContext<Scheme::CKKS>& context, int cols)
-        : context_(&context)
+        : context_(context)
     {
         n_ = context_->get_poly_modulus_degree();
         n_power_ = context_->n_power;
