@@ -326,6 +326,88 @@ namespace heongpu
             // Algorithm 4 requires, and that holds for any head_dim that is a
             // multiple of d.
 
+            /** @brief Everything between the two Algorithm-4 products. */
+            struct BatchSoftmaxSeamConfig
+            {
+                bool causal = true;
+
+                /// Subtracted from the scores so they land in [-bound, 0],
+                /// in RAW score units. If the scores arrive already carrying
+                /// the exponential's domain map, this is scaled to match
+                /// here -- the caller never has to remember to do it.
+                double score_shift = 0.0;
+                /// The same shift per QUERY row: d entries. A causal row of
+                /// length u + 1 has a different range from a full one, so one
+                /// number for the whole block is the loosest calibration
+                /// available and this is the sharp one. Overrides
+                /// @c score_shift.
+                std::vector<double> score_shift_rows;
+                /// The same shift per (input, query): slot_count entries, in
+                /// the layout's own index b + (k/2) * u. Overrides both of
+                /// the above.
+                ///
+                /// This exists only because the batch axis carries INDEPENDENT
+                /// INPUTS here. On a path that spends the batch axis on heads
+                /// or on channel blocks, a per-input calibration is not a slot
+                /// vector and cannot be expressed at all.
+                std::vector<double> score_shift_slots;
+
+                /// The scores already carry the exponential's domain map,
+                /// 2/bound, folded into whatever plaintext formed them.
+                ///
+                /// This is an ASSERTION ABOUT THE INPUT, not a request: set it
+                /// and the seam skips the affine multiply that would otherwise
+                /// cost a level, so setting it when the scores do NOT carry
+                /// the map is silently wrong rather than an error. attention()
+                /// owns the query weight and sets this itself; a caller
+                /// driving the seam directly owns the fold.
+                /// @see exp_domain_scale.
+                bool scores_carry_exp_domain = false;
+
+                /// Carry the reciprocal's domain map on the causal mask.
+                /// Costs nothing -- the mask is a plaintext product that is
+                /// paid for either way -- and saves one level per round. Needs
+                /// a mask, so it needs @c causal, and it is incompatible with
+                /// a Newton step, which wants its argument unmapped; with
+                /// @c softmax.inverse_newton above zero it is a silent no-op,
+                /// and softmax_seam_levels() reports the level it did not
+                /// save.
+                bool fold_affine_into_mask = true;
+
+                /// Refresh the denominator before fitting its reciprocal --
+                /// the paper's narrow auxiliary track.
+                ///
+                /// This is the largest single lever on the seam and it is
+                /// almost free here: the denominator is ONE ciphertext however
+                /// many parts the key axis is cut into, so the whole fit moves
+                /// off the wide track for one bootstrap per round, while the
+                /// d parts pay only the square and the normalising product.
+                /// Needs the boot key at the call and no Newton step.
+                bool refresh_denominator = false;
+
+                /// Hoist the crossings' rotation trains. Bit-identical; what
+                /// falls is decompositions (n1 + n2 - 2 -> n2 per column) and
+                /// launches.
+                bool hoisted_crossings = true;
+
+                /// Encode each distinct causal mask once instead of once per
+                /// head. @see causal_column_mask.
+                bool cache_masks = true;
+            };
+
+            /**
+             * @brief The domain map the exponential wants on its argument.
+             *
+             * Multiply it into whatever plaintext forms the scores -- the
+             * query weight, where a scaling is free -- and set
+             * @c scores_carry_exp_domain. That is one level of the deepest
+             * stretch in the block, for nothing.
+             */
+            static double exp_domain_scale(double bound)
+            {
+                return Llama3Operator::domain_scale(-bound, 0.0);
+            }
+
             /** @brief Plaintext weights of one attention sublayer. */
             struct BatchAttentionWeights
             {
@@ -361,6 +443,9 @@ namespace heongpu
                 /// and count are fixed by this encoding and overwritten: the
                 /// key axis is entirely across ciphertexts, so count is one.
                 Llama3Operator::SoftmaxConfig softmax;
+                /// Everything between the two Algorithm-4 products.
+                /// @see BatchSoftmaxSeamConfig, softmax_seam.
+                BatchSoftmaxSeamConfig seam;
             };
 
             /**
@@ -372,8 +457,114 @@ namespace heongpu
              * while leaving the sum of squares in the range a full row would
              * produce. Without it the first reciprocal would have to be fitted
              * over a range that widens with every position masked off.
+             *
+             * Note what this does NOT depend on: the head. The triangle is a
+             * property of the query and key indices, and the batch axis here
+             * carries independent INPUTS, all of which see the same causality.
+             * So the d masks of a sublayer serve every one of its heads, which
+             * is what makes them worth encoding once. @see
+             * Llama3Operator::set_mask_plain_capacity.
              */
             std::vector<double> causal_column_mask(int key) const;
+
+            // ---------------------------------------------------------------
+            // The SoftMax seam, continued
+            // ---------------------------------------------------------------
+            //
+            // The slot vector is N/2 = d * (k/2) wide and the score block of
+            // one head fills it exactly: (k/2) independent inputs on the fast
+            // axis, d queries on the slow one. There is no room left for the
+            // key axis, so the key axis is the CIPHERTEXT axis -- not by
+            // preference but by arithmetic, and the layout is therefore
+            // determined rather than chosen.
+            //
+            // That forced layout is also the cheap one, which is the happy
+            // part. The reduction the SoftMax needs runs along the key, so it
+            // is a slot-wise addition of the d parts: `count = 1`, the loop in
+            // sum_strided is dead code, and the denominator costs ZERO
+            // rotations, zero levels and zero Galois indices. The alternative
+            // -- key inside the ciphertext, query across them -- is reachable
+            // (it is the transpose of the score block, and Algorithm 4 will
+            // hand it over if you ask for K Q^T instead of Q K^T) but it costs
+            // iterations * log2(d) rotations per part, de-amortises the
+            // reciprocal d-fold, and needs a CMT to undo P^T before the value
+            // product. It buys nothing back: the reduction it moves was
+            // already free.
+            //
+            // Both seams are conversion-free, which is the other half of the
+            // layout question. Algorithm 4 hands the scores over column-wise
+            // with the KEY on the columns, which is the axis this reduces; and
+            // from_slots hands P back column-wise, which is what Algorithm 4
+            // wants as the left operand of P V, with V still carrying the key
+            // on its rows where the projection left it. The only conversion is
+            // the row bridge, one level each way, and it is unavoidable: a
+            // ring product of two columns convolves over the row index, so no
+            // entrywise polynomial -- no exponential, no square, no reciprocal
+            // -- can be evaluated in matrix form at all.
+            //
+            // So the levers here are not the layout. They are the levels the
+            // seam spends and the encodes it repeats, and both are below.
+
+            /** @brief Where the SoftMax reduces, and what that costs. */
+            struct SoftmaxLayout
+            {
+                int parts = 0;  ///< ciphertexts the key axis is cut into
+                int count = 0;  ///< key positions inside ONE ciphertext
+                int stride = 0;
+                bool strided = true;
+                /// Rotations the denominator costs. Zero, and that is the
+                /// whole point of the layout.
+                int reduction_rotations = 0;
+                /// Rotations the two row bridges cost, both directions.
+                int crossing_rotations = 0;
+                /// Galois indices the seam needs beyond the ones Algorithm 4
+                /// already forces. Zero.
+                int new_galois_indices = 0;
+            };
+
+            /**
+             * @brief The layout the seam runs in, for a d x d score block.
+             *
+             * Reports rather than decides: the values are read off the ring,
+             * so a test can pin the invariant instead of restating it.
+             */
+            SoftmaxLayout softmax_layout() const;
+
+            /**
+             * @brief Levels the seam spends, crossings included.
+             *
+             * The closed form of the ledger, so a caller can size its chain
+             * without running the circuit and a test can assert the ledger it
+             * claims. Counts to_slots, the SoftMax and from_slots; not the two
+             * Algorithm-4 products either side.
+             */
+            static int
+            softmax_seam_levels(const Llama3Operator::SoftmaxConfig& softmax,
+                                const BatchSoftmaxSeamConfig& seam);
+
+            /**
+             * @brief The SoftMax seam: scores in matrix form, P in matrix
+             *        form.
+             *
+             * bridge to slots, shift, SoftMax, bridge back. @p scores must be
+             * exactly layout.d columns -- the square block Algorithm 4 hands
+             * back -- with the key on the columns and the query on the rows.
+             * What comes back is the same shape, ready to be the LEFT operand
+             * of the value product with no transpose.
+             *
+             * @param boot_key Needed only for @c refresh_denominator, which
+             *                 throws without it rather than quietly putting
+             *                 the fit's levels back on the wide track and
+             *                 changing the schedule the caller sized its chain
+             *                 for.
+             */
+            BatchActivation
+            softmax_seam(BatchActivation& scores,
+                         const Llama3Operator::SoftmaxConfig& softmax,
+                         const BatchSoftmaxSeamConfig& seam,
+                         Galoiskey<Scheme::CKKS>& galois_key,
+                         Relinkey<Scheme::CKKS>& relin_key,
+                         Galoiskey<Scheme::CKKS>* boot_key = nullptr);
 
             /**
              * @brief One attention sublayer on the batch path.
@@ -387,7 +578,9 @@ namespace heongpu
                                       const BatchAttentionWeights& weights,
                                       const BatchAttentionConfig& config,
                                       Galoiskey<Scheme::CKKS>& galois_key,
-                                      Relinkey<Scheme::CKKS>& relin_key);
+                                      Relinkey<Scheme::CKKS>& relin_key,
+                                      Galoiskey<Scheme::CKKS>* boot_key =
+                                          nullptr);
 
             // ---------------------------------------------------------------
             // RMSNorm and SwiGLU
@@ -526,6 +719,14 @@ namespace heongpu
             /// The d x d Vandermonde of (*) at batch index b, and its inverse.
             /// Built once per operator: it depends only on the ring.
             void build_bridge_tables();
+
+            /// The d causal masks as slot vectors, built on first use. They
+            /// depend on d and k alone -- not on the head, not on the level,
+            /// not on the data -- so a sublayer that rebuilt them per head was
+            /// writing d * slot_count doubles H times over. The whole table is
+            /// 2 MiB at the Llama-3 shape.
+            const std::vector<std::vector<double>>& causal_masks();
+            std::vector<std::vector<double>> causal_mask_cache_;
 
             /// One direction of the bridge; @p inverse picks V^-1 over V.
             std::vector<Ciphertext<Scheme::CKKS>>
