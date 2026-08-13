@@ -769,6 +769,89 @@ TEST(HEonGPU, CKKS_Llama3Batch16_FeedForwardKeepsInstancesIndependent)
 }
 
 // ----------------------------------------------------------------------
+// The one experiment that decides how much layout conversion a block needs
+// ----------------------------------------------------------------------
+
+// Bridging is 98.3% of every Galois rotation in a block, and the SwiGLU's
+// three crossings are 64% of the bridging. All three exist for one reason:
+// project() is assumed to need matrix form. It may not.
+//
+// Algorithm 1 computes X.W with the weight encoded through BatchMatrixEncoder.
+// The weight handed to project() is one real matrix SHARED by all sixteen
+// instances, so its R_k image is the CONSTANT polynomial -- and multiplying by
+// a constant polynomial of R_k is scalar multiplication. The projection
+// therefore degenerates to out_c = sum_j W[j][c] * ct_j, a scalar
+// multiply-accumulate ACROSS ciphertexts, which cannot care what a ciphertext
+// encodes. The bridge is linear and acts WITHIN a column. Two such maps
+// commute.
+//
+// If that holds, the SwiGLU never has to leave slot form, and neither does
+// RMSNorm: the only thing on this path that genuinely needs the coefficient
+// encoding is Algorithm 4, because a ciphertext-ciphertext matrix product is
+// what the R_k structure is FOR. This test is the whole question, and it is
+// cheap.
+TEST(HEonGPU, CKKS_Llama3Batch16_ProjectionCommutesWithTheBridge)
+{
+    llama::Batch16Shape shape = SmallShape();
+    shape.d_model = 4;
+    Fixture f(shape, 8);
+    const int in_channels = 4;
+    const int out_channels = 3;
+
+    const auto x = f.random_batch(in_channels, 1357u, 0.5);
+    const auto w = random_weight(in_channels, out_channels, 2468u, 0.5);
+
+    auto ct =
+        f.op->encrypt(x, Fixture::d, in_channels, *f.encryptor, f.scale);
+
+    // (a) the way the code does it today: project in MATRIX form, then bridge.
+    auto proj =
+        f.op->project(ct, w, in_channels, out_channels, "commute.matrix");
+    auto a_slots = f.op->to_slots(proj, *f.galois);
+    ASSERT_EQ(a_slots.size(), static_cast<size_t>(out_channels));
+
+    // (b) bridge FIRST, then hand project() slot-form ciphertexts.
+    auto ct2 =
+        f.op->encrypt(x, Fixture::d, in_channels, *f.encryptor, f.scale);
+    llama::BatchActivation slot_act;
+    slot_act.rows = Fixture::d;
+    slot_act.column = f.op->to_slots(ct2, *f.galois);
+    auto b = f.op->project(slot_act, w, in_channels, out_channels,
+                           "commute.slot");
+    ASSERT_EQ(b.columns(), out_channels);
+
+    // Both must equal the host product read through the slot map -- otherwise
+    // they could agree by being wrong in the same way.
+    double worst_ab = 0.0;
+    double worst_host = 0.0;
+    for (int c = 0; c < out_channels; ++c)
+    {
+        const auto ga = f.decode(a_slots[static_cast<size_t>(c)]);
+        const auto gb = f.decode(b.column[static_cast<size_t>(c)]);
+        for (int inst = 0; inst < Fixture::instances; ++inst)
+        {
+            const auto want = host_product(x[inst], w, Fixture::d,
+                                           in_channels, out_channels);
+            for (int u = 0; u < Fixture::d; ++u)
+            {
+                const int s = f.nl->slot_of(inst, u);
+                const double ref =
+                    want[static_cast<size_t>(u) * out_channels + c];
+                worst_ab = std::max(worst_ab, std::abs(ga[s] - gb[s]));
+                worst_host = std::max(worst_host, std::abs(gb[s] - ref));
+            }
+        }
+    }
+
+    EXPECT_LT(worst_host, 1e-3)
+        << "projecting slot-form ciphertexts does not compute the product";
+    EXPECT_LT(worst_ab, 1e-3)
+        << "project() does not commute with the bridge; the SwiGLU's three "
+           "crossings and the RMSNorm's return crossing are all load bearing "
+           "after all";
+}
+
+// ----------------------------------------------------------------------
 // The cost accounting
 // ----------------------------------------------------------------------
 
