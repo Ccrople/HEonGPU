@@ -3240,6 +3240,17 @@ mentioning levels. `llama3.cu` warns about exactly this in
 reaches a different kernel first. Anyone enabling a feature here should raise
 `HEONGPU_B16_LIMBS` first, and read that message as "out of chain".
 
+Confirmed by giving it the chain, which is the whole diagnosis:
+
+| | limbs | levels spent | result |
+|---|---:|---:|---|
+| block_op + RoPE | 62 | — | CUDA "invalid configuration argument" |
+| block_op + RoPE | 68 | **62** | **DATAFLOW OK**, 2.039e-02 |
+
+62 = 59 + 3, which is exactly what 23.5 prices RoPE at. **The whole block
+runs end to end with rotary embedding**, at 43.0 s for sixteen inputs at this
+width.
+
 ### 23.7 Two things the driver had to learn
 
 
