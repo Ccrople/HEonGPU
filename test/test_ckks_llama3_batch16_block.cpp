@@ -243,7 +243,12 @@ TEST(HEonGPU, CKKS_Llama3Batch16Block_BlockedMaskReducesToTheSingleBlockOne)
 {
     Fixture f(SmallShape(), 3);
 
-    for (int key : {0, 1, 7, 63, Fixture::d - 1})
+    // EVERY key, not a sample. This is the only thing standing between the
+    // blocked mask and Llama3RectOperator::attention, which calls
+    // batch_.causal_column_mask(j) for j in [0, d) (llama3_rect.cu:2485) --
+    // so if the delegation drifted by one ulp on one key, the rectangular
+    // path's SoftMax would move and nothing else in this suite would notice.
+    for (int key = 0; key < Fixture::d; ++key)
     {
         const std::vector<double> single = f.op->causal_column_mask(key);
         const std::vector<double> blocked = f.op->causal_column_mask(0, 0, key);

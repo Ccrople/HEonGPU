@@ -3511,33 +3511,34 @@ the small chain must copy verbatim.
    Whether the matrix encoding costs precision relative to a slot encoding at
    the same parameters is one A/B run away and was not made.
 
+
 ---
 
 ## 25. What a whole 8B block at batch 16 still lacked: a refresh, and a second token block (2026-08-13)
 
-짠23's consolidation left a gap table with two rows still open, and they are not
+§23's consolidation left a gap table with two rows still open, and they are not
 the same kind of gap as the rest of this document. Everything else here is an
 optimisation: a schedule that spends fewer levels, a crossing that costs less,
 a product that was computing the identity. These two are the difference between
 a circuit that runs and one that does not exist.
 
-| gap, as 짠23 recorded it | what it means |
+| gap, as §23 recorded it | what it means |
 |---|---|
-| bootstrapping ??"still absent, and unreachable: no boot key is ever passed" | at batch 16 the chain buys **one** usable level and a block spends around sixty |
-| "sequences longer than d = 128 tokens ??still no code path; there is no token blocking here" | d = 128 is **1/64** of Llama-3-8B's 8192-token context |
+| bootstrapping — "still absent, and unreachable: no boot key is ever passed" | at batch 16 the chain buys **one** usable level and a block spends around sixty |
+| "sequences longer than d = 128 tokens — still no code path; there is no token blocking here" | d = 128 is **1/64** of Llama-3-8B's 8192-token context |
 
 Both are now implemented, with tests. Nothing in this section is timed, and
 that is said once here rather than hedged throughout: what follows is
 structure, levels and arithmetic over the shape.
 
-### 25.1 The refresh: absent, not off ??and the reason batch 16 needs one
+### 25.1 The refresh: absent, not off — and the reason batch 16 needs one
 
 `llama3_batch.cu` and `llama3_batch16.cu` between them did not contain the word
 `bootstrap`. Not a flag left false: no entry point took a boot key, and no
 caller could have supplied one. (`llama3_rect.cu` has 25 mentions and
 `llama3.cu` 27, so the machinery existed everywhere except here.)
 
-That is fatal rather than merely slow on this path, and 짠24 is why:
+That is fatal rather than merely slow on this path, and §24 is why:
 
 ```
 batch = k/2 = 16  =>  k = 32,  d = 128,  N = 256*batch = 4096
@@ -3545,28 +3546,39 @@ the 128-bit cap at N = 4096 is 109 bits of log QP
 41 + 33 + 33 = 107  =>  two Q primes and a special  =>  ONE usable level
 ```
 
-**What makes a refresh legal here was the open question of 짠24, and it was
+**What makes a refresh legal here was the open question of §24, and it was
 answered by measurement.** Regular bootstrapping is ModRaise -> CoeffToSlot ->
 EvalMod -> SlotToCoeff, whose net effect on the plaintext *polynomial* is the
-identity with the modulus restored, and it reads no encoding tag ??so it
+identity with the modulus restored, and it reads no encoding tag — so it
 refreshes a Kang matrix encryption where it stands, with no crossing in front
 of it. That was not obvious: EvalMod's bound is on the plaintext
 *coefficients*, and this encoding puts an inverse length-`k` DFT there.
 `RegularBootstrapCarriesAMatrixEncryption` settled it at 14.9 bits, and the
-consequence is the parameter set itself ??a refresh that wanted slot form would
+consequence is the parameter set itself — a refresh that wanted slot form would
 need a bridge, the bridge is a level, the island would need 140 bits against a
 cap of 109, and **batch 16 would have no legal parameter set at all**.
 
 **The chain follows from the schedule.** A regular bootstrap spends
-`CtoS + taylor + StoC + 8` levels of whatever chain it is handed ??25 at the
-default `(3, 3, 11)` ??so a schedule whose worst stretch is `S` wants exactly
+`CtoS + taylor + StoC + 8` levels of whatever chain it is handed — 25 at the
+default `(3, 3, 11)` — so a schedule whose worst stretch is `S` wants exactly
 `S + 26` limbs. Longer is not safer: at `dnum = 1` it is slower in proportion to
 `L^2`, for levels the circuit discards at the next seam. `refresh_levels()` and
 `chain_limbs_for()` are that arithmetic, so a chain gets sized without running a
 circuit, and `level_budget` is how the limbs a stretch will not spend get
 dropped rather than carried by every key switch until the next seam.
 
-**Six named seams**, close to the rectangular path's set on purpose ??the
+**That arithmetic is v1's, and it is v1 because `Llama3Operator::bootstrap`
+is.** The `bootfast` session established, concurrently with this work, that
+`Llama3Operator::bootstrap` calls the v1 Taylor procedure and is the only boot
+call in the whole Llama-3 module tree — `regular_bootstrapping_v2` was reachable
+only from benchmarks that go around the operator API. v2 spends **15** levels
+where v1 spends 25 and is 2.6-2.8x faster at equal returned levels. Nothing
+here has to change to take that: `refresh_levels` reads a
+`BootstrappingConfig`, which is v1's type, so a v2 caller gets a compile error
+rather than a stale 25 — and the seam set, the key union, the level budget and
+the guards are all independent of which procedure runs underneath.
+
+**Six named seams**, close to the rectangular path's set on purpose — the
 circuit is the same shape, and a schedule comparable across the two paths is
 worth more than one tuned to this one:
 
@@ -3585,7 +3597,7 @@ through. A refresh that quietly does not happen changes the level schedule the
 caller sized its chain for, and surfaces several layers later as an unrelated
 throw. For the same reason `boot_rotation_indices()` exists: it is the union of
 this module's indices with `bootstrapping_key_indexs()`, and a caller must build
-its **one** Galois key from it ??a shift-vector key asked for an index it does
+its **one** Galois key from it — a shift-vector key asked for an index it does
 not hold is undefined behaviour, not an error, so two keys is the shape of a
 silent wrong answer.
 
@@ -3598,8 +3610,8 @@ enforce it, and at batch 16 the ring pins `d = 128`.
 The surprise is which half is expensive.
 
 **The SoftMax costs no new rotations at any sequence length.** The key axis is
-already the ciphertext axis ??`d * (k/2) == N/2` exactly, so the slot vector is
-full of (input, query) and the key has nowhere else to go ??and lengthening the
+already the ciphertext axis — `d * (k/2) == N/2` exactly, so the slot vector is
+full of (input, query) and the key has nowhere else to go — and lengthening the
 key axis therefore means handing the reduction *more parts*. `count` stays one,
 `sum_strided`'s loop stays dead, and a denominator over 8192 keys costs exactly
 what a denominator over 128 keys cost: **zero rotations, zero levels, zero new
@@ -3618,13 +3630,13 @@ against each, so `B` blocks cost `B(B+1)/2` of each per head instead of `B`.
 
 **The blocked causal mask is the only piece that is not bookkeeping.** Query `u`
 of block `p` sees `p*d + u + 1` keys out of the `(p+1)*d` the seam reduces over,
-so the weight is `sqrt((p+1)*d / (p*d + u + 1))` ??constant along the key axis,
+so the weight is `sqrt((p+1)*d / (p*d + u + 1))` — constant along the key axis,
 therefore cancelled exactly by the SoftMax rounds, and chosen so the sum of
 squares lands where a full row would leave it. That last clause is the whole
 point of the weight and it is silent when wrong: it is the range the reciprocal
 is *fitted over*, and fitting a reciprocal over the wrong range is what cost
 this project a day on the rectangular path. At `p = 0` the formula is
-`sqrt(d/(u+1))`, which is the single-block mask exactly ??so the single-block
+`sqrt(d/(u+1))`, which is the single-block mask exactly — so the single-block
 entry point now delegates to the blocked one and the two cannot drift.
 
 A query block uses `d + 1` distinct masks whatever its index: `d` triangles on
@@ -3653,7 +3665,7 @@ times that and buy nothing, because a query block is visited once.
 holds its whole visible past in slot form at once and the SoftMax squares it, so
 the deepest query block is `64 * 128 = 8192` slot ciphertexts. And K and V for
 the *whole* sequence must be resident, because there is no KV cache on this
-path ??the batch axis carries sixteen independent prompts, not sixteen positions
+path — the batch axis carries sixteen independent prompts, not sixteen positions
 of one, so there is no autoregressive step to cache for.
 
 At a 20-limb cost-model chain a ciphertext is 1.25 MiB, and:
@@ -3673,14 +3685,14 @@ Three things follow, and the third is the useful one.
    alone.
 2. **A full 8192-token context does not fit on one card at a cost-model
    chain.** 160 GiB of K and V against an A100's 80. What fits at 20 limbs is
-   about 16 blocks ??**2048 tokens** ??with half the card left for everything
+   about 16 blocks — **2048 tokens** — with half the card left for everything
    else.
 3. **The security cap that makes batch 16 awkward for levels makes it cheap for
    memory.** The legal batch-16 island chain is three limbs, and at three limbs
    the K and V of a full 8192-token context are 24 GiB. The 160 GiB figure is a
    property of the 20-limb chains every measurement on this path was taken at,
    not of the parameter set. Batch 16 pays for its short chain in forced
-   refreshes (짠24.5) and is repaid in working set.
+   refreshes (§24.5) and is repaid in working set.
 
 `sequence_product_count()` reports the product and column counts from the shape
 alone, so a caller sizes a card before running anything and a test pins the
@@ -3692,14 +3704,14 @@ Token blocking can be wrong three ways and only one of them is an error.
 
 **Wrong arithmetic** is caught by a host reference: the blocked seam is checked
 against an exact causal SoftMax over the whole `2d`-long visible row, so a
-denominator that summed only its own block ??or a mask off by one block ??fails
+denominator that summed only its own block — or a mask off by one block — fails
 there rather than at the end of a sublayer where nothing would name it.
 
 **Wrong causality is caught by nothing else.** A mask that leaks one future key
 returns a perfectly plausible number, and no round trip and no reference-free
 check sees it. So the suite perturbs a token of the **last** block and requires
 every token of the **first** to come back unchanged; and separately perturbs a
-token of the first and requires the second to **move** ??because a per-block
+token of the first and requires the second to **move** — because a per-block
 SoftMax would pass the first test and fail the second.
 
 **Wrong generalisation** is caught by requiring the blocked path to agree with
@@ -3708,13 +3720,69 @@ value, on the sublayer and on the whole-block driver. If those drift, the two
 entry points are two models and every measurement taken before this existed
 describes the other one.
 
-And the refresh's own failure mode ??a bootstrap that quietly does not happen ??is asserted directly: all three entry points that can refresh throw without the
+And the refresh's own failure mode — a bootstrap that quietly does not happen —
+is asserted directly: all three entry points that can refresh throw without the
 boot key.
 
-### 25.5 Open
+
+### 25.5 Measured, at the real batch-16 ring
+
+Sicily, `N = 4096, d = 128, k = 32, batch = 16`. Model widths cut down —
+`d_model` 4-8, `hidden` 8-16 — because what is under test is the SCHEDULE and
+the CAUSALITY, which are properties of the circuit and not of the width.
+
+| what | measured |
+|---|---|
+| blocked mask reduces to the single-block one | exact, entry by entry |
+| `attention_sequence` at one block vs `attention` | **5.04e-08**, identical depth |
+| sequence block driver vs block driver at one block | **4.88e-08**, identical depth trace |
+| blocked seam vs an exact host SoftMax over a 2d row | 7.29e-04 worst, ~4.6% of the peak probability |
+| **a masked-off key** | **5.61e-07** — zero to the CKKS noise floor |
+| perturbing a token of block 1: block 0 moves | **1.45e-07** |
+| the same perturbation: block 1 moves | 2.92e-03 — a factor of **2.0e4** |
+| perturbing a token of block 0: block 1 moves | 3.09e-03 |
+| perturbing instance 5: instance 5 moves | 0.964 |
+| the same: every other instance moves | **1.27e-07** — a factor of **7.6e6** |
+| a refresh carries the matrix encryption | 3.34e-04, **11.5 bits** |
+| the boot-key union | 127 module + 35 bootstrapping = **146** (16 shared) |
+
+**The first per-seam level map of a batch-16 block**, from the depth trace of a
+whole block at the cheap fit degrees (a 13-level seam; the production seam is
+23, so a production block is 56):
+
+| seam | depth | the stretch behind it |
+|---|---:|---:|
+| `block.entry` | 0 | — |
+| `block.after_attention_norm` | 9 | RMSNorm **9** |
+| `block.after_attention` | 26 | attention **17** |
+| `block.mid` | 27 | residual **1** |
+| `block.after_feed_forward_norm` | 36 | RMSNorm **9** |
+| `block.out` | 46 | SwiGLU + residual **10** |
+
+**And the refresh arithmetic came out exactly as `chain_limbs_for` predicts,
+which is the point of having it.** A two-token-block run with one refresh at
+`block.mid`, on a 54-limb chain: the seam left the stream at depth 25, i.e.
+`54 - 25 = 29` limbs, and `refresh_levels((3,3,11))` is 25 — so the bootstrap
+returned `chain - 25` limbs to the digit. The feed-forward half then spent
+`44 - 25 = 19` levels, which is `9 + 9 + 1` from the table above, again to the
+digit.
+
+Regressions: every other batch-16 and shared suite green — `llama3_batch16`
+(17), `llama3_batch` (13), `llama3_batch_softmax` (9), `batchmatrix_shared`
+(6), `batchmatrix_gpu` (12), `batch_ringswitch` (7), plus the rectangular
+suites, which share `cmt`, `ccmm` and `causal_column_mask` with this path.
+
+**One thing this run established that is not about either gap.** The first
+attempt failed all twelve GPU tests at once with an RMM pool ceiling of 3.72
+GiB — the card had filled with another session's work between the build and the
+run. That is the failure mode `rmm-pool-ceiling-not-working-set` describes:
+`max == cap` in the error means the pool was sized small at context generate,
+not that the circuit is too big. Moving to a card with room ran the identical
+binary green.
+### 25.6 Open
 
 1. **Nothing here is timed.** The tests establish algebra, causality, levels and
-   precision. Every figure in 짠25.3 is arithmetic over the shape.
+   precision. Every figure in §25.3 is arithmetic over the shape.
 2. **The `m^2` is not reduced, only paid.** Causality halves it and nothing here
    does better. A sliding window or a sink prefix would change the model, which
    is the caller's decision and not this module's.
@@ -3724,5 +3792,5 @@ boot key.
    it throws.
 4. **The refresh schedule is not tuned.** Six seams are named and any of them
    can be switched off, but which set minimises the chain at this shape is a
-   `depth_trace` run that has not been made ??and at 8B widths that run is the
+   `depth_trace` run that has not been made — and at 8B widths that run is the
    OOM this session was told not to attempt.
