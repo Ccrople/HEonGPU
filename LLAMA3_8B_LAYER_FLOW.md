@@ -2198,3 +2198,132 @@ removes work (one `match_scale` per ciphertext) and adds none.
 **E1 alone frees no boot.** It is one of the four preconditions in §18.1; E2,
 S1, `shared = 5` and `P <= 45` are still needed together. The next step is E2,
 which is a host-side weight fold and needs no library change at all.
+
+## 19. The bootstrap itself: the parameter surface is flat, and the module was on the wrong model (2026-08-13)
+
+Task: the block is bootstrap-bound (53.7% of a two-ring block, §14.4), so make
+a bootstrap cheaper — by parameter, by method, or by both.
+
+Everything below is measured on **one idle A6000 (Sicily GPU 2)** with
+`benchmark/profile_boot_precision.cpp`, which now takes the non-positional
+knobs from the environment so a sweep needs no rebuild:
+`HEONGPU_BP_{CTS_PIECE,STC_PIECE,CTS_RATIO,STC_RATIO,SPECIALS,HAMMING,
+SPARSE_HW,REPS,EXTRA_L}`. One process per point (the bootstrapping context
+locks after generation), 3 reps with the first discarded.
+
+**Baseline: 255.0 ms, 16.76 bits, L = 29, 14 levels returned, 48 Galois keys.**
+
+### 19.1 Every knob is already at its optimum. The surface is worth ~4%.
+
+| lever | swept | best | vs baseline |
+|---|---|---|---|
+| DFT pieces CtoS x StoC | all 16 of 2..5 x 2..5 | **4/3, the shipped value** | **0%** |
+| special primes (dnum) | 1..20 | 6-8 | 2.2% |
+| BSGS ratio | 0.5..16 | 4 | 2.0%, +23% keys |
+| model swap to `slim` | — | — | *slower* at equal levels |
+
+`slim` runs EvalMod once and is still slower than v2 (214.7 ms returning 6,
+against v2's ~159), because it pays the v1 Taylor exponential and the
+un-hoisted `multiply_matrix` path. The pieces trade **key memory**, not time:
+5/5 needs **28** Galois keys against 4/3's 48, for +7.7% time — useful wherever
+the key ceiling binds, which is most of this project.
+
+### 19.2 Cost is linear in the chain, and precision is flat along it
+
+`boot_ms ~= 104 + 12.5 x (levels returned)`: 116.6 ms at 2 levels, 256.6 at 14,
+341.1 at 20, all at 16.75 bits. `depth_after` is **constant at 15** — the
+boot's own `stc_piece + n_sine + cts_piece` — so `nbase` alone sets what comes
+back. The ~104 ms intercept is the boot's own depth, and it is what any
+algorithmic change has to attack.
+
+Corollary for §17: the five boots that restore 14 levels and let `cross.down`
+discard 10 are paying **256.6 ms for what a right-sized chain delivers at
+138.6** — 1.85x on those calls, ~10% of a block, at the cost of a second
+bootstrapping context and a second 48-key set.
+
+### 19.3 The EvalMod cliff is real, and it is `h -> K -> degree`
+
+§14.5 recorded (sine_deg 30, dangle 3) as a cliff and closed the 43% bucket.
+That verdict holds, and the reason is now measured rather than observed: **K
+bounds |I(s)| after ModRaise, |I(s)| grows with the sparse secret's hamming
+weight h, and the Chebyshev degree must resolve K oscillations.** So h sets K
+sets the degree sets the boot's depth, and none of the three moves alone.
+
+At the shipped h = 32, K = 8 with degree 10 looks like 186.7 ms — 1.37x — and
+**fails on 1 of 16 independent secrets**. Degree 14 at K = 8 fails 2 of 12.
+The single fast run is a lucky secret; the failure is catastrophic, not
+graceful. Matching h to K works: **h = 16, K = 8, degree 10 gives 187.9 ms
+against 259.0, 0/16 failures, at BETTER precision (18.09 vs 16.74)** — 1.38x,
+bought by halving the sparse bootstrapping secret. That is a security
+parameter, so it is recorded as an option and not taken.
+
+**Method note, which cost this section two false starts:** the secret is
+redrawn per process and the message is not (fixed seed), so a bootstrap
+parameter must be tested across many SECRETS, not many reps. Three reps of one
+secret will happily bless a config that fails 1 in 16.
+
+### 19.4 The module was on v1, and v2 is 2.6-2.8x faster AND more secure
+
+`Llama3Operator::bootstrap` (`llama3.cu:3199`) called `regular_bootstrapping`,
+the **v1 Taylor** model, and it is the only boot call in the entire Llama-3
+module tree (`llama3.cu`, `llama3_rect.cu`, `llama3_batch.cu`;
+`llama3_batch16.cu` has none). `regular_bootstrapping_v2` was reachable only
+from benchmarks that go *around* the operator API — `profile_tworing_block.cpp:812`,
+`profile_ckks.cpp`, `profile_tworing_stage16.cpp`. So every figure in §14 for
+the **rect** path was taken on v1, and the two-ring numbers on v2.
+
+The comparison only means anything at equal **returned** levels, because v1
+spends 25 levels of chain depth and v2 spends 15 (`depth_after` is constant per
+model, so returned = L - 25 and L - 15):
+
+| returned levels | v1 | v2 | v2 is |
+|---:|---:|---:|---:|
+| 2 | 328.3 ms | 117.5 ms | **2.79x** |
+| 6 | 429.4 ms | 159.6 ms | **2.69x** |
+| 10 | 550.5 ms | 207.1 ms | **2.66x** |
+| 14 | 682.6 ms | 258.8 ms | **2.64x** |
+
+and v2 gets there on a chain **ten primes shorter**, which every other
+operation in the circuit is charged for as well.
+
+**Security runs the same way, which is what settles it.** v1's ModRaise needs
+the SCHEME's own secret to be sparse — the shipped examples and this harness's
+v1 branch use `Secretkey(context, 16)`. v2 holds a dense h = 192 secret and
+switches into a sparse h = 32 one for the ModRaise alone, through two
+`Switchkey`s. So v2 is ahead on speed and on security; the only thing that
+moves the wrong way is precision, 20.1 -> 16.75 bits, against a block that
+already lands near 6 (§12).
+
+Shipped as **`Llama3Operator::use_v2_bootstrapping(swk_d2s, swk_s2d)`** —
+opt-in, default still v1, and it refuses a half-configured pair, because half a
+pair would ModRaise under the sparse secret and never switch back, which
+decrypts as noise rather than throwing. Test:
+`test/test_ckks_llama3_bootv2.cpp`, 4/4, 18.13 bits worst-slot at logN 13
+through the module API.
+
+### 19.5 What is left, priced
+
+1. **The constant-plaintext encode in `evaluate_poly`, ~4-6%.**
+   `quick_ckks_encoder_constant_complex` (`operator.cu:2733`) encodes a single
+   constant by building a 32768-entry host vector, doing a **synchronous**
+   512 KB `cudaMemcpy`, and running a full 32768-point inverse FFT — on
+   `stream = 0`, ignoring the caller's stream — and it runs ~48 times per boot,
+   once per polynomial coefficient over both EvalMod chains. The analytic path
+   already exists for real constants (`quick_ckks_encoder_constant_double`,
+   `:2778`, one kernel, no FFT, because the NTT of a constant polynomial is
+   that constant everywhere) and the Chebyshev coefficients of a cosine are
+   real. Not bit-identical — the fast path is exactly rounded where the current
+   one rounds an IFFT output — so it needs a precision check, not just a diff.
+2. **Batching the 16 ciphertexts of a refresh call.** `TwoRing::refresh` is a
+   literal serial loop on the default stream. Boot phases are 90.5% GPU-busy,
+   so stream overlap alone is bounded at ~5% of a block; real sharing of the
+   key streaming (~28% of a boot's DRAM traffic) is the larger prize and the
+   larger job.
+3. **CUDA graphs.** `cudaGraph*` appears zero times in the tree, against
+   ~1500 kernel launches per boot.
+
+**Refuted, and worth recording so it is not retried:** a "solo" v2 that runs
+EvalMod once, on the theory that the upper coefficient half is an encryption of
+zero. It is not. After ModRaise the plaintext is `m + q0*I(s)` and **`I(s)` is
+dense over all N coefficients whatever the message is**, so the imaginary
+CoeffToSlot output is never zero and dropping it returns noise.

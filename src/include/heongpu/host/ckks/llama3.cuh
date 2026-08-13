@@ -1244,6 +1244,51 @@ namespace heongpu
                       Relinkey<Scheme::CKKS>& relin_key);
 
             /**
+             * @brief Route bootstrap() through the v2 model instead of v1.
+             *
+             * Measured on one A6000 at logN 16, held at equal numbers of
+             * RETURNED levels -- v1 spends 25 levels of chain depth against
+             * v2's 15, so the two are only comparable once the chain is
+             * matched, which is why the shipped side-by-side understates it:
+             *
+             *     returned   v1         v2         v2 is
+             *        2       328.3 ms   117.5 ms   2.79x
+             *        6       429.4 ms   159.6 ms   2.69x
+             *       10       550.5 ms   207.1 ms   2.66x
+             *       14       682.6 ms   258.8 ms   2.64x
+             *
+             * and v2 reaches that on a chain ten primes shorter, which every
+             * other operation in the circuit is charged for as well.
+             *
+             * Security moves the same way. v1's ModRaise needs the SCHEME's
+             * own secret to be sparse -- the shipped examples give it hamming
+             * weight 16 -- whereas v2 holds a dense secret and switches into a
+             * sparse one for the ModRaise alone, through the two switch keys
+             * taken here. So this is not a speed-against-security trade: v2 is
+             * ahead on both.
+             *
+             * Precision is the one thing that moves the wrong way, 20.1 -> 16.75
+             * bits. Every consumer in this module sits far below that; a whole
+             * block already lands near 6 bits.
+             *
+             * Neither key is copied, so both must outlive this operator.
+             * Generate them with HEKeyGenerator::generate_switch_key between
+             * the working secret and a sparse one, and call
+             * generate_bootstrapping_params_v2 rather than
+             * generate_bootstrapping_params. Passing two nulls reverts to v1.
+             */
+            void use_v2_bootstrapping(
+                Switchkey<Scheme::CKKS>* swk_dense_to_sparse,
+                Switchkey<Scheme::CKKS>* swk_sparse_to_dense);
+
+            /** @brief Whether bootstrap() currently routes to the v2 model. */
+            bool v2_bootstrapping_enabled() const
+            {
+                return boot_swk_dense_to_sparse_ != nullptr &&
+                       boot_swk_sparse_to_dense_ != nullptr;
+            }
+
+            /**
              * @brief Refresh a ciphertext read as coefficients, return slots.
              *
              * bootstrap() ends with SlotToCoeff so that it gives back the
@@ -1600,6 +1645,10 @@ namespace heongpu
                     Relinkey<Scheme::CKKS>& relin_key);
 
           private:
+            /// Non-owning; set by use_v2_bootstrapping, null while on v1.
+            Switchkey<Scheme::CKKS>* boot_swk_dense_to_sparse_ = nullptr;
+            Switchkey<Scheme::CKKS>* boot_swk_sparse_to_dense_ = nullptr;
+
             /// The prime the next rescale of @p ct will divide by.
             double rescale_prime(const Ciphertext<Scheme::CKKS>& ct) const;
 

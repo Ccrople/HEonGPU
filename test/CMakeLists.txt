@@ -41,6 +41,7 @@ set(EXECUTABLES
     ckks_batchmatrix_sweep_testcases test_ckks_batchmatrix_sweep.cpp
     ckks_batchmatrix_rect_testcases test_ckks_batchmatrix_rect.cpp
     ckks_llama3_testcases test_ckks_llama3.cpp
+    ckks_llama3_bootv2_testcases test_ckks_llama3_bootv2.cpp
     ckks_llama3_batch_testcases test_ckks_llama3_batch.cpp
     ckks_llama3_rect_testcases test_ckks_llama3_rect.cpp
     ckks_ringswitch_testcases test_ckks_ringswitch.cpp

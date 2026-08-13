@@ -3186,6 +3186,23 @@ namespace heongpu
                                   "down", galois_key, token_blocks);
         }
 
+        void Llama3Operator::use_v2_bootstrapping(
+            Switchkey<Scheme::CKKS>* swk_dense_to_sparse,
+            Switchkey<Scheme::CKKS>* swk_sparse_to_dense)
+        {
+            // Half a pair would be a bootstrap that raises the modulus under
+            // the sparse secret and never comes back, which decrypts to noise
+            // rather than failing, so refuse it here.
+            if ((swk_dense_to_sparse == nullptr) !=
+                (swk_sparse_to_dense == nullptr))
+            {
+                throw std::invalid_argument(
+                    "use_v2_bootstrapping needs both switch keys or neither.");
+            }
+            boot_swk_dense_to_sparse_ = swk_dense_to_sparse;
+            boot_swk_sparse_to_dense_ = swk_sparse_to_dense;
+        }
+
         Ciphertext<Scheme::CKKS>
         Llama3Operator::bootstrap(Ciphertext<Scheme::CKKS>& x,
                                   Galoiskey<Scheme::CKKS>& boot_key,
@@ -3196,6 +3213,17 @@ namespace heongpu
             // prime left, so anything still unspent has to go first. It is
             // free to drop and it was about to be discarded regardless.
             drop_to_depth(x, context_->get_ciphertext_modulus_count() - 1);
+            // Both models are an identity on the plaintext polynomial, which
+            // is what lets the rectangular and matrix encodings be refreshed
+            // where they stand, so the choice between them is cost only. v2 is
+            // 2.6-2.8x faster at equal returned levels and spends ten fewer
+            // levels of chain -- see use_v2_bootstrapping.
+            if (v2_bootstrapping_enabled())
+            {
+                return regular_bootstrapping_v2(x, boot_key, relin_key,
+                                                boot_swk_dense_to_sparse_,
+                                                boot_swk_sparse_to_dense_);
+            }
             return regular_bootstrapping(x, boot_key, relin_key);
         }
 
