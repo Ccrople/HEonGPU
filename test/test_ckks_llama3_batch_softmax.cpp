@@ -230,16 +230,38 @@ namespace
                      sharpest * static_cast<double>(d) * 1.05);
     }
 
+    /// Levels a degree-D Chebyshev evaluation spends, matching
+    /// softmax_seam_levels' own recursion.
+    int fit_levels(int degree)
+    {
+        int levels = 0;
+        for (int reach = 1; reach < degree; reach <<= 1)
+        {
+            levels++;
+        }
+        return levels;
+    }
+
     /// The seam's production settings: both folds on, no Newton step, ranges
-    /// calibrated. This is the configuration the branch exists to make
-    /// available.
+    /// calibrated, and a degree-63 reciprocal. This is the configuration the
+    /// branch exists to make available.
+    ///
+    /// The degree is not a free parameter and it is the thing this file
+    /// measured rather than assumed. Taking fold_affine_into_mask forces
+    /// inverse_newton = 0, and a causal triangle that starts at u = 0 has a
+    /// row attending to ONE key, whose sum of squares after a round is
+    /// exactly 1 -- so `concentration` is d whatever the calibration, the
+    /// later rounds are fitted over [0.5/d, 1.5], and that range is 384:1 at
+    /// d = 128. Degree 15 over that is 33% wrong, which is what the first run
+    /// of this suite measured. Degree 63 is what the rect path uses in
+    /// production and it is what this needs, for the same reason.
     void production(SoftmaxConfig& softmax, SeamConfig& seam, double bound,
                     double shift)
     {
         softmax.bound = bound;
         softmax.iterations = 2;
         softmax.exp_degree = 15;
-        softmax.inverse_degree = 15;
+        softmax.inverse_degree = 63;
         softmax.inverse_newton = 0;
 
         seam.causal = true;
@@ -456,15 +478,18 @@ TEST(HEonGPU, CKKS_Llama3BatchSoftmax_CalibrationIsWhatPaysForTheNewtonSteps)
         random_scores(16, Fixture::d, shift - bound, shift, 8675309u);
     const auto want = host_causal_softmax(scores, Fixture::d, shift);
 
-    // The refined form: two Newton steps, and therefore no fold.
+    // The refined form: a cheap degree-15 fit rescued by two Newton steps,
+    // and therefore no fold.
     SoftmaxConfig refined;
     SeamConfig refined_seam;
     production(refined, refined_seam, bound, shift);
+    refined.inverse_degree = 15;
     refined.inverse_newton = 2;
     refined_seam.fold_affine_into_mask = false;
     calibrate(scores, Fixture::d, shift, refined.iterations, refined);
 
-    // The folded form: no Newton step, same degree, same calibrated range.
+    // The folded form: no Newton step, a wider fit instead, same calibrated
+    // range.
     SoftmaxConfig folded;
     SeamConfig folded_seam;
     production(folded, folded_seam, bound, shift);
@@ -475,10 +500,15 @@ TEST(HEonGPU, CKKS_Llama3BatchSoftmax_CalibrationIsWhatPaysForTheNewtonSteps)
     const int folded_levels = Batch::softmax_seam_levels(folded, folded_seam);
     std::cout << "batch16 softmax seam levels: refined " << refined_levels
               << ", folded+calibrated " << folded_levels << std::endl;
-    // One exp affine + one 1/x affine per round + two levels per Newton step
-    // per round.
-    EXPECT_EQ(refined_levels - folded_levels,
-              1 + refined.iterations * (1 + 2 * refined.inverse_newton));
+    // Per round the refined form pays the 1/x affine map and two levels per
+    // Newton step; the folded form pays a wider fit instead. Both configs
+    // carry the exponential's map on the input, so that level does not enter.
+    const int expected =
+        refined.iterations * (1 + 2 * refined.inverse_newton) -
+        refined.iterations *
+            (fit_levels(folded.inverse_degree) -
+             fit_levels(refined.inverse_degree));
+    EXPECT_EQ(refined_levels - folded_levels, expected);
 
     Fixture f(refined_levels + 3);
 
@@ -531,12 +561,17 @@ TEST(HEonGPU, CKKS_Llama3BatchSoftmax_MaskCacheChangesEncodesNotAnswers)
 
     Fixture f(Batch::softmax_seam_levels(softmax, seam) + 3);
 
-    // Uncached, so that the cached run has something to be compared against.
+    // ONE encryption, three seams. Encrypting per run would compare two
+    // different samples of the encryption noise and measure nothing: the
+    // first cut of this test did exactly that and reported a 4e-7 "difference"
+    // that was the noise and not the cache.
+    auto ct = encrypt_scores(f, scores, seam, bound);
+
+    // Uncached, so that the cached runs have something to be compared against.
     SeamConfig uncached = seam;
     uncached.cache_masks = false;
-    auto first = encrypt_scores(f, scores, uncached, bound);
     auto reference =
-        f.op->softmax_seam(first, softmax, uncached, *f.galois, *f.relin);
+        f.op->softmax_seam(ct, softmax, uncached, *f.galois, *f.relin);
     const auto want =
         f.op->decrypt(reference, *f.decryptor,
                       reference.column.front().scale());
@@ -544,16 +579,14 @@ TEST(HEonGPU, CKKS_Llama3BatchSoftmax_MaskCacheChangesEncodesNotAnswers)
         << "cache_masks = false must not consult the cache";
 
     // First cached run: d distinct masks, so d misses and no hits.
-    auto second = encrypt_scores(f, scores, seam, bound);
-    auto once = f.op->softmax_seam(second, softmax, seam, *f.galois, *f.relin);
+    auto once = f.op->softmax_seam(ct, softmax, seam, *f.galois, *f.relin);
     const auto after_one =
         f.op->decrypt(once, *f.decryptor, once.column.front().scale());
     EXPECT_EQ(f.op->arith().mask_plain_hits(), 0u);
 
     // Second cached run at the same depth -- which is what the next head is.
     // Every one of the d encodes is now served.
-    auto third = encrypt_scores(f, scores, seam, bound);
-    auto twice = f.op->softmax_seam(third, softmax, seam, *f.galois, *f.relin);
+    auto twice = f.op->softmax_seam(ct, softmax, seam, *f.galois, *f.relin);
     const auto after_two =
         f.op->decrypt(twice, *f.decryptor, twice.column.front().scale());
     EXPECT_EQ(f.op->arith().mask_plain_hits(),
@@ -583,15 +616,18 @@ TEST(HEonGPU, CKKS_Llama3BatchSoftmax_HoistedCrossingsAreBitIdentical)
 
     Fixture f(Batch::softmax_seam_levels(softmax, seam) + 3);
 
+    // One encryption, two seams: "bit-identical" is a claim about the
+    // arithmetic, and re-encrypting would compare two samples of the
+    // encryption noise instead.
+    auto ct = encrypt_scores(f, scores, seam, bound);
+
     SeamConfig plain = seam;
     plain.hoisted_crossings = false;
-    auto a = encrypt_scores(f, scores, plain, bound);
-    auto p_plain = f.op->softmax_seam(a, softmax, plain, *f.galois, *f.relin);
+    auto p_plain = f.op->softmax_seam(ct, softmax, plain, *f.galois, *f.relin);
     const auto want =
         f.op->decrypt(p_plain, *f.decryptor, p_plain.column.front().scale());
 
-    auto b = encrypt_scores(f, scores, seam, bound);
-    auto p_hoisted = f.op->softmax_seam(b, softmax, seam, *f.galois, *f.relin);
+    auto p_hoisted = f.op->softmax_seam(ct, softmax, seam, *f.galois, *f.relin);
     const auto got = f.op->decrypt(p_hoisted, *f.decryptor,
                                    p_hoisted.column.front().scale());
 
@@ -600,8 +636,7 @@ TEST(HEonGPU, CKKS_Llama3BatchSoftmax_HoistedCrossingsAreBitIdentical)
     // And the operator's own setting survives the call, because the seam is
     // not the only thing that crosses.
     const bool before = f.op->hoisted_crossings();
-    auto c = encrypt_scores(f, scores, seam, bound);
-    f.op->softmax_seam(c, softmax, seam, *f.galois, *f.relin);
+    f.op->softmax_seam(ct, softmax, seam, *f.galois, *f.relin);
     EXPECT_EQ(f.op->hoisted_crossings(), before);
 }
 
@@ -636,13 +671,16 @@ TEST(HEonGPU, CKKS_Llama3BatchSoftmax_PerRowShiftAgreesWithTheScalarOne)
 
     Fixture f(Batch::softmax_seam_levels(softmax, seam) + 3);
 
-    auto a = encrypt_scores(f, scores, seam, bound);
-    auto scalar = f.op->softmax_seam(a, softmax, seam, *f.galois, *f.relin);
+    // Both seams read the same ciphertext: the two shifts are the same
+    // numbers said two ways, so what is being pinned is the seam's scaling of
+    // them and not the encryption.
+    auto ct = encrypt_scores(f, scores, seam, bound);
+
+    auto scalar = f.op->softmax_seam(ct, softmax, seam, *f.galois, *f.relin);
     const auto from_scalar =
         f.op->decrypt(scalar, *f.decryptor, scalar.column.front().scale());
 
-    auto b = encrypt_scores(f, scores, rows, bound);
-    auto per_row = f.op->softmax_seam(b, softmax, rows, *f.galois, *f.relin);
+    auto per_row = f.op->softmax_seam(ct, softmax, rows, *f.galois, *f.relin);
     const auto from_rows =
         f.op->decrypt(per_row, *f.decryptor, per_row.column.front().scale());
 
