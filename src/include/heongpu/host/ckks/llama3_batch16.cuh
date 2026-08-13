@@ -568,7 +568,19 @@ namespace heongpu
              *              at one level and one scale. Channel
              *              `h*head_dim + c` is head h, head-dim lane c.
              *
-             * One level. Applies to Q and K only -- V is not rotated.
+             * One level, four plaintext products and two additions per lane
+             * pair. Applies to Q and K only -- V is not rotated.
+             *
+             * KNOWN COST, stated rather than hidden. The three slot vectors a
+             * lane needs are built once per lane but applied through
+             * multiply_vector, which ENCODES on every call -- so the same
+             * plaintext is re-encoded once per head. At head_dim = 128 and 32
+             * heads that is 4 * 64 * 32 = 8,192 encodes for Q where 192 would
+             * do, a 42x redundancy, and it is the same defect the SiLU's
+             * domain map has when its fold is off. The fix is to hold an
+             * HEEncoder and encode each lane's three vectors once; it needs a
+             * constructor change, so it is named here rather than done
+             * quietly. The ARITHMETIC is unaffected.
              */
             void rope_slots(std::vector<Ciphertext<Scheme::CKKS>>& slots,
                             const RopeConfig& config);

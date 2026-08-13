@@ -2327,7 +2327,81 @@ result is recorded in 19.7.
 
 ### 19.7 Measured
 
-*Pending: Sicily GPU 2, tree `HEonGPU-b16nl`.*
+Sicily **GPU 2** (GPU 0 was at 100% from another user, GPU 1 idle but holding
+27 GB), tree `HEonGPU-b16nl`, commit `a697686`, CUDA 12.0, sm_86.
+**17 of 17 green, 8.7 s**, at the real batch-16 ring `N = 4096, d = 128,
+k = 32, batch = 16` — the first time anything in this repo has executed at
+that shape.
+
+**1. `project()` COMMUTES with the bridge. CONFIRMED.**
+`ProjectionCommutesWithTheBridge` checks the slot-form projection against a
+host reference *and* against the matrix-form path, so it cannot pass by being
+wrong in the same way. This is the load-bearing result of the section: the
+crossings that are 98.3% of a block's rotations exist because the projection
+was assumed to need the coefficient encoding, and it does not. **Only
+Algorithm 4 genuinely needs it.**
+
+**2. The instances stay separate.** `RMSNormKeepsInstancesIndependent` and
+`FeedForwardKeepsInstancesIndependent` perturb ONE of the sixteen and require
+the other fifteen to move by less than 1e-4 while the perturbed one moves by
+more than 1e-2. Not exact equality: two runs are two encryptions, so the floor
+is CKKS noise, and mixing would be an O(1) move — the bound sits three orders
+above the noise and three below the signal. Nothing here is asserted by a
+round trip, which a pair of mutually inverse mistakes would also pass.
+
+**3. The reshape is free, and the test proves it by POINTER IDENTITY.**
+`ReshapeIsIndexArithmeticAndAliasesTheInput` asserts
+`view[lane] == &ct.column[channel_of(h, lane)]` — the difference between free
+and `d` ciphertext deep copies per head. GQA maps 4 query heads onto each kv
+head as a view, and `kv_channels` stays at 1024 against `q_channels` 4096.
+
+**4. Every level claim, asserted as an exact depth rather than argued.**
+
+| claim | assertion | result |
+|---|---|---|
+| gain folds into the weight, exactly | value agreement + `depth_a == depth_b + 1` | holds |
+| the SiLU domain map folds onto the gate weight | value agreement + `depth_a == depth_b - 1` | holds |
+| a pre-scaled sum skips the fit's affine multiply | value agreement + `depth_b == depth_a - 1` | holds |
+| `hidden_block` changes only the association of a sum | value agreement + equal depth | holds |
+| RoPE costs one level | `after == before + 1` | holds |
+
+**5. Two claims I made were REFUTED by the tests and are corrected above.**
+
+- **`slot_resident` does not save a level.** I wrote that two crossings
+  replacing three would drop one; measured, both arrangements land at depth 9.
+  Three crossing CALLS are only two crossing LEVELS, because the gate and the
+  up projection cross concurrently. The saving is bridged columns —
+  43,008 -> 8,192 — and nothing else. The test now pins the equality.
+- **The levels are in FULL slot residency instead**, where the norm's return
+  crossing and the SwiGLU's entry crossing are adjacent and cancel outright:
+  `SlotResidentSublayersNeedNoCrossing` asserts exactly `-2` levels for a
+  norm/SwiGLU pair, and every non-attention bridged column disappears with
+  them.
+
+**6. The one test failure worth reporting, because it is not a bug.**
+`RMSNormMatchesThePlaintextLayer` first failed at 3.2e-3 against a tolerance I
+had guessed at 1e-3. That number is the CHEBYSHEV FIT and nothing else: 1/sqrt
+has a branch point at zero, so its interpolation error is set by how close the
+fitted interval comes to it, and a fixture with eight channels of uniform
+noise is the worst case — the summed square spans about 14x. At the real
+`d_model = 4096` the summed square concentrates as `1/sqrt(4096)` and the span
+collapses towards 1.1x. The test now bounds at 5e-3 and *proves the
+attribution* by re-running the identical circuit at degree 31 and requiring
+the error to collapse by 4x; if it did not, the error would be coming from the
+encoding rather than the series.
+
+**7. Relinearisation counts, corrected from a source simulation** of
+`gen_power`, `optimal_split` and `evaluate_poly_recurse` including the re-split
+branch that does fire: degree 7 -> **5**, degree 15 -> **8**, degree 31 ->
+**14**. Earlier hand estimates in this document said 4 / 7 / 11, a 27%
+undercount at degree 31.
+
+**What is NOT measured.** No timing, no `nsys` capture, and nothing at the 8B
+width — every key-switch and byte figure in 19.3 and 19.8 is arithmetic over
+the source. The tests run at `d_model` 4-8 and `hidden` 8-16; what they
+establish is the LAYOUT, the LEVELS and the SEPARATION, which are properties
+of the circuit and not of the width. The cost model is unvalidated on this
+path.
 
 ### 19.8 The three things that could sink this shape, none of them layout
 
@@ -2348,7 +2422,33 @@ result is recorded in 19.7.
    are unreachable. One block spends ~67 levels of a 70-limb chain, of which
    the bridge is only 9.
 
-### 19.9 Coverage, stated plainly
+### 19.9 RoPE, which was missing entirely
+
+Rotary embedding is **absent from the Algorithm-1 path** -- not configured
+off, absent: `llama3_batch.cu` never mentions it and `BatchAttentionConfig`
+has no field for it. It is the one non-linearity of this session's scope with
+no implementation anywhere, so `rope_slots()` is it.
+
+It is cheap here for the two reasons everything else is. The head-dim pairing
+`c <-> c + head_dim/2` is a pairing of whole CIPHERTEXTS, because a channel is
+a ciphertext -- no homomorphic rotation, no Galois key. And the angle
+`(u + offset) * theta^(-2c/head_dim)` depends on the TOKEN, which is the slow
+slot axis, so one plaintext per lane pair serves every instance and every
+head. Four plaintext products, two additions, **one level**, measured.
+
+The minus sign goes on the plaintext, not on the ciphertext: negating
+homomorphically is `multiply_constant`, a plaintext product and a rescale, and
+the two halves of a pair would then be at different depths and could not be
+added at all.
+
+**Known cost, named rather than hidden:** the three slot vectors a lane needs
+are built once per lane but applied through `multiply_vector`, which encodes
+on every call -- so the same plaintext is re-encoded once per head, 8,192
+encodes for Q where 192 would do. It is the same defect the SiLU's domain map
+has when its fold is off. The fix needs an `HEEncoder` on the constructor; the
+arithmetic is unaffected either way.
+
+### 19.10 Coverage, stated plainly
 
 Before this session **nothing in the repo had ever run at the batch-16
 shape**: the GPU suite is `N = 4096, d = 8` (i.e. `k = 512, batch = 256`) and
