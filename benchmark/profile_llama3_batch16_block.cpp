@@ -309,6 +309,13 @@ int main()
     const std::string stage = EnvStr("HEONGPU_B16_STAGE", "block");
     const bool slot_resident = EnvInt("HEONGPU_B16_SLOT_RESIDENT", 0) != 0;
     const bool use_rope = EnvInt("HEONGPU_B16_ROPE", 0) != 0;
+    // The fits are the accuracy, and their degree is the knob that says so.
+    // Raising only these must collapse the error; if it does not, what is
+    // wrong is the dataflow and not the series.
+    const int silu_degree = EnvInt("HEONGPU_B16_SILU_DEGREE", 15);
+    const int norm_degree = EnvInt("HEONGPU_B16_NORM_DEGREE", 15);
+    const int exp_degree = EnvInt("HEONGPU_B16_EXP_DEGREE", 15);
+    const int inv_degree = EnvInt("HEONGPU_B16_INV_DEGREE", 63);
 
     const int q_channels = heads * hd;
     const int kv_channels = kv_heads * hd;
@@ -319,6 +326,9 @@ int main()
               << heads << " over " << kv_heads << " kv, head_dim " << hd
               << "\n[b16] limbs " << limbs << ", stage " << stage
               << ", slot_resident " << slot_resident << ", rope " << use_rope
+              << "\n[b16] degrees: norm " << norm_degree << ", silu "
+              << silu_degree << ", exp " << exp_degree << ", 1/x "
+              << inv_degree
               << std::endl;
 
     // ---- context and keys --------------------------------------------
@@ -409,7 +419,7 @@ int main()
 
     llama::Llama3Batch16Operator::RMSNormConfig norm_cfg;
     bracket_sum(x, model, norm_cfg.sum_lo, norm_cfg.sum_hi);
-    norm_cfg.degree = 15;
+    norm_cfg.degree = norm_degree;
     norm_cfg.newton_iterations = 0;
     norm_cfg.fold_mean_into_fit = true;
 
@@ -569,8 +579,8 @@ int main()
         cfg.score_shift = smax;
         cfg.softmax.bound = bound;
         cfg.softmax.iterations = 2;
-        cfg.softmax.exp_degree = 15;
-        cfg.softmax.inverse_degree = 63;
+        cfg.softmax.exp_degree = exp_degree;
+        cfg.softmax.inverse_degree = inv_degree;
         cfg.softmax.inverse_newton = 0;
         cfg.seam.causal = true;
         cfg.seam.scores_carry_exp_domain = true;
@@ -716,7 +726,7 @@ int main()
 
         llama::Llama3Batch16Operator::FeedForwardConfig fcfg;
         fcfg.silu_bound = gmax * 1.15 + 1e-6;
-        fcfg.silu_degree = 15;
+        fcfg.silu_degree = silu_degree;
         fcfg.fold_silu_domain_into_gate = true;
         fcfg.hidden_block = hidden_block;
         fcfg.slot_resident = slot_resident;
@@ -865,8 +875,8 @@ int main()
         bcfg.attention.score_shift = smax;
         bcfg.attention.softmax.bound = (smax - smin) * 1.05 + 1e-6;
         bcfg.attention.softmax.iterations = 2;
-        bcfg.attention.softmax.exp_degree = 15;
-        bcfg.attention.softmax.inverse_degree = 63;
+        bcfg.attention.softmax.exp_degree = exp_degree;
+        bcfg.attention.softmax.inverse_degree = inv_degree;
         bcfg.attention.softmax.inverse_newton = 0;
         bcfg.attention.seam.causal = true;
         bcfg.attention.seam.scores_carry_exp_domain = true;
@@ -923,7 +933,7 @@ int main()
                          sharpest * static_cast<double>(d) * 1.05);
         }
         bcfg.feed_forward.silu_bound = gmax * 1.15 + 1e-6;
-        bcfg.feed_forward.silu_degree = 15;
+        bcfg.feed_forward.silu_degree = silu_degree;
         bcfg.feed_forward.fold_silu_domain_into_gate = true;
         bcfg.feed_forward.hidden_block = hidden_block;
         bcfg.feed_forward.slot_resident = slot_resident;
