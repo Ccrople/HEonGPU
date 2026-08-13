@@ -3103,3 +3103,110 @@ shape**: the GPU suite is `N = 4096, d = 8` (i.e. `k = 512, batch = 256`) and
 batch **8**. Multi-head and GQA are untested everywhere -- every existing test
 sets `heads = 1`, so the head-indexing arithmetic has only ever run at
 `h = 0`.
+
+---
+
+## 23. Four branches into one, and the block end to end (2026-08-13)
+
+Sections 19 to 22 are four sessions on the same encoding, each of which
+validated its own seam against a host reference and passed. **Nothing had ever
+run the seams against each other.** This section is that, and it found two
+faults that no unit test in the suite could have caught.
+
+`HEonGPU_LLama3_8B_batch16` is now the single branch; `_ccmm`, `_softmax` and
+`_nonlinear` are merged and deleted, each verified an ancestor of the union
+first.
+
+### 23.1 The two faults the merge found
+
+**A projection taken on a product was rejected outright.** `pcmm` grew the
+guard `relinearization_required_ || cipher_size_ != 2`. The second half is
+wrong: `relinearize_inplace` clears the flag and **never writes
+`cipher_size_` back to 2**, so every ciphertext that has been through
+multiply + relinearize reports three for the rest of its life. The library
+already treats the flag as the authority — `operator.cuh` derives the size as
+`relinearization_required_ ? 3 : 2` rather than reading the field. Nobody had
+hit it because every existing call feeds `project()` from a BRIDGE output,
+which is freshly allocated at size two; a slot-resident SwiGLU feeds it a
+product. The guard now tests the flag, and both `pcmm` variants stamp their
+own output rather than copying the stale size out of `in[0]`.
+
+**RoPE was wired into nothing.** It existed as an entry point that no code
+path called, and `BatchAttentionConfig` had no field for it — so every
+measurement this path has ever produced was taken with **no positional
+information at all**. An attention sublayer without RoPE is not Llama-3's.
+
+### 23.2 What is still not implemented, stated plainly
+
+| gap | status |
+|---|---|
+| bootstrapping | **absent and unreachable** — no boot key is ever passed, so the two aux-refresh hooks cannot be turned on. One block spends ~56 of a 62-limb chain, so a STACK does not run at all. |
+| sequences longer than `d = 128` tokens | **no code path.** There is no token blocking here; the slot path in `llama3.cu` has it and this one does not. |
+| the real 8B width | does not fit on a 48 GiB A6000, by the arithmetic in 22.8. The driver is stage-selectable for exactly this reason. |
+
+### 23.3 The block, measured stage by stage
+
+Sicily GPU 2, `N = 4096, d = 128, k = 32, batch 16`, `d_model 128`,
+`hidden 256`, 2 heads over 1 KV, 62 limbs. Every stage is compared against a
+host reference computed from **that stage's own input**, so a per-stage error
+says WHERE and the end-to-end error says WHETHER.
+
+| stage | ms | levels | relative error |
+|---|---:|---:|---:|
+| norm1 | 6,830 | 0 → 9 | 5.4e-06 |
+| attention (QKV, scores, seam, PV, W_o) | 8,773 | 9 → 36 | 2.5e-03 |
+| residual | 47 | 36 → 37 | 2.5e-03 |
+| norm2 | 1,544 | 37 → 46 | 6.4e-02 |
+| SwiGLU | 3,465 | 46 → 55 | 1.4e-01 |
+| residual | 30 | 55 → 56 | 1.4e-01 |
+
+**The dataflow is correct**: every stage runs, the levels land exactly where
+the ledger predicts (attention is 27 = 1 + 1 + 23 + 1 + 1), and no
+orientation, scale or level disagreement appears at any seam. What degrades
+is ACCURACY, down a 56-level chain of degree-15 fits.
+
+### 23.4 The optimisation, measured
+
+`slot_resident` on the SwiGLU — the arrangement 22.6's commutation result
+unlocks, and which the `pcmm` guard above was silently blocking:
+
+| | SwiGLU ms | levels | relative error |
+|---|---:|---:|---:|
+| three crossings over the hidden | 3,465 | 46 → 55 | 1.432e-01 |
+| two crossings around the sublayer | **1,601** | 46 → 55 | 1.432e-01 |
+
+**2.09x on the sublayer, identical depth, identical error to four digits.**
+At this shape the bridged columns fall 3 x 256 = 768 to 2 x 128 = 256; at the
+8B shape the same move is 43,008 to 8,192.
+
+### 23.5 RoPE, priced
+
+| | attention ms | levels | relative error |
+|---|---:|---:|---:|
+| off | 8,773 | 9 → 36 | 2.451e-03 |
+| on | 23,862 | 9 → 39 | 2.405e-03 |
+
+**Exactly +3 levels**, as 22.9 says it must be: two crossings and the
+rotation. The error is unchanged, which is what validates the wiring — the
+host reference ropes the same Q and K, and so does the score calibration,
+which has to see what the circuit will see. The 2.7x in time is the two
+crossings over `q_channels + kv_channels`, and it is the price of reaching
+slot form from the coefficient encoding. Under a slot-resident stream Q and K
+are already in slot form when they are formed and RoPE costs its one level
+and nothing else.
+
+### 23.6 Two things the driver had to learn
+
+**Calibrate the model, not just the fit.** Random weights at this width put
+raw attention scores across a span of hundreds, so the SoftMax was asked to
+fit `exp` over `[-300, 0]` — a dynamic range of `e^75`. It did not fail
+loudly; it returned values that outgrew int64 at decrypt, which surfaces as
+"extracted coefficient does not fit in int64" from the Garner reconstruction
+and looks like a library fault. A trained model does not present that, and
+that boundedness is the premise Section 4.3's calibration rests on.
+
+**An absolute error means nothing across shapes.** The SwiGLU looked broken
+at 6.9e-01 absolute and is ordinary at 1.8e-02 relative: a fit's error grows
+with the range it is fitted over, and a wider model gives a wider range. A
+fixed absolute threshold reads a correct circuit as broken the moment the
+width moves.
