@@ -595,11 +595,20 @@ namespace heongpu
             BatchActivation& x, const FeedForwardWeights& weights,
             const FeedForwardConfig& config,
             Galoiskey<Scheme::CKKS>& galois_key,
-            Relinkey<Scheme::CKKS>& relin_key)
+            Relinkey<Scheme::CKKS>& relin_key,
+            Galoiskey<Scheme::CKKS>* boot_key)
         {
             const int in_channels = shape_.d_model;
             const int hidden = shape_.hidden;
             validate(x, in_channels, "feed_forward");
+            if (config.refresh_hidden && boot_key == nullptr)
+            {
+                // Falling back to no refresh would change the level schedule
+                // the caller sized its chain for, silently, and the failure
+                // would surface as a throw several layers away.
+                throw std::invalid_argument(
+                    "refresh_hidden needs the boot Galois key");
+            }
 
             const std::size_t want = static_cast<std::size_t>(in_channels) *
                                      static_cast<std::size_t>(hidden);
@@ -633,7 +642,8 @@ namespace heongpu
                     slots = batch_.to_slots(x, galois_key);
                 }
                 std::vector<Ciphertext<Scheme::CKKS>> hidden_out =
-                    feed_forward_slots(slots, weights, config, relin_key);
+                    feed_forward_slots(slots, weights, config, relin_key,
+                                       boot_key);
                 slots.clear();
 
                 Range _r_out("b16.ffn.from_slots");
@@ -705,6 +715,17 @@ namespace heongpu
                 up_slots.clear();
                 note_depth("feed_forward.hidden", hidden_slots);
 
+                if (config.refresh_hidden)
+                {
+                    // Taken here rather than at either end of the sublayer:
+                    // this is the point at which the SwiGLU's stretch actually
+                    // runs out, and it is already in slot form, so the refresh
+                    // costs no crossing of its own.
+                    bootstrap(hidden_slots, "feed_forward.hidden", *boot_key,
+                              relin_key);
+                    note_depth("feed_forward.hidden_refreshed", hidden_slots);
+                }
+
                 BatchActivation h =
                     batch_.from_slots(hidden_slots, x.rows, galois_key);
                 hidden_slots.clear();
@@ -743,7 +764,8 @@ namespace heongpu
             std::vector<Ciphertext<Scheme::CKKS>>& slots,
             const FeedForwardWeights& weights,
             const FeedForwardConfig& config,
-            Relinkey<Scheme::CKKS>& relin_key)
+            Relinkey<Scheme::CKKS>& relin_key,
+            Galoiskey<Scheme::CKKS>* boot_key)
         {
             const int in_channels = shape_.d_model;
             const int hidden = shape_.hidden;
@@ -751,6 +773,11 @@ namespace heongpu
             {
                 throw std::invalid_argument(
                     "feed_forward_slots takes d_model slot-form ciphertexts");
+            }
+            if (config.refresh_hidden && boot_key == nullptr)
+            {
+                throw std::invalid_argument(
+                    "refresh_hidden needs the boot Galois key");
             }
             const std::size_t want = static_cast<std::size_t>(in_channels) *
                                      static_cast<std::size_t>(hidden);
@@ -822,6 +849,14 @@ namespace heongpu
                 up.column.clear();
                 note_depth("feed_forward_slots.hidden", hidden_slots);
 
+                if (config.refresh_hidden)
+                {
+                    bootstrap(hidden_slots, "feed_forward_slots.hidden",
+                              *boot_key, relin_key);
+                    note_depth("feed_forward_slots.hidden_refreshed",
+                               hidden_slots);
+                }
+
                 BatchActivation h;
                 h.rows = tokens();
                 h.column = std::move(hidden_slots);
@@ -856,6 +891,200 @@ namespace heongpu
         }
 
         // -------------------------------------------------------------------
+        // The refresh
+        // -------------------------------------------------------------------
+
+        int Llama3Batch16Operator::Batch16RefreshConfig::count() const
+        {
+            if (!enabled)
+            {
+                return 0;
+            }
+            return static_cast<int>(entry) +
+                   static_cast<int>(after_attention_norm) +
+                   static_cast<int>(after_attention) + static_cast<int>(mid) +
+                   static_cast<int>(after_feed_forward_norm) +
+                   static_cast<int>(feed_forward_hidden);
+        }
+
+        int Llama3Batch16Operator::refresh_levels(
+            const BootstrappingConfig& config)
+        {
+            // The library's own accounting, not a measurement of it:
+            // regular_bootstrapping runs CoeffToSlot in CtoS_piece linear
+            // maps, EvalMod's sine at taylor_number, SlotToCoeff in
+            // StoC_piece, and spends eight more on the modular reduction's
+            // scaffolding. 25 at the default (3, 3, 11).
+            return config.CtoS_piece_ + config.taylor_number_ +
+                   config.StoC_piece_ + 8;
+        }
+
+        int Llama3Batch16Operator::chain_limbs_for(
+            int worst_stretch, const BootstrappingConfig& config)
+        {
+            if (worst_stretch < 0)
+            {
+                throw std::invalid_argument(
+                    "A stretch spends a non-negative number of levels");
+            }
+            // The refresh's own slice, the levels the stretch spends, and the
+            // one prime the next bootstrap is handed. Longer than this is not
+            // safer: every key switch to the next seam carries the unspent
+            // limbs and then the seam throws them away.
+            return refresh_levels(config) + worst_stretch + 1;
+        }
+
+        Ciphertext<Scheme::CKKS> Llama3Batch16Operator::bootstrap(
+            Ciphertext<Scheme::CKKS>& ct, Galoiskey<Scheme::CKKS>& boot_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            // Encoding-blind on purpose. The procedure puts the plaintext
+            // polynomial back the way it found it, so a matrix encryption is
+            // refreshed where it stands and no crossing is needed in front of
+            // it -- which is what makes batch 16's two-prime island legal.
+            return arith().bootstrap(ct, boot_key, relin_key);
+        }
+
+        void Llama3Batch16Operator::bootstrap(
+            std::vector<Ciphertext<Scheme::CKKS>>& ct, const char* name,
+            Galoiskey<Scheme::CKKS>& boot_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            if (ct.empty())
+            {
+                return;
+            }
+
+            Range _r(name);
+            // One at a time. A bootstrap fills the slots on its own, so there
+            // is nothing for two of them to share, and holding a second
+            // ciphertext at the raised modulus is exactly what a card running
+            // this width does not have.
+            for (auto& c : ct)
+            {
+                c = bootstrap(c, boot_key, relin_key);
+            }
+
+            apply_level_budget(ct, name);
+        }
+
+        void Llama3Batch16Operator::bootstrap(
+            BatchActivation& x, const char* name,
+            Galoiskey<Scheme::CKKS>& boot_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            bootstrap(x.column, name, boot_key, relin_key);
+        }
+
+        void Llama3Batch16Operator::apply_level_budget(
+            std::vector<Ciphertext<Scheme::CKKS>>& ct, const char* seam_name)
+        {
+            if (!level_budget || ct.empty())
+            {
+                return;
+            }
+            const int keep = level_budget(seam_name);
+            const int total = batch_.chain_limbs();
+            if (keep <= 0 || total <= 0 || keep >= total)
+            {
+                return;
+            }
+            const int target = total - keep;
+            for (auto& c : ct)
+            {
+                if (c.depth() < target)
+                {
+                    arith().drop_to_depth(c, target);
+                }
+            }
+        }
+
+        std::vector<int> Llama3Batch16Operator::rotation_indices() const
+        {
+            return batch_.rotation_indices();
+        }
+
+        std::vector<int> Llama3Batch16Operator::boot_rotation_indices() const
+        {
+            std::vector<int> all = batch_.rotation_indices();
+            const std::vector<int> boot = batch_.arith().
+                bootstrapping_key_indexs();
+            all.insert(all.end(), boot.begin(), boot.end());
+            std::sort(all.begin(), all.end());
+            all.erase(std::unique(all.begin(), all.end()), all.end());
+            return all;
+        }
+
+        void Llama3Batch16Operator::seam(const char* name, BatchActivation& x,
+                                         bool take,
+                                         Galoiskey<Scheme::CKKS>* boot_key,
+                                         Relinkey<Scheme::CKKS>& relin_key)
+        {
+            note_depth(name, x);
+            if (!take)
+            {
+                return;
+            }
+            if (boot_key == nullptr)
+            {
+                throw std::invalid_argument(
+                    std::string("The refresh at seam '") + name +
+                    "' needs the boot Galois key");
+            }
+            bootstrap(x, name, *boot_key, relin_key);
+            note_depth(name, x);
+        }
+
+        void Llama3Batch16Operator::seam(const char* name, Batch16Sequence& x,
+                                         bool take,
+                                         Galoiskey<Scheme::CKKS>* boot_key,
+                                         Relinkey<Scheme::CKKS>& relin_key)
+        {
+            if (x.empty())
+            {
+                return;
+            }
+            note_depth(name, x.block.front());
+            if (!take)
+            {
+                return;
+            }
+            if (boot_key == nullptr)
+            {
+                throw std::invalid_argument(
+                    std::string("The refresh at seam '") + name +
+                    "' needs the boot Galois key");
+            }
+            // Token blocks are independent here: a refresh is per ciphertext
+            // and a block is a set of them, so a sequence costs blocks times
+            // one block's refreshes and nothing else changes.
+            for (auto& b : x.block)
+            {
+                bootstrap(b, name, *boot_key, relin_key);
+            }
+            note_depth(name, x.block.front());
+        }
+
+        void Llama3Batch16Operator::check_refresh(
+            const TransformerBlockConfig& config,
+            Galoiskey<Scheme::CKKS>* boot_key) const
+        {
+            if (!config.refresh.enabled)
+            {
+                return;
+            }
+            if (boot_key == nullptr && config.refresh.count() > 0)
+            {
+                // Checked before any work rather than at the first seam, so a
+                // caller who forgot the key does not discover it half a block
+                // in with the levels already spent.
+                throw std::invalid_argument(
+                    "A block with refresh.enabled needs the boot Galois key, "
+                    "built from boot_rotation_indices()");
+            }
+        }
+
+        // -------------------------------------------------------------------
         // The whole block
         // -------------------------------------------------------------------
 
@@ -863,15 +1092,21 @@ namespace heongpu
             BatchActivation& x, const TransformerBlockWeights& weights,
             const TransformerBlockConfig& config,
             Galoiskey<Scheme::CKKS>& galois_key,
-            Relinkey<Scheme::CKKS>& relin_key)
+            Relinkey<Scheme::CKKS>& relin_key,
+            Galoiskey<Scheme::CKKS>* boot_key)
         {
             validate(x, shape_.d_model, "transformer_block");
+            check_refresh(config, boot_key);
 
             Range _r("b16.transformer_block");
 
             BatchActivation stream;
             stream.rows = x.rows;
             stream.column = x.column;
+
+            seam("block.entry", stream,
+                 config.refresh.enabled && config.refresh.entry, boot_key,
+                 relin_key);
 
             {
                 Range _r_half("b16.block.attention_half");
@@ -895,20 +1130,34 @@ namespace heongpu
 
                 BatchActivation normed = rms_norm(
                     stream, gain, config.attention_norm, galois_key, relin_key);
-                BatchActivation sub = batch_.attention(
-                    normed, aw, config.attention, galois_key, relin_key);
+                seam("block.after_attention_norm", normed,
+                     config.refresh.enabled && config.refresh.after_attention_norm,
+                     boot_key, relin_key);
+
+                BatchActivation sub =
+                    batch_.attention(normed, aw, config.attention, galois_key,
+                                     relin_key, boot_key);
                 normed.column.clear();
+                seam("block.after_attention", sub,
+                     config.refresh.enabled && config.refresh.after_attention,
+                     boot_key, relin_key);
+
                 // The two operands have been through completely different
                 // circuits, so neither the level nor the scale lines up; this
                 // is the one level a pre-norm residual pays.
                 stream.column =
                     arith().residual_add(stream.column, sub.column);
-                note_depth("block.after_attention", stream);
+                seam("block.mid", stream,
+                     config.refresh.enabled && config.refresh.mid, boot_key,
+                     relin_key);
             }
 
             {
                 Range _r_half("b16.block.feed_forward_half");
                 FeedForwardWeights fw = weights.feed_forward;
+                FeedForwardConfig fc = config.feed_forward;
+                fc.refresh_hidden = config.refresh.enabled &&
+                                    config.refresh.feed_forward_hidden;
                 std::vector<double> gain = weights.feed_forward_norm;
                 if (config.fold_norm_scale && !gain.empty())
                 {
@@ -922,12 +1171,187 @@ namespace heongpu
                 BatchActivation normed =
                     rms_norm(stream, gain, config.feed_forward_norm,
                              galois_key, relin_key);
-                BatchActivation sub = feed_forward(
-                    normed, fw, config.feed_forward, galois_key, relin_key);
+                seam("block.after_feed_forward_norm", normed,
+                     config.refresh.enabled &&
+                         config.refresh.after_feed_forward_norm,
+                     boot_key, relin_key);
+
+                BatchActivation sub =
+                    feed_forward(normed, fw, fc, galois_key, relin_key,
+                                 boot_key);
                 normed.column.clear();
                 stream.column =
                     arith().residual_add(stream.column, sub.column);
                 note_depth("block.out", stream);
+            }
+
+            return stream;
+        }
+
+        // -------------------------------------------------------------------
+        // A sequence longer than d tokens
+        // -------------------------------------------------------------------
+
+        void Llama3Batch16Operator::validate(const Batch16Sequence& x,
+                                             int channels,
+                                             const char* name) const
+        {
+            if (x.empty())
+            {
+                throw std::invalid_argument(
+                    std::string(name) +
+                    " takes at least one token block; an empty sequence is a "
+                    "caller bug, not an identity");
+            }
+            for (int t = 0; t < x.blocks(); ++t)
+            {
+                validate(x.block[static_cast<std::size_t>(t)], channels, name);
+                // Attention forms ONE denominator across every block, so a
+                // level or scale drift between blocks is a silently wrong
+                // SoftMax rather than an error from the library. This is the
+                // only place that sees it before the sum happens.
+                if (x.block[static_cast<std::size_t>(t)]
+                        .column.front()
+                        .depth() != x.block.front().column.front().depth() ||
+                    x.block[static_cast<std::size_t>(t)]
+                            .column.front()
+                            .scale() != x.block.front().column.front().scale())
+                {
+                    throw std::invalid_argument(
+                        std::string(name) +
+                        " needs every token block at one level and one scale");
+                }
+            }
+        }
+
+        Llama3Batch16Operator::Batch16Sequence
+        Llama3Batch16Operator::transformer_block(
+            Batch16Sequence& x, const TransformerBlockWeights& weights,
+            const TransformerBlockConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key,
+            Galoiskey<Scheme::CKKS>* boot_key)
+        {
+            validate(x, shape_.d_model, "transformer_block");
+            check_refresh(config, boot_key);
+
+            Range _r("b16.transformer_block_sequence");
+
+            const int blocks = x.blocks();
+
+            Batch16Sequence stream;
+            stream.block.reserve(static_cast<std::size_t>(blocks));
+            for (int t = 0; t < blocks; ++t)
+            {
+                BatchActivation copy;
+                copy.rows = x.block[static_cast<std::size_t>(t)].rows;
+                copy.column = x.block[static_cast<std::size_t>(t)].column;
+                stream.block.push_back(std::move(copy));
+            }
+
+            seam("block.entry", stream,
+                 config.refresh.enabled && config.refresh.entry, boot_key,
+                 relin_key);
+
+            {
+                Range _r_half("b16.block_seq.attention_half");
+                Llama3BatchOperator::BatchAttentionWeights aw =
+                    weights.attention;
+                std::vector<double> gain = weights.attention_norm;
+                if (config.fold_norm_scale && !gain.empty())
+                {
+                    fold_gain(aw.query, gain, shape_.d_model,
+                              config.attention.q_channels);
+                    fold_gain(aw.key, gain, shape_.d_model,
+                              config.attention.kv_channels);
+                    fold_gain(aw.value, gain, shape_.d_model,
+                              config.attention.kv_channels);
+                    gain.clear();
+                }
+
+                // RMSNorm reduces over CHANNELS, so it never looks along the
+                // token axis and a sequence is a plain loop over blocks. The
+                // whole of token blocking's cost is in attention, and this is
+                // the half of the block where that shows.
+                Batch16Sequence normed;
+                normed.block.reserve(static_cast<std::size_t>(blocks));
+                for (int t = 0; t < blocks; ++t)
+                {
+                    normed.block.push_back(rms_norm(
+                        stream.block[static_cast<std::size_t>(t)], gain,
+                        config.attention_norm, galois_key, relin_key));
+                }
+                seam("block.after_attention_norm", normed,
+                     config.refresh.enabled &&
+                         config.refresh.after_attention_norm,
+                     boot_key, relin_key);
+
+                std::vector<BatchActivation> sub = batch_.attention_sequence(
+                    normed.block, aw, config.attention, galois_key, relin_key,
+                    boot_key);
+                normed.block.clear();
+
+                Batch16Sequence out_seq;
+                out_seq.block = std::move(sub);
+                seam("block.after_attention", out_seq,
+                     config.refresh.enabled && config.refresh.after_attention,
+                     boot_key, relin_key);
+
+                for (int t = 0; t < blocks; ++t)
+                {
+                    stream.block[static_cast<std::size_t>(t)].column =
+                        arith().residual_add(
+                            stream.block[static_cast<std::size_t>(t)].column,
+                            out_seq.block[static_cast<std::size_t>(t)].column);
+                }
+                seam("block.mid", stream,
+                     config.refresh.enabled && config.refresh.mid, boot_key,
+                     relin_key);
+            }
+
+            {
+                Range _r_half("b16.block_seq.feed_forward_half");
+                FeedForwardWeights fw = weights.feed_forward;
+                FeedForwardConfig fc = config.feed_forward;
+                fc.refresh_hidden = config.refresh.enabled &&
+                                    config.refresh.feed_forward_hidden;
+                std::vector<double> gain = weights.feed_forward_norm;
+                if (config.fold_norm_scale && !gain.empty())
+                {
+                    fold_gain(fw.gate, gain, shape_.d_model, shape_.hidden);
+                    fold_gain(fw.up, gain, shape_.d_model, shape_.hidden);
+                    gain.clear();
+                }
+
+                Batch16Sequence normed;
+                normed.block.reserve(static_cast<std::size_t>(blocks));
+                for (int t = 0; t < blocks; ++t)
+                {
+                    normed.block.push_back(rms_norm(
+                        stream.block[static_cast<std::size_t>(t)], gain,
+                        config.feed_forward_norm, galois_key, relin_key));
+                }
+                seam("block.after_feed_forward_norm", normed,
+                     config.refresh.enabled &&
+                         config.refresh.after_feed_forward_norm,
+                     boot_key, relin_key);
+
+                for (int t = 0; t < blocks; ++t)
+                {
+                    // SwiGLU is slot-wise and blind to every index, so a token
+                    // block is an independent call. Released as it goes rather
+                    // than held: the whole sequence's hidden at once is
+                    // blocks * 4 * hidden ciphertexts and no card has that.
+                    BatchActivation sub = feed_forward(
+                        normed.block[static_cast<std::size_t>(t)], fw, fc,
+                        galois_key, relin_key, boot_key);
+                    normed.block[static_cast<std::size_t>(t)].column.clear();
+                    stream.block[static_cast<std::size_t>(t)].column =
+                        arith().residual_add(
+                            stream.block[static_cast<std::size_t>(t)].column,
+                            sub.column);
+                }
+                note_depth("block.out", stream.block.front());
             }
 
             return stream;

@@ -661,6 +661,22 @@ namespace heongpu
                 /// all -- THAT is where the levels are, two of them per
                 /// norm/SwiGLU pair.
                 bool slot_resident = false;
+                /// Refresh the hidden, in SLOT form, after the SiLU and the
+                /// gate product and before the down projection.
+                ///
+                /// This seam cannot be driven from outside the sublayer, and
+                /// that is why it is a flag here rather than one more entry in
+                /// Batch16RefreshConfig's list of block seams: the SwiGLU half
+                /// is the deepest stretch in the block at the paper's degree-31
+                /// SiLU, and the point where it runs out is INSIDE this
+                /// function. Refreshing at the sublayer's ends instead would
+                /// leave the same stretch unsplit.
+                ///
+                /// It refreshes the WIDE track -- one bootstrap per hidden
+                /// column of the chunk, so hidden_block is what bounds its
+                /// cost -- and it is taken in slot form, which is where the
+                /// hidden already is. Needs the boot key at the call.
+                bool refresh_hidden = false;
             };
 
             /**
@@ -682,7 +698,9 @@ namespace heongpu
                                          const FeedForwardWeights& weights,
                                          const FeedForwardConfig& config,
                                          Galoiskey<Scheme::CKKS>& galois_key,
-                                         Relinkey<Scheme::CKKS>& relin_key);
+                                         Relinkey<Scheme::CKKS>& relin_key,
+                                         Galoiskey<Scheme::CKKS>* boot_key =
+                                             nullptr);
 
             /**
              * @brief The same SwiGLU on a stream that is already in slot form.
@@ -706,7 +724,199 @@ namespace heongpu
             feed_forward_slots(std::vector<Ciphertext<Scheme::CKKS>>& slots,
                                const FeedForwardWeights& weights,
                                const FeedForwardConfig& config,
-                               Relinkey<Scheme::CKKS>& relin_key);
+                               Relinkey<Scheme::CKKS>& relin_key,
+                               Galoiskey<Scheme::CKKS>* boot_key = nullptr);
+
+            // ---------------------------------------------------------------
+            // The refresh
+            // ---------------------------------------------------------------
+            //
+            // Until now this path had NO bootstrapping at all -- not
+            // configured off, ABSENT: llama3_batch.cu and llama3_batch16.cu
+            // between them did not contain the word, no entry point took a
+            // boot key, and nothing could have supplied one. That is a
+            // different kind of gap from a missing optimisation, because at
+            // batch 16 the chain cannot carry a block:
+            //
+            //     batch = k/2 = 16  =>  k = 32, d = 128, N = 4096
+            //     the 128-bit cap at N = 4096 is 109 bits of log QP
+            //     41 + 33 + 33 = 107  =>  two Q primes and a special
+            //                          =>  ONE usable level
+            //
+            // and one block spends around sixty. A batch-16 block without a
+            // refresh is not slow, it is impossible. (At the library's demo
+            // chains, where every measurement on this path was actually taken,
+            // it merely runs ~23x outside 128-bit; LLAMA3_8B_LAYER_FLOW.md 24.)
+            //
+            // WHAT MAKES IT LEGAL, AND IT IS MEASURED RATHER THAN ARGUED.
+            // Regular bootstrapping is ModRaise -> CoeffToSlot -> EvalMod ->
+            // SlotToCoeff, whose net effect on the plaintext POLYNOMIAL is the
+            // identity with the modulus restored, and it reads no encoding
+            // tag. So it refreshes a Kang matrix encryption WHERE IT STANDS,
+            // with no crossing in front of it. That was genuinely open,
+            // because EvalMod's bound is on the plaintext COEFFICIENTS while
+            // this encoding puts an inverse length-k DFT there --
+            // test_ckks_batch_ringswitch.cpp's
+            // RegularBootstrapCarriesAMatrixEncryption answers it at the real
+            // island shape: 3.23e-05, 14.9 bits.
+            //
+            // It is also what decides the parameter set. A refresh that wanted
+            // slot form would need a bridge in front of it, that bridge is a
+            // level, the island would need three Q primes plus a special = 140
+            // bits against a cap of 109, and batch 16 would have no legal
+            // parameter set at all. It has one, by two bits.
+            //
+            // WHAT IT COSTS. A regular bootstrap spends CtoS + taylor + StoC +
+            // 8 levels of whatever chain it is handed, so a chain of L limbs
+            // hands back L - (that + 1) usable levels, and a schedule whose
+            // worst stretch is S wants exactly L = S + that + 1. Longer is not
+            // safer: it is slower, at dnum = 1 in proportion to L^2, for
+            // levels the circuit discards at the next seam. refresh_levels()
+            // and chain_limbs_for() are that arithmetic, so a caller can size
+            // a chain without running a circuit.
+
+            /**
+             * @brief Refresh one ciphertext, whatever encoding it carries.
+             *
+             * Nothing here reads @c encoding_, and that is the point: it is
+             * correct on a matrix encryption, on a slot ciphertext and on
+             * anything else the polynomial happens to mean.
+             *
+             * @c generate_bootstrapping_params must have run on arith()
+             * first -- on THIS operator's arithmetic half, since the
+             * bootstrapping context is per HEArithmeticOperator instance and
+             * not per HEContext -- and @p boot_key must hold
+             * boot_rotation_indices(). A shift-vector Galois key asked for an
+             * index it does not hold is undefined behaviour rather than an
+             * error, which is why that union exists as a function.
+             */
+            Ciphertext<Scheme::CKKS>
+            bootstrap(Ciphertext<Scheme::CKKS>& ct,
+                      Galoiskey<Scheme::CKKS>& boot_key,
+                      Relinkey<Scheme::CKKS>& relin_key);
+
+            /** @brief Refresh every ciphertext of a column set, in place. */
+            void bootstrap(std::vector<Ciphertext<Scheme::CKKS>>& ct,
+                           const char* name,
+                           Galoiskey<Scheme::CKKS>& boot_key,
+                           Relinkey<Scheme::CKKS>& relin_key);
+
+            /** @brief Refresh a matrix encryption, in place. */
+            void bootstrap(BatchActivation& x, const char* name,
+                           Galoiskey<Scheme::CKKS>& boot_key,
+                           Relinkey<Scheme::CKKS>& relin_key);
+
+            /**
+             * @brief Which seams of a block take a refresh.
+             *
+             * Close to the seam set the rectangular path uses, and
+             * deliberately so: the circuit is the same shape, and a schedule
+             * comparable across the two paths is worth more than one tuned to
+             * this one. Switching a seam off is what shows it was needed --
+             * the stretch behind it runs out and the operation that wanted the
+             * level throws, rather than returning noise.
+             */
+            struct Batch16RefreshConfig
+            {
+                /// Refresh at all. OFF by default, so every measurement taken
+                /// before this existed -- which is all of them -- reproduces
+                /// unchanged.
+                bool enabled = false;
+                /// The residual stream on the way in. False for the first
+                /// block of a stack, whose input is already fresh; true is
+                /// what joins one block to the next.
+                bool entry = false;
+                /// The normalised stream, before the projections read it.
+                bool after_attention_norm = true;
+                /// The attention sublayer's output, before the residual add.
+                /// The sublayer's own internal refresh -- the SoftMax's narrow
+                /// auxiliary track -- is
+                /// BatchSoftmaxSeamConfig::refresh_denominator and is not
+                /// duplicated here.
+                bool after_attention = true;
+                /// The residual stream between the two halves.
+                bool mid = true;
+                /// The normalised stream, before the gate and up projections.
+                bool after_feed_forward_norm = true;
+                /// The SwiGLU hidden, after the SiLU and the gate product.
+                /// The SwiGLU half is the deepest stretch in the block at the
+                /// paper's degree-31 SiLU, so it is this seam or a degree
+                /// nobody fits a SiLU at.
+                bool feed_forward_hidden = true;
+
+                /// Refreshes one block takes with these flags.
+                int count() const;
+            };
+
+            /**
+             * @brief Levels one regular bootstrap spends on itself.
+             *
+             * CtoS + taylor + StoC + 8, read off the configuration rather than
+             * hard coded, so a caller who changes the configuration gets an
+             * answer instead of a stale constant. 25 at the default (3, 3, 11).
+             */
+            static int refresh_levels(const BootstrappingConfig& config);
+
+            /**
+             * @brief The chain a schedule wants, in limbs.
+             *
+             * @param worst_stretch The most levels spent between two
+             *                      consecutive refreshes. @c depth_trace is
+             *                      how that is measured; it does not follow
+             *                      from the shape.
+             *
+             * One more than the stretch plus the refresh, because a bootstrap
+             * is handed a ciphertext with one prime left.
+             */
+            static int chain_limbs_for(int worst_stretch,
+                                       const BootstrappingConfig& config);
+
+            /**
+             * @brief Every rotation index THIS module's layers can ask for.
+             *
+             * The bridge's and the products', which are the same set -- both
+             * are the multiples of k/2 -- and nothing else: the reductions
+             * here are slot-wise additions and RoPE pairs whole ciphertexts,
+             * so no layer in this module asks for an index of its own.
+             */
+            std::vector<int> rotation_indices() const;
+
+            /**
+             * @brief The union of that with the bootstrapping key indices.
+             *
+             * BUILD THE KEY FROM THIS, not from either half. A Galois key in
+             * shift-vector form asked for an index it does not hold is
+             * undefined behaviour and not an error, so a caller who generates
+             * two keys and hands over the wrong one gets a wrong answer
+             * silently. Sorted and deduplicated.
+             *
+             * @c generate_bootstrapping_params must have run on arith()
+             * before this is called: the bootstrapping index list does not
+             * exist until it has.
+             */
+            std::vector<int> boot_rotation_indices() const;
+
+            /**
+             * @brief Limbs to keep after the refresh at each named seam.
+             *
+             * A bootstrap hands back a fixed depth wherever it is taken, and a
+             * stretch almost never wants all of it -- and the difference is
+             * not free to hold. METHOD_II reads its digit count from
+             * @c d_leveled[depth] and its RNS width from @c Q_prime_size -
+             * depth, so an unspent limb is carried by every key switch until
+             * the next refresh and then discarded. On this path that is
+             * hundreds of thousands of key switches per block.
+             *
+             * Called with the seam's name once its refresh is done. Return the
+             * limbs the stretch behind it needs -- one MORE than it spends,
+             * because the next bootstrap wants a ciphertext with one prime
+             * left. Return <= 0, or leave this empty, to keep whatever the
+             * bootstrap handed back.
+             *
+             * Too small does not corrupt anything silently: the stretch runs
+             * out and the operation that wanted the level throws.
+             */
+            std::function<int(const char* seam)> level_budget;
 
             // ---------------------------------------------------------------
             // The whole block
@@ -737,6 +947,10 @@ namespace heongpu
                 /// applying them homomorphically. Exact, host-side, and worth
                 /// a level and d_model plaintext encodes per norm.
                 bool fold_norm_scale = true;
+                /// Where the block refreshes. Disabled by default; a block
+                /// with @c refresh.enabled needs a boot key at the call and
+                /// generate_bootstrapping_params to have run on arith().
+                Batch16RefreshConfig refresh;
             };
 
             /**
@@ -766,7 +980,79 @@ namespace heongpu
                               const TransformerBlockWeights& weights,
                               const TransformerBlockConfig& config,
                               Galoiskey<Scheme::CKKS>& galois_key,
-                              Relinkey<Scheme::CKKS>& relin_key);
+                              Relinkey<Scheme::CKKS>& relin_key,
+                              Galoiskey<Scheme::CKKS>* boot_key = nullptr);
+
+            // ---------------------------------------------------------------
+            // A sequence longer than d tokens
+            // ---------------------------------------------------------------
+            //
+            // d IS the sequence length on this path, and at batch 16 the ring
+            // pins it to 128. Llama-3-8B's context is 8192, so every
+            // measurement this path has produced covered 1/64 of the model,
+            // and there was no code path to the rest of it.
+            // Llama3BatchOperator::attention_sequence is the m^2 attention
+            // schedule; this is the block driver over it.
+            //
+            // The non-linear half needs nothing new, and it is worth saying
+            // why rather than merely doing it: RMSNorm reduces over CHANNELS
+            // and SwiGLU is slot-wise, so neither looks along the token axis
+            // at all. A sequence is a loop over token blocks for both, with no
+            // interaction between blocks and no new key material. Attention is
+            // the only layer in a transformer block that couples tokens, which
+            // is exactly why it is the only one that pays here.
+
+            /** @brief A sequence as token blocks of d rows each. */
+            struct Batch16Sequence
+            {
+                /// Block t holds tokens [t*d, (t+1)*d) of every one of the
+                /// k/2 instances. All blocks at one level and one scale.
+                std::vector<BatchActivation> block;
+
+                int blocks() const { return static_cast<int>(block.size()); }
+                bool empty() const { return block.empty(); }
+                /// Channels each block carries.
+                int columns() const
+                {
+                    return block.empty() ? 0 : block.front().columns();
+                }
+            };
+
+            /**
+             * @brief Check a sequence is the shape this module expects.
+             *
+             * @throws std::invalid_argument if it is empty, if a block is not
+             *         d rows by @p channels columns, or if the blocks have
+             *         drifted apart in level or scale -- the last of which is
+             *         silent everywhere else and turns into a wrong SoftMax
+             *         denominator inside attention.
+             */
+            void validate(const Batch16Sequence& x, int channels,
+                          const char* name) const;
+
+            /** @brief Tokens a sequence of @p blocks token blocks carries. */
+            int sequence_tokens(int blocks) const { return blocks * tokens(); }
+
+            /**
+             * @brief One pre-norm transformer block over a whole sequence.
+             *
+             * The same circuit as the single-block driver with attention
+             * replaced by its causal blocked form, and every other layer run
+             * per token block. At one block it is arithmetically identical to
+             * transformer_block(BatchActivation&, ...) -- asserted by test
+             * rather than by inspection.
+             *
+             * @param boot_key Required when @c config.refresh.enabled;
+             *                 otherwise unused and may be null. Must hold
+             *                 boot_rotation_indices().
+             */
+            Batch16Sequence
+            transformer_block(Batch16Sequence& x,
+                              const TransformerBlockWeights& weights,
+                              const TransformerBlockConfig& config,
+                              Galoiskey<Scheme::CKKS>& galois_key,
+                              Relinkey<Scheme::CKKS>& relin_key,
+                              Galoiskey<Scheme::CKKS>* boot_key = nullptr);
 
             // ---------------------------------------------------------------
             // The bridge, which is the only thing here that costs anything
@@ -823,6 +1109,30 @@ namespace heongpu
                             const std::vector<Ciphertext<Scheme::CKKS>>& ct)
                 const;
             void note_depth(const char* name, const BatchActivation& x) const;
+
+            /// Drop to the limbs @c level_budget asks for at this seam. A
+            /// no-op when the hook is empty, which is the default.
+            void apply_level_budget(std::vector<Ciphertext<Scheme::CKKS>>& ct,
+                                    const char* seam);
+
+            /// One named seam of the block schedule: trace the depth, and
+            /// refresh if @p take says so. Every seam in both drivers goes
+            /// through here, so a seam cannot be traced without being
+            /// refreshable or refreshed without being traced.
+            void seam(const char* name, BatchActivation& x, bool take,
+                      Galoiskey<Scheme::CKKS>* boot_key,
+                      Relinkey<Scheme::CKKS>& relin_key);
+
+            /// The same over a whole sequence: one refresh per token block.
+            void seam(const char* name, Batch16Sequence& x, bool take,
+                      Galoiskey<Scheme::CKKS>* boot_key,
+                      Relinkey<Scheme::CKKS>& relin_key);
+
+            /// Everything the two block drivers share: the gain folds and the
+            /// per-block layer calls, with the seams named identically so the
+            /// single-block and sequence schedules cannot drift apart.
+            void check_refresh(const TransformerBlockConfig& config,
+                               Galoiskey<Scheme::CKKS>* boot_key) const;
 
             /// Shape-independent config validation, shared by the two norm
             /// entry points so a slot-form caller cannot skip it.
