@@ -670,7 +670,8 @@ namespace heongpu
             const std::vector<Ciphertext<Scheme::CKKS>*>& a,
             const std::vector<Ciphertext<Scheme::CKKS>*>& b, const char* name,
             Galoiskey<Scheme::CKKS>& galois_key,
-            Relinkey<Scheme::CKKS>& relin_key)
+            Relinkey<Scheme::CKKS>& relin_key,
+            HEBatchMatrixOperator<Scheme::CKKS>::RightOperandForm b_form)
         {
             if (static_cast<int>(a.size()) != layout_.d ||
                 static_cast<int>(b.size()) != layout_.d)
@@ -678,7 +679,36 @@ namespace heongpu
                 throw std::invalid_argument(
                     std::string("The ") + name +
                     " product needs both operands square at layout.d columns, "
-                    "which is what Algorithm 4's three internal CMTs assume");
+                    "which is what Algorithm 4's internal CMTs assume");
+            }
+
+            // ccmm checks the count and the level and then writes
+            // scale_a * scale_b unconditionally. A scale mismatch therefore
+            // passes every guard and comes back as a silently wrong product,
+            // so it is caught here: matmul() screens its operands through
+            // require_uniform, but attention() calls this directly on
+            // borrowed columns and nothing else looks.
+            const double scale_a = a[0]->scale();
+            const double scale_b = b[0]->scale();
+            for (const auto* c : a)
+            {
+                if (c->scale() != scale_a)
+                {
+                    throw std::invalid_argument(
+                        std::string("The ") + name +
+                        " product's left operand has drifted in scale across "
+                        "its columns");
+                }
+            }
+            for (const auto* c : b)
+            {
+                if (c->scale() != scale_b)
+                {
+                    throw std::invalid_argument(
+                        std::string("The ") + name +
+                        " product's right operand has drifted in scale across "
+                        "its columns");
+                }
             }
 
             char range_name[64];
@@ -687,7 +717,7 @@ namespace heongpu
 
             std::vector<Ciphertext<Scheme::CKKS>> out;
             matrix_.ccmm(out, a, b, galois_key, relin_key, arith_,
-                         /*rescale=*/true);
+                         /*rescale=*/true, b_form);
 
             // Algorithm 4, like Algorithm 1, only MARKS the rescale: it leaves
             // the product at scale_a * scale_b and sets rescale_required_.
@@ -850,26 +880,38 @@ namespace heongpu
             BatchActivation v = project(x, weights.value, config.in_channels,
                                         config.kv_channels, "attention.v");
 
-            // K^T, one CMT per channel block. This is the only transpose the
-            // sublayer pays for: the value product P V already reads V with
-            // the key on its rows, which is where the projection left it.
-            std::vector<Ciphertext<Scheme::CKKS>> key_t;
-            key_t.reserve(k.column.size());
-            {
-                Range _r("attention.transpose_key");
-                for (int base = 0; base < k.columns(); base += d)
-                {
-                    std::vector<Ciphertext<Scheme::CKKS>> block(
-                        k.column.begin() + base, k.column.begin() + base + d);
-                    matrix_.cmt(block, galois_key, arith_);
-                    for (auto& c : block)
-                    {
-                        key_t.push_back(std::move(c));
-                    }
-                }
-            }
-
+            // K is NOT transposed here, and that is the point.
+            //
+            // The scores are S = Q K^T. This used to build K^T with a CMT per
+            // channel block and hand it to Algorithm 4, whose step 1 opens by
+            // transposing its right operand -- so K was transposed twice and
+            // the pair composed to the identity. A CMT is a genuine matrix
+            // transpose and therefore an involution on the encoding, so the
+            // two cancel exactly.
+            //
+            // What the algorithm actually needs from step 1 is the ROW-wise
+            // encryption of its right operand, and the row-wise encryption of
+            // K^T is the column-wise encryption of K -- which is what the
+            // projection already handed back. So the projection's own output
+            // is passed straight in, marked row_wise, and both CMTs are gone:
+            // d - 1 rotations per score product plus one whole standalone CMT
+            // per kv channel block, a deep copy of d ciphertexts per product,
+            // and the entire K^T array. It is also STRICTLY more accurate --
+            // the step-1 CMT's key-switching noise is multiplied by the left
+            // operand in the GEMM and is the dominant term in the product's
+            // error.
             const int group = heads / kv_heads;
+
+            // V does still owe the step-1 transpose: P V wants V row-wise and
+            // the projection leaves it column-wise, and no reordering of the
+            // product can conjure the transpose the way it cancels for K.
+            // But under grouped-query attention `group` consecutive heads
+            // share one V block, and Algorithm 4 transposed it once per head.
+            // It is transposed here instead -- once per distinct block, in
+            // place, at the level P will meet it at -- and every head in the
+            // group then reads the same row-wise copy.
+            std::vector<bool> value_is_row_wise(
+                static_cast<size_t>(std::max(v.columns(), 0)), false);
 
             BatchActivation out;
             out.rows = x.rows;
@@ -892,10 +934,15 @@ namespace heongpu
                         for (int j = 0; j < d; ++j)
                         {
                             lhs.push_back(&q.column[q_base + t * d + j]);
-                            rhs.push_back(&key_t[kv_base + t * d + j]);
+                            rhs.push_back(&k.column[kv_base + t * d + j]);
                         }
+                        // row_wise: K's column-wise encryption IS the row-wise
+                        // encryption of K^T, so this computes Q K^T with no
+                        // transpose at all.
                         std::vector<Ciphertext<Scheme::CKKS>> term = product(
-                            lhs, rhs, "attention.score", galois_key, relin_key);
+                            lhs, rhs, "attention.score", galois_key, relin_key,
+                            HEBatchMatrixOperator<
+                                Scheme::CKKS>::RightOperandForm::row_wise);
                         if (scores.empty())
                         {
                             scores = std::move(term);
@@ -958,19 +1005,51 @@ namespace heongpu
                     const int depth = p.column.front().depth();
                     for (int t = 0; t < per_head; ++t)
                     {
-                        std::vector<Ciphertext<Scheme::CKKS>> value(
-                            v.column.begin() + kv_base + t * d,
-                            v.column.begin() + kv_base + (t + 1) * d);
+                        const int base = kv_base + t * d;
+
+                        // The value block is used in place rather than sliced
+                        // out: ccmm reads its right operand and never writes
+                        // it, so the copy this used to make was `group` deep
+                        // copies of d ciphertexts for nothing. The mod drop is
+                        // idempotent, so heads after the first in a group fall
+                        // straight through it.
+                        for (int j = 0; j < d; ++j)
+                        {
+                            arith_.drop_to_depth(v.column[base + j], depth);
+                        }
+
+                        // First head of the group pays the transpose; the rest
+                        // inherit it. Dropping before transposing rather than
+                        // after is deliberate -- the CMT is d - 1 rotations
+                        // and a rotation costs what the live limb count says.
+                        if (!value_is_row_wise[static_cast<size_t>(base)])
+                        {
+                            Range _r_t("attention.transpose_value");
+                            std::vector<Ciphertext<Scheme::CKKS>> block;
+                            block.reserve(static_cast<size_t>(d));
+                            for (int j = 0; j < d; ++j)
+                            {
+                                block.push_back(std::move(v.column[base + j]));
+                            }
+                            matrix_.cmt(block, galois_key, arith_);
+                            for (int j = 0; j < d; ++j)
+                            {
+                                v.column[base + j] = std::move(block[j]);
+                            }
+                            value_is_row_wise[static_cast<size_t>(base)] = true;
+                        }
+
                         std::vector<Ciphertext<Scheme::CKKS>*> lhs, rhs;
                         for (int j = 0; j < d; ++j)
                         {
-                            arith_.drop_to_depth(value[j], depth);
                             lhs.push_back(&p.column[j]);
-                            rhs.push_back(&value[j]);
+                            rhs.push_back(&v.column[base + j]);
                         }
                         std::vector<Ciphertext<Scheme::CKKS>> head_out =
                             product(lhs, rhs, "attention.value", galois_key,
-                                    relin_key);
+                                    relin_key,
+                                    HEBatchMatrixOperator<Scheme::CKKS>::
+                                        RightOperandForm::row_wise);
                         for (auto& c : head_out)
                         {
                             out.column.push_back(std::move(c));

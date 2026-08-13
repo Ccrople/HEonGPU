@@ -447,6 +447,140 @@ TEST(HEonGPU, CKKS_Llama3Batch_AttentionMatchesHostAttention)
     EXPECT_LT(worst, 5e-2);
 }
 
+// Grouped-query attention, which nothing in this repo had ever executed:
+// every other configuration sets heads = 1, so group = heads / kv_heads = 1 and
+// the whole kv_base / per_head indexing at the top of the head loop had never
+// run with two heads sharing a block.
+//
+// It is exercised here because the sublayer now shares work across the group:
+// the value block is transposed once per DISTINCT block rather than once per
+// head, in place, and the heads after the first read the transposed copy. With
+// group = 2 a mistake in that sharing -- transposing twice, transposing the
+// wrong block, or letting the second head see a block at the wrong level --
+// changes the answer for exactly half the heads, which the reference below
+// catches head by head.
+TEST(HEonGPU, CKKS_Llama3Batch_GroupedQueryAttentionMatchesHostAttention)
+{
+    Fixture f(34);
+    const int d = Fixture::d;
+    const int channels = d;
+    const int heads = 4;
+    const int kv_heads = 2;
+    const int group = heads / kv_heads;
+    const int q_channels = heads * d;
+    const int kv_channels = kv_heads * d;
+
+    namespace llama = heongpu::llama;
+
+    const auto x = f.random_batch(d, channels, 909u);
+    const double amp = 1.0 / std::sqrt(static_cast<double>(channels));
+    const auto wq = random_weight(channels, q_channels, 81u, amp);
+    const auto wk = random_weight(channels, kv_channels, 82u, amp);
+    const auto wv = random_weight(channels, kv_channels, 83u, amp);
+
+    // Host reference: project once at full width, then slice per head. Head h
+    // reads query block h and key/value block h / group -- the sharing the
+    // circuit is being asked to exploit.
+    auto slice = [&](const std::vector<double>& m, int cols, int base)
+    {
+        std::vector<double> s(static_cast<size_t>(d) * d);
+        for (int r = 0; r < d; ++r)
+            for (int c = 0; c < d; ++c)
+                s[static_cast<size_t>(r) * d + c] =
+                    m[static_cast<size_t>(r) * cols + base + c];
+        return s;
+    };
+
+    std::vector<std::vector<std::vector<double>>> raw(f.layout.batch);
+    std::vector<std::vector<std::vector<double>>> value(f.layout.batch);
+    double highest = -1e300;
+    double lowest = 1e300;
+    for (int s = 0; s < f.layout.batch; ++s)
+    {
+        const auto q = host_product(x[s], wq, d, channels, q_channels);
+        const auto k = host_product(x[s], wk, d, channels, kv_channels);
+        const auto v = host_product(x[s], wv, d, channels, kv_channels);
+        raw[s].resize(heads);
+        value[s].resize(heads);
+        for (int h = 0; h < heads; ++h)
+        {
+            const auto qh = slice(q, q_channels, h * d);
+            const auto kh = slice(k, kv_channels, (h / group) * d);
+            value[s][h] = slice(v, kv_channels, (h / group) * d);
+            raw[s][h] = host_product(qh, host_transpose(kh, d, d), d, d, d);
+            for (int u = 0; u < d; ++u)
+                for (int j = 0; j <= u; ++j)
+                {
+                    const double val = raw[s][h][static_cast<size_t>(u) * d + j];
+                    highest = std::max(highest, val);
+                    lowest = std::min(lowest, val);
+                }
+        }
+    }
+
+    llama::Llama3BatchOperator::BatchAttentionConfig config;
+    config.in_channels = channels;
+    config.q_channels = q_channels;
+    config.kv_channels = kv_channels;
+    config.heads = heads;
+    config.kv_heads = kv_heads;
+    config.causal = true;
+    config.head_scale = 2.0 / (highest - lowest);
+    config.score_shift = highest * config.head_scale;
+    config.softmax.bound = 2.0;
+    config.softmax.iterations = 2;
+    config.softmax.exp_degree = 15;
+    config.softmax.inverse_degree = 15;
+    config.softmax.inverse_newton = 2;
+
+    std::vector<std::vector<double>> want(f.layout.batch);
+    for (int s = 0; s < f.layout.batch; ++s)
+    {
+        want[s].assign(static_cast<size_t>(d) * q_channels, 0.0);
+        for (int h = 0; h < heads; ++h)
+        {
+            std::vector<double> p(static_cast<size_t>(d) * d, 0.0);
+            for (int u = 0; u < d; ++u)
+            {
+                double total = 0.0;
+                for (int j = 0; j <= u; ++j)
+                {
+                    const double e =
+                        std::exp(raw[s][h][static_cast<size_t>(u) * d + j] *
+                                     config.head_scale -
+                                 config.score_shift);
+                    p[static_cast<size_t>(u) * d + j] = e;
+                    total += e;
+                }
+                for (int j = 0; j <= u; ++j)
+                    p[static_cast<size_t>(u) * d + j] /= total;
+            }
+            const auto head_out = host_product(p, value[s][h], d, d, d);
+            for (int r = 0; r < d; ++r)
+                for (int c = 0; c < d; ++c)
+                    want[s][static_cast<size_t>(r) * q_channels + h * d + c] =
+                        head_out[static_cast<size_t>(r) * d + c];
+        }
+    }
+
+    llama::Llama3BatchOperator::BatchAttentionWeights weights;
+    weights.query = wq;
+    weights.key = wk;
+    weights.value = wv;
+
+    auto ct = f.op->encrypt(x, d, channels, *f.encryptor, f.scale);
+    auto out = f.op->attention(ct, weights, config, *f.galois, *f.relin);
+    ASSERT_EQ(out.columns(), q_channels);
+
+    const auto got =
+        f.op->decrypt(out, *f.decryptor, out.column.front().scale());
+
+    const double worst = max_abs_diff(want, got);
+    std::cout << "grouped-query attention worst absolute error: " << worst
+              << std::endl;
+    EXPECT_LT(worst, 5e-2);
+}
+
 // RMSNorm behind the bridge. The channel axis runs across ciphertexts here, so
 // the mean of the squares is a slot-wise addition and the reduction that costs
 // the slot path log2(channels) rotations costs this path nothing; what is

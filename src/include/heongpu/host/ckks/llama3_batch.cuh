@@ -539,11 +539,21 @@ namespace heongpu
 
             /// Algorithm 4 on borrowed columns, so a block product never has
             /// to copy a ciphertext just to name its operands.
+            ///
+            /// @param b_form Whether @p b still owes Algorithm 4's step-1
+            ///               transpose. Handing over an operand that is
+            ///               already row-wise computes A * B^T for the B that
+            ///               operand encrypts column-wise -- which is what
+            ///               the score product wants, and is how it stops
+            ///               transposing K twice for nothing.
             std::vector<Ciphertext<Scheme::CKKS>>
             product(const std::vector<Ciphertext<Scheme::CKKS>*>& a,
                     const std::vector<Ciphertext<Scheme::CKKS>*>& b,
                     const char* name, Galoiskey<Scheme::CKKS>& galois_key,
-                    Relinkey<Scheme::CKKS>& relin_key);
+                    Relinkey<Scheme::CKKS>& relin_key,
+                    HEBatchMatrixOperator<Scheme::CKKS>::RightOperandForm
+                        b_form = HEBatchMatrixOperator<
+                            Scheme::CKKS>::RightOperandForm::column_wise);
 
             /// The prime the next rescale of @p ct will divide by.
             double rescale_prime(const Ciphertext<Scheme::CKKS>& ct) const;
