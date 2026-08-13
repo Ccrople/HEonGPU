@@ -1297,7 +1297,16 @@ namespace heongpu
         out.clear();
         out.reserve(cols_out);
         for (int j = 0; j < cols_out; ++j)
+        {
             out.emplace_back(*in[0]); // inherits level, scale and shape
+            // ...including a cipher_size_ that may be a stale 3, because
+            // relinearize_inplace clears the flag and never writes the field
+            // back. Only components 0 and 1 are written below, so the product
+            // IS degree two, and it says so here rather than handing the
+            // staleness on to whatever reads it next.
+            out.back().cipher_size_ = 2;
+            out.back().relinearization_required_ = false;
+        }
 
         std::vector<Data64*> in_base(inner), out_base(cols_out);
         for (int j = 0; j < inner; ++j)
@@ -1393,8 +1402,21 @@ namespace heongpu
                     "and the debt would be lost rather than carried");
             // Only components 0 and 1 are addressed, through comp_stride. A
             // degree-3 operand would have its third component ignored and the
-            // output would inherit cipher_size_ = 3 while holding two.
-            if (c->relinearization_required_ || c->cipher_size_ != 2)
+            // output would inherit a size it does not hold.
+            //
+            // The test is the FLAG and not cipher_size_, and that distinction
+            // is load-bearing: relinearize_inplace (operator.cuh, the CKKS
+            // overload) clears relinearization_required_ but never writes
+            // cipher_size_ back to 2, so a ciphertext that has been through
+            // multiply + relinearize is genuinely degree two while still
+            // REPORTING three, for the rest of its life. The library treats
+            // the flag as the authority elsewhere for exactly this reason --
+            // operator.cuh derives the size as
+            // `relinearization_required_ ? 3 : 2` rather than reading the
+            // field. Testing the stale field here rejected every projection
+            // taken on a product, which is what a slot-resident SwiGLU does at
+            // its down projection and what section 22.6 turns on.
+            if (c->relinearization_required_)
                 throw std::invalid_argument(
                     "PCMM needs degree-two ciphertexts; relinearize first, "
                     "because only two components are addressed and the third "
@@ -1434,7 +1456,16 @@ namespace heongpu
         out.clear();
         out.reserve(cols_out);
         for (int j = 0; j < cols_out; ++j)
+        {
             out.emplace_back(*in[0]); // inherits level, scale and shape
+            // ...including a cipher_size_ that may be a stale 3, because
+            // relinearize_inplace clears the flag and never writes the field
+            // back. Only components 0 and 1 are written below, so the product
+            // IS degree two, and it says so here rather than handing the
+            // staleness on to whatever reads it next.
+            out.back().cipher_size_ = 2;
+            out.back().relinearization_required_ = false;
+        }
 
         // Pointer tables: [limb][col] -> start of that limb inside the
         // component, so the kernels can address each ciphertext independently.

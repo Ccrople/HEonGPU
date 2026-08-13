@@ -12,6 +12,7 @@ set(EXECUTABLES
     ckks_profile profile_ckks.cpp
     llama3_profile profile_llama3.cpp
     llama3_batch_profile profile_llama3_batch.cpp
+    llama3_batch16_block_profile profile_llama3_batch16_block.cpp
     llama3_nobatch_profile profile_llama3_nobatch.cpp
     llama3_rect_profile profile_llama3_rect.cpp
     llama3_rect_boot_profile profile_llama3_rect_boot.cpp
