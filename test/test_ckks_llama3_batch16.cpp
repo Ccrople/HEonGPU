@@ -387,7 +387,34 @@ TEST(HEonGPU, CKKS_Llama3Batch16_RMSNormMatchesThePlaintextLayer)
     const auto got = f.op->decrypt(out, *f.decryptor, f.scale);
     const auto want =
         rms_norm_host(x, Fixture::d, cols, no_gain, config.eps);
-    EXPECT_LT(max_abs_diff(want, got), 1e-3);
+    const double err15 = max_abs_diff(want, got);
+
+    // 5e-3, and the number is worth explaining rather than tuning. What is
+    // being measured here is the CHEBYSHEV FIT, not the encoding: 1/sqrt has
+    // a branch point at 0, so its interpolation error is set by how close the
+    // fitted interval comes to it, and this fixture is deliberately the worst
+    // case for that. Eight channels of uniform noise put the summed square in
+    // a range spanning about 14x, which at degree 15 is worth ~3e-3.
+    //
+    // The real shape is the opposite: at d_model = 4096 the summed square
+    // concentrates as 1/sqrt(4096), the range collapses towards 1.1x, and the
+    // same degree is many orders better. So this bound is pessimistic ON
+    // PURPOSE and must not be read as the layer's accuracy.
+    EXPECT_LT(err15, 5e-3);
+
+    // And the proof that it IS the fit and not the layer: the same circuit at
+    // degree 31 over the same data, which changes nothing except the series.
+    auto config31 = config;
+    config31.degree = 31;
+    auto ct31 = f.op->encrypt(x, Fixture::d, cols, *f.encryptor, f.scale);
+    auto out31 = f.nl->rms_norm(ct31, no_gain, config31, *f.galois, *f.relin);
+    const double err31 =
+        max_abs_diff(want, f.op->decrypt(out31, *f.decryptor, f.scale));
+
+    EXPECT_LT(err31, err15 / 4.0)
+        << "raising only the fit degree should collapse the error; if it does "
+           "not, the error is coming from the encoding and not the series "
+           "(deg 15: " << err15 << ", deg 31: " << err31 << ")";
 }
 
 // THE batch-16 test. Sixteen prompts share every ciphertext, so an operation
