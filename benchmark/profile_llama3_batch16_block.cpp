@@ -51,6 +51,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <limits>
 #include <vector>
 
 namespace
@@ -397,8 +398,29 @@ int main()
         op.encrypt(x, d, model, encryptor, scale);
     Batch ref = x;
 
-    auto decrypt = [&](llama::BatchActivation& a) {
-        return op.decrypt(a, decryptor, scale);
+    // A decrypt that cannot take the driver down with it. When a fit is
+    // evaluated outside its interval the plaintext outgrows int64 and the
+    // Garner reconstruction throws -- which is exactly the case worth
+    // REPORTING, because a crash at that point loses the ledger that says
+    // which stage did it.
+    bool decrypt_failed = false;
+    auto decrypt = [&](llama::BatchActivation& a) -> Batch {
+        try
+        {
+            return op.decrypt(a, decryptor, scale);
+        }
+        catch (const std::exception& e)
+        {
+            decrypt_failed = true;
+            std::cout << "[b16] DECRYPT FAILED: " << e.what()
+                      << "
+[b16] the value has outgrown the scale, which "
+                         "means a fit was evaluated outside its interval"
+                      << std::endl;
+            return Batch(static_cast<size_t>(instances),
+                         Mat(a.column.size() * static_cast<size_t>(d),
+                             std::numeric_limits<double>::quiet_NaN()));
+        }
     };
     auto tick = [] { return Clock::now(); };
     auto ms = [](Clock::time_point a, Clock::time_point b) {
@@ -494,6 +516,32 @@ int main()
                         smin = std::min(smin, acc);
                     }
         }
+        // CALIBRATE THE MODEL, not just the fit. Random weights at this width
+        // put the raw scores across a span of hundreds, and the SoftMax fits
+        // exp over [-bound, 0] with bound = that span -- a dynamic range of
+        // e^(span/4) that no degree any circuit can afford will carry. A
+        // trained model does not do this: attention scores are bounded, which
+        // is the premise Section 4.3's calibration rests on. So the query
+        // weight is scaled, on the host and for the reference too, until the
+        // score span is the one a calibrated model presents. Scores are linear
+        // in W_q, so the span scales with it exactly and no second pass is
+        // needed.
+        const double target = static_cast<double>(
+            EnvInt("HEONGPU_B16_SCORE_SPAN", 4));
+        const double span = smax - smin;
+        const double qscale = (span > 1e-9) ? target / span : 1.0;
+        for (auto& w : aw.q)
+            w *= qscale;
+        for (auto& w : bw.query)
+            w *= qscale;
+        for (auto& w : gw.q)
+            w *= qscale;
+        smax *= qscale;
+        smin *= qscale;
+        std::cout << "[b16] score span " << std::scientific
+                  << std::setprecision(3) << span << " -> " << (smax - smin)
+                  << " (query weight x " << qscale << ")" << std::endl;
+
         const double bound = (smax - smin) * 1.05 + 1e-6;
         cfg.score_shift = smax;
         cfg.softmax.bound = bound;
@@ -564,6 +612,14 @@ int main()
                          sharpest * static_cast<double>(d) * 1.05);
         }
 
+        std::cout << "[b16] calibration: score in [" << std::scientific
+                  << std::setprecision(3) << smin << ", " << smax
+                  << "], bound " << cfg.softmax.bound << ", shift "
+                  << cfg.score_shift << ", denom ["
+                  << cfg.softmax.sum_lo << ", " << cfg.softmax.sum_hi
+                  << "], concentration " << cfg.softmax.concentration
+                  << std::endl;
+
         auto t0 = tick();
         const int din = normed.column.front().depth();
         llama::BatchActivation sub =
@@ -573,7 +629,7 @@ int main()
 
         Batch ref_sub(instances);
         {
-            AttnWeights hw = aw;
+            AttnWeights hw = aw; // already carries the calibration scaling
             llama::Llama3Batch16Operator::fold_gain(hw.q, gain1, model,
                                                     q_channels);
             llama::Llama3Batch16Operator::fold_gain(hw.k, gain1, model,
@@ -707,7 +763,8 @@ int main()
     double worst = 0.0;
     for (const Stage& s : ledger)
         worst = std::max(worst, s.error);
-    const bool ok = worst < 5e-2 && spent < limbs - 1;
+    const bool ok = !decrypt_failed && worst == worst && worst < 5e-2 &&
+                    spent < limbs - 1;
     std::cout << "[b16] " << (ok ? "DATAFLOW OK" : "DATAFLOW SUSPECT")
               << " (worst stage error " << std::scientific << worst << ")"
               << std::endl;
