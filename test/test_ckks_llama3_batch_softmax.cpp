@@ -176,6 +176,8 @@ namespace
         const double divisor = std::pow(2.0, iterations);
         double lo = 1e300;
         double hi = 0.0;
+        // Round zero's denominator, and how concentrated a row is after it.
+        double sharpest = 0.0;
         for (const auto& block : scores)
         {
             for (int u = 0; u < d; ++u)
@@ -185,21 +187,47 @@ namespace
                 const double w =
                     static_cast<double>(d) / static_cast<double>(u + 1);
                 double total = 0.0;
+                double squares = 0.0;
                 for (int j = 0; j <= u; ++j)
                 {
                     const double e = std::exp(
                         (block[static_cast<size_t>(u) * d + j] - shift) /
                         divisor);
                     total += w * e * e;
+                    squares += e * e;
                 }
                 lo = std::min(lo, total);
                 hi = std::max(hi, total);
+
+                // A round leaves y_j = e_j^2 / sum e^2, which sums to one, so
+                // every round after the first sees a denominator in [1/d, 1]
+                // and what calibration supplies is how far up that the
+                // sharpest row actually reaches. The mask weight cancels
+                // here, which is exactly what it is for.
+                double after = 0.0;
+                for (int j = 0; j <= u; ++j)
+                {
+                    const double e = std::exp(
+                        (block[static_cast<size_t>(u) * d + j] - shift) /
+                        divisor);
+                    const double y = e * e / squares;
+                    after += y * y;
+                }
+                sharpest = std::max(sharpest, after);
             }
         }
         // A little room either side, so the fit is not evaluated at its own
         // endpoints.
         config.sum_lo = lo * 0.95;
         config.sum_hi = hi * 1.05;
+        // As a multiple of the uniform value 1/d. Without this the later
+        // rounds are fitted over [0.5/d, 1.5], a range of 3d, and a degree-15
+        // reciprocal with no Newton step cannot carry it -- which is the
+        // whole of Section 4.3's argument, and the reason the folded
+        // configuration is safe at all.
+        config.concentration =
+            std::min(static_cast<double>(d),
+                     sharpest * static_cast<double>(d) * 1.05);
     }
 
     /// The seam's production settings: both folds on, no Newton step, ranges
