@@ -2053,3 +2053,193 @@ four limbs. Smaller primes cannot add limbs because the prime size IS the
 scale. A 2^14 island can, is secure, and does not fit an 80 GiB card by about
 16 GiB. **The blocker moved from modulus to key memory, and that is a
 different machine, not a different parameter.**
+
+---
+
+## 19. The SoftMax on 16 batched inputs: the layout is forced (2026-08-13)
+
+Branch `HEonGPU_LLama3_8B_batch16_softmax`, off `HEonGPU_LLama3_8B_batch16`
+@ `4c4ce17`. Scope: the SoftMax seam of `Llama3BatchOperator` — everything
+between the two Algorithm-4 products. PCMM, CCMM, RMSNorm and FFN are other
+sessions'. Derived by a 13-agent workflow (5 readers, 4 layout costings, 4
+adversarial lenses); every number below is read off the code at the target
+shape `N = 4096, d = 128, k = 32, batch = 16, heads = 32, kv_heads = 8`, not
+at the `d = 8` shape the existing suite runs.
+
+### 19.1 The premise does not hold, and the reason is worth keeping
+
+**Sixteen batched inputs do not make the SoftMax cheaper per input. Nothing
+does, because the cost is set by the data volume and not by which index rides
+the batch axis.** Measured per input, every SoftMax quantity on this path is
+*identical* to the single-input rect path — not similar, identical:
+
+| per input | batch-16 | rect (Alg 5) |
+|---|---:|---:|
+| exp evaluations | 32 heads x 128 parts / 16 = 256 | 2 groups x 128 x 1 = 256 |
+| reciprocal fits | 32 x R / 16 = 2R | 2 x R x 1 = 2R |
+| crossing rotations | 2 x 32 x 128 x 22 / 16 = 11,264 | 2 x 2 x 128 x 22 = 11,264 |
+| reduction rotations | 0 | 0 |
+| SoftMax levels | identical | identical |
+
+Both encodings fill the same 2048 slots with 2048 (something x query) pairs,
+and the SoftMax never reads what the "something" is. The bridge charges per
+*value*, not per ciphertext, so permuting which index sits on the batch axis
+moves nothing at all. Batching buys throughput and a far smaller key set
+(127 + boot indices against Algorithm 5's 2047); it does not buy the SoftMax.
+
+What sixteen inputs *do* buy the SoftMax is **that the layout stops being a
+choice**, and the forced layout is the optimal one.
+
+### 19.2 The layout is forced, and it is the unique minimum
+
+`batch = k/2 = N/(2d)`, so sixteen inputs at `N = 4096` pins **`d = 128`** —
+which is also Llama-3-8B's `head_dim` and also the token block. Then
+`d * (k/2) = 2048 = N/2` exactly: the slot vector is *entirely* spent on
+(input, query) and **the key axis has nowhere to go but the ciphertext axis.**
+
+That axis is the free one. `count = 1`, `sum_strided`'s loop is dead code, and
+the denominator is a slot-wise addition of the `d` parts: **zero rotations,
+zero levels, zero Galois indices.**
+
+Four candidate layouts were costed and all lose:
+
+| layout | verdict | why |
+|---|---|---|
+| **A** key across ciphertexts | **adopted** | reduction 0 rotations; both seams conversion-free |
+| B key inside the ciphertext | viable, worse | +17.4-31.3% rotations, +153-186% ct-ct mults, 0 levels saved |
+| C SoftMax in coefficient form | **impossible** | see 19.3 |
+| D shrink `d` | viable, worse | 1.20x at `d`=64, 2.17x at `d`=32; `d`=128 is the constraint boundary *and* the optimum |
+
+A and B are the endpoints of a one-parameter family — put `K` of the 128 keys
+inside the ciphertext, `128/K` across them — and **every term of that family is
+monotone increasing in `K`**: reduction rotations `K*log2(K)`, reciprocal fits
+`K`, plus a gather the row bridge cannot perform because the key *is* the
+ciphertext index. So `K = 1` is not merely better than `K = 128`; it is the
+unique minimum of the whole family, simultaneously on reduction rotations (0),
+reciprocal amortisation (one fit per 2048 denominators, the ceiling) and
+conversion (the bridge's native codomain, 1 level, the floor for a `d`-point
+linear map).
+
+**Layout D's caveat corrects a note already in the tree.** "Smaller `d` is
+cheaper per value" assumed a *full* batch axis. With sixteen inputs fixed, a
+column holds `16d` useful values rather than `N/2`, occupancy is `d/128`, and
+the conclusion inverts: `d` = 64 and 32 are 1.27x and 1.82x *worse* per value,
+and the CMT term (which scales as `1/d^2`) buries the crossing term's shallow
+4.5% minimum at `d` = 64 six times over.
+
+### 19.3 Both seams are conversion-free, and the crossing is unavoidable
+
+Algorithm 4 hands the scores back column-wise **with the key on the columns**,
+which is the axis the SoftMax reduces; `to_slots` consumes that output
+unmodified. `from_slots` hands `P` back as exactly the left operand the value
+product wants, with `V` still carrying the key on its rows where the projection
+left it. **No transpose, no block map, no permutation, no new Galois key** —
+verified in code at the target shape, not inferred.
+
+The one conversion that remains is the row bridge, and it is *provably*
+mandatory. For the row-basis map `R_N -> R_k^d` to be entrywise it would have
+to be a ring isomorphism, i.e. `X^d - Y` would have to split over `R_k`; the
+torsion units of `R_k` are `+-Y^j` and `(+-Y^j)^d = Y` needs `gcd(d, 2k) = 1`,
+impossible for powers of two. Equivalently: `R_N (x) Q = Q(zeta_2N)` is a
+**field**, so its only idempotents are 0 and 1, while a product ring has `2^d`.
+A ciphertext product convolves over the row index instead:
+`(ab)_r = sum_{i+i'=r} a_i b_{i'} + Y * sum_{i+i'=r+d} a_i b_{i'}`. **Not one
+SoftMax step — not the exponential, not the mask, not the square, not the
+normalising product — can act on a score matrix encryption.** That is a
+property of the ring, not a limitation of Kang's algorithms.
+
+### 19.4 So the levers are levels and encodes, and neither had been taken
+
+| lever | seam levels | cost |
+|---|---:|---|
+| baseline as it stood (`Ed=Id=15, Nw=2, R=2`, causal) | **30** | — |
+| `+ scores_carry_exp_domain` (exp map on the query weight) | 29 | free, host-side |
+| `+ fold_affine_into_mask` (1/x map on the causal mask, forces `Nw=0`) | **19** | calibration, not free |
+| `+ refresh_denominator` (the paper's auxiliary track) | **11** | 1 bootstrap of 1 ciphertext per round |
+
+**30 -> 19 is eleven levels, and eight of them are the Newton steps.** That is
+an accuracy change, not bookkeeping: `fold_affine_into_mask` is silently ANDed
+with `inverse_newton <= 0`, so taking the fold deletes the refinement and the
+reciprocal becomes the bare degree-15 fit. It is safe *only* because
+`sum_lo`/`sum_hi` are measured — Section 4.3's whole argument — and they had
+never been set anywhere on this path, so the fit was being taken over exactly
+the worst-case interval the paper warns against. The new suite calibrates them
+off the host scores and measures both forms against the true SoftMax.
+
+`refresh_denominator` is the largest single lever and it is nearly free here:
+the denominator is **one** ciphertext however many parts the key axis is cut
+into, so the whole fit moves off the wide track for one bootstrap per round
+while the `d` parts pay only the square and the normalising product. It was
+reachable through the config and *threw*, because `attention()` passed no boot
+key.
+
+**A correction to how levels are argued on this path.** "The SoftMax is the
+deepest stretch, and the chain is the worst stretch + 26" is a *rect* relation
+that needs a bootstrap between stretches. There is no bootstrap anywhere on the
+batch path, so every level saved buys one limb **1:1** — the SoftMax is not
+privileged, it is merely the largest single consumer (30 of the attention
+test's 33). That makes the level argument stronger, not weaker.
+
+The third lever is not levels at all: the causal masks depend on the query and
+key indices alone, never on the head, yet were rebuilt and re-encoded inside
+the head loop — `H*d = 4096` encodes of a 2048-slot vector per attention call
+where `d = 128` would do. Each is an NTT over the whole live chain. This is the
+same disease the bridge's diagonal cache already cured, and it is **not**
+specific to this path: `multiply_vector` re-encodes unconditionally, so the
+rect path pays it too and can take the fix from `Llama3Operator`.
+
+### 19.5 What was implemented
+
+`Llama3BatchOperator::softmax_seam()` owns everything between the two
+Algorithm-4 products, so `attention()` only calls it — deliberately, because
+`attention()` belongs to the CCMM session. With it:
+
+* `softmax_layout()` and `softmax_seam_levels()` **report** the layout and the
+  closed-form ledger instead of restating them in a comment, and the tests
+  assert against them. The ledger test measures depth in and out, which is a
+  two-sided pin; a limb allocation that merely fits is one-sided.
+* `score_shift_rows` (per query) and `score_shift_slots` (per input *and*
+  query) — the second expressible only because the batch axis carries
+  independent inputs. The seam scales the shift by the folded domain map
+  itself, which is the trap the rect path leaves to its caller.
+* An encoded-mask cache on `Llama3Operator`, keyed by `(mask id, fold weight
+  bits, depth, rescale prime)`. The weight is in the key by its exact bits
+  rather than by a convention, because it is derived from the fitted ranges and
+  two calibrations would otherwise share an entry.
+* Hoisted crossings on by default in the seam, restored around the call.
+
+Defaults keep the old numbers: the folds are opt-in through
+`BatchAttentionConfig::seam`, so nothing already measured moves.
+
+### 19.6 The ceiling nobody had counted
+
+**About half of every SoftMax ciphertext is causally dead.** A causal `d x d`
+score block has `d(d+1)/2` live entries of `d^2`, i.e. 50.4% live at `d` = 128
+— so 49.6% of the exp evaluations, the squares, the normalising products and
+both crossings are spent on values the mask is about to zero. That is worth
+roughly 44% of the attention rotation budget.
+
+It is also provably unreachable in this encoding: the key axis *is* the
+ciphertext axis, so a part cannot be dropped without dropping a key position
+for every query at once, and Algorithm 4 requires square `d x d` operands
+either side. Recovering it needs a triangular block schedule over a token grid,
+which is a different shape of attention and not a SoftMax change. **Name it as
+the ceiling and do not go looking for it inside the seam.**
+
+### 19.7 Left undone, deliberately
+
+* The auxiliary track is wired and validated as a *contract* (it throws
+  without a boot key); its numerical behaviour on this path is untested,
+  because nothing on the batch path bootstraps at all and standing up a boot
+  fixture is the refresh-schedule session's job, not the seam's.
+* `heads > 1`, `kv_heads < heads` and `per_head > 1` still have no host
+  reference anywhere in the batch suite. The GQA reuse is what makes this
+  path's K/V cheaper than the rect path's host expansion, and it is asserted
+  rather than checked.
+* Two defects found while reading, both outside this seam and reported to the
+  sessions that own them: the V level-drop allocates `n*Q_size` and launches
+  two kernels *per level per ciphertext* (`operator.cu:1454-1485`, with its own
+  TODO) and re-drops the same kv blocks `group` times under GQA; and the
+  bridge's plaintext cache holds four sets with **widest-first** eviction,
+  which is backwards for a block that walks eight crossings monotonically down
+  the chain.

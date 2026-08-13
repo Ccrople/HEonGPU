@@ -414,6 +414,73 @@ TEST(HEonGPU, CKKS_Llama3BatchSoftmax_FoldsCostLevelsAndNotAccuracy)
     }
 }
 
+// The other eight levels, and they are NOT free -- so they are measured rather
+// than asserted. fold_affine_into_mask is silently ANDed with
+// inverse_newton <= 0, so taking the fold forces the Newton refinement off and
+// the reciprocal becomes the bare degree-15 fit. That is safe only if the fit
+// is taken over a MEASURED range instead of the worst case, which is the whole
+// of Section 4.3's argument. This runs both and compares them to the truth.
+TEST(HEonGPU, CKKS_Llama3BatchSoftmax_CalibrationIsWhatPaysForTheNewtonSteps)
+{
+    const double bound = 4.0;
+    const double shift = 2.0;
+    const auto scores =
+        random_scores(16, Fixture::d, shift - bound, shift, 8675309u);
+    const auto want = host_causal_softmax(scores, Fixture::d, shift);
+
+    // The refined form: two Newton steps, and therefore no fold.
+    SoftmaxConfig refined;
+    SeamConfig refined_seam;
+    production(refined, refined_seam, bound, shift);
+    refined.inverse_newton = 2;
+    refined_seam.fold_affine_into_mask = false;
+    calibrate(scores, Fixture::d, shift, refined.iterations, refined);
+
+    // The folded form: no Newton step, same degree, same calibrated range.
+    SoftmaxConfig folded;
+    SeamConfig folded_seam;
+    production(folded, folded_seam, bound, shift);
+    calibrate(scores, Fixture::d, shift, folded.iterations, folded);
+
+    const int refined_levels =
+        Batch::softmax_seam_levels(refined, refined_seam);
+    const int folded_levels = Batch::softmax_seam_levels(folded, folded_seam);
+    std::cout << "batch16 softmax seam levels: refined " << refined_levels
+              << ", folded+calibrated " << folded_levels << std::endl;
+    // One exp affine + one 1/x affine per round + two levels per Newton step
+    // per round.
+    EXPECT_EQ(refined_levels - folded_levels,
+              1 + refined.iterations * (1 + 2 * refined.inverse_newton));
+
+    Fixture f(refined_levels + 3);
+
+    auto a = encrypt_scores(f, scores, refined_seam, bound);
+    auto p_refined =
+        f.op->softmax_seam(a, refined, refined_seam, *f.galois, *f.relin);
+    const auto got_refined = f.op->decrypt(p_refined, *f.decryptor,
+                                           p_refined.column.front().scale());
+    const double worst_refined = max_abs_diff(want, got_refined);
+
+    auto b = encrypt_scores(f, scores, folded_seam, bound);
+    auto p_folded =
+        f.op->softmax_seam(b, folded, folded_seam, *f.galois, *f.relin);
+    const auto got_folded = f.op->decrypt(p_folded, *f.decryptor,
+                                          p_folded.column.front().scale());
+    const double worst_folded = max_abs_diff(want, got_folded);
+
+    std::cout << "  refined worst absolute error:          " << worst_refined
+              << std::endl;
+    std::cout << "  folded + calibrated worst abs error:   " << worst_folded
+              << std::endl;
+
+    // Both are the SoftMax. The claim being pinned is not that the cheaper one
+    // is better, but that calibration buys back what the Newton steps were
+    // paying for -- so the levels really are recoverable and not merely
+    // deleted.
+    EXPECT_LT(worst_refined, 5e-2);
+    EXPECT_LT(worst_folded, 5e-2);
+}
+
 // ---------------------------------------------------------------------------
 // 4. The work changes and the answer does not
 // ---------------------------------------------------------------------------
