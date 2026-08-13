@@ -1477,13 +1477,25 @@ int main()
         // The norm's multiplies drifted the scale; everything the normed
         // stream feeds (projections -> to_batch -> the next boots)
         // preserves scale, so normalize once here.
-        ledger.charge("scale_norm", [&]() {
-            for (auto& c : slots)
-                tr.arith_hi->match_scale(c, tr.scale);
-        });
+        // E1. The match_scale here and the block_map below are BOTH plaintext
+        // multiplies followed by a rescale, and they run back to back. Folding
+        // the first into the second costs nothing and saves its level -- and
+        // that level is the one the island entry is short of, because
+        // from_slots_at/descend can only DROP to their target, so everything
+        // the norm leg spends above comes straight off the entry.
+        const bool fold_norm_scale =
+            EnvInt("HEONGPU_TB_FOLD_NORM_SCALE", 0) != 0;
+        if (!fold_norm_scale)
+        {
+            ledger.charge("scale_norm", [&]() {
+                for (auto& c : slots)
+                    tr.arith_hi->match_scale(c, tr.scale);
+            });
+        }
         ledger.charge("wide.block_map", [&]() {
             tr.wide_rect->block_map(slots, false, "wide.block_forward",
-                                    *tr.galois_hi);
+                                    *tr.galois_hi,
+                                    fold_norm_scale ? tr.scale : 0.0);
         });
         // The normed stream is the input to a whole sublayer of island work
         // -- "x arrives as island RECT at l = shared" -- so this crossing
@@ -2274,6 +2286,14 @@ int main()
                       << std::setprecision(3) << MaxAbsDiff(got_skip, x_plain)
                       << std::defaultfloat << std::endl;
         }
+        // The number this leg actually decides. Everything the norm spends
+        // above comes straight off the island entry -- from_slots_at and
+        // descend only DROP to their target -- so this is what the whole
+        // attention sublayer gets to work with, and it is what decides
+        // whether q and k can skip a refresh.
+        std::cout << "[tb] norm exit: normed island l = " << is_l(normed)
+                  << ", skip island l = " << is_l(skip) << " (shared "
+                  << shared << ")" << std::endl;
         ledger.print("norm leg (one refresh + norm, 16 big cts)");
         return 0;
     }

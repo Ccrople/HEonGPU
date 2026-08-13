@@ -2054,6 +2054,119 @@ scale. A 2^14 island can, is secure, and does not fit an 80 GiB card by about
 16 GiB. **The blocker moved from modulus to key memory, and that is a
 different machine, not a different parameter.**
 
+## 18. Correction to §17: `shared` is not what pins the island entry
+
+§17.1 asserted that the island enters each sublayer at `shared - 1`, and
+concluded that `shared >= 7` deletes `boot.qkv` x3. **The spend counts in
+§17.1 are right. The entry rule is wrong**, and with it the conclusion that a
+bigger island ring would have bought anything.
+
+The rule was fitted to a single observation -- at `shared = 4` the entry is 3,
+which equals `shared - 1` by coincidence.
+
+**The entry is `min(shared, 14 - norm_leg_spend)`, and the second term binds.**
+`drop_big_to` (`benchmark/profile_tworing_block.cpp:1370-1373`) and `descend`
+(`:756-770`) **only drop, never raise**:
+
+```
+boot.norm                    -> 14
+:1442 wide.block_map (inv)   -1 -> 13
+:1471 rmsnorm                -7 ->  6   (degree 7; the DEFAULT at :1456 is 15, costing 8)
+:1480 scale_norm             -1 ->  5
+:1484 wide.block_map (fwd)   -1 ->  4
+:1492 from_slots_at(shared)     -> drop_big_to(slots, shared+1) is a NO-OP at 4
+                                   for shared = 4, 7 and 9 alike
+                                -> bridge -1 -> 3
+:1493 descend(big_out, shared)  -> island 3
+```
+
+Three consequences:
+
+1. **`shared >= 7` alone deletes zero boots.** q and k still land at 1 limb
+   after `to_batch` and `island_refresh_if(qb, "qkv", 4)` still fires.
+2. **`HEONGPU_TB_LAZY_REFRESH` (`ff62042`) is inert, not merely off** -- it
+   cannot fire for q/k/v at any `shared` as the code stands.
+3. **§17.3's logN 14 key-memory wall is real but was never the binding
+   constraint.** An H100 would not have bought a boot either.
+
+### 18.1 What does close it: the entry side
+
+The entry side has soft levels of its own, which §17 did not count.
+
+* **E1 -- fold `scale_norm` (`:1480`) into the adjacent forward `block_map`
+  (`:1484`).** `block_map` takes `plain_scale = rescale_prime(ct.front())` as
+  a free local and re-encodes every call (`src/lib/host/ckks/llama3_rect.cu:388`),
+  so there is no cached diagonal set to poison. Encoding at
+  `plain_scale * (nominal / s_ct)` makes the trailing rescale land on nominal,
+  which is exactly `match_scale`'s own expression
+  (`src/lib/host/ckks/llama3.cu:622-627`). **+1 entry limb.**
+* **E2 -- fold the RMSNorm learned gain into the projection weights.**
+  `rms_norm`'s last level is `multiply_plaintext(normalised, weights[at])` and
+  `weights` is already optional (`llama3.cu:1364`). Everything between
+  `rms_norm` and `project` is linear, so `(g*x)W = x*diag(g)W` host-side.
+  **+1 entry limb.**
+* **S1 -- fold the pre-boot `scale_norm` (`:1629`) into the wide bridge's
+  `plain_scale`** (`llama3_batch.cu:273`). **-1 spend.**
+
+At `shared = 5`, `P <= 45`, `NORM_DEGREE = 7`:
+
+```
+boot 14 -> block_map 13 -> rmsnorm(-6, gain folded) 7 -> block_map(scale folded) 6
+        -> drop_big_to(6) no-op -> bridge 5 -> descend min(5,5) = ENTRY 5
+spend:  project 1 + to_batch 1 + qk 1 + to_slots 1 + boot input 1 = 5
+5 >= 5  ->  q and k skip their boots.
+```
+
+All four preconditions are required together; drop any one and the saving is
+exactly zero. **It does not free `v`** (needs 6, arrives at 3), so the prize is
+**2 of 3 boots = 5,275 ms = 8.95%**, not §17's 13.4%.
+
+### 18.2 Two hard floors §17 did not have
+
+* **`P >= 41 bits.** `coefficient_validator` (`src/lib/util/util.cu:11-52`,
+  called from `src/lib/host/ckks/context.cu:181-186`) with `P_size == 1` sets
+  `quotient = Q_size, remainder = 0`, so it compares **each individual** `q_i`
+  against the total P bit-count -- and `q0` is 41 bits. It fires even under
+  `sec_level_type::none`. With the 218-bit cap this leaves `P in [41, 45]` and
+  **`shared = 5` as the only reachable step**; `shared = 6` is 247 bits at the
+  best possible P, impossible at logN 13 under any assignment.
+* **The boot's input limb is a floor, three ways.**
+  `regular_bootstrapping_v2` throws unless exactly one limb remains
+  (`operator.cu:7474-7479`), `mod_drop_ckks_leveled_inplace` throws at
+  `depth_ >= Q_size-1` (`operator.cu:1457-1460`), and ModRaise's INTT is
+  hard-coded to one modulus (`operator.cu:4182`).
+
+### 18.3 Levers that died, and should not be revisited
+
+* **`to_slots` fused into CoeffToSlot -- dead on ENCODING, not on cost.**
+  `ringswitch_interleave_kernel` (`src/lib/kernel/ringswitch.cu:42-52`) puts
+  the poly index in the low `k_power` bits, so the wide row is composite,
+  `i = jp + 8u`. CoeffToSlot bit-reverses the **full** 15-bit index, which
+  re-partitions that composite field: the key axis moves from stride 32 to
+  4096 and the query axis from 256 to 32 -- the two axes swap. The RECT
+  precedent (`island_slot`, `llama3_rect.cuh:604-614`) absorbs reversal
+  *within* a field; it cannot absorb a re-partition. The SoftMax comb
+  (`profile_tworing_block.cpp:1078-1099`) would silently sum 8 query rows
+  instead of 8 keys. Absorbing the row reversal instead would make the map
+  dense at N/2 = 32768 diagonals -- the exact shape that lost 32.7% twice.
+* **`project_qkv` fused with `to_batch` -- dead on PRECISION.** `p = 33` IS
+  the scale, so the whole splittable budget is 33 bits and it must cover both
+  a dense 4096-diagonal crossing table (`llama3_rect.cu:1300-1330`) and an
+  `llround(w * delta_w)` int64 weight table (`llama3_rect.cu:125-128`). The
+  optimum split lands near 7.8 bits against a measured 9.77.
+
+### 18.4 What to measure, and where
+
+`shared` 4 -> 5 takes the Algorithm 5 Galois set 10.0 -> 15.0 GiB and puts
+every island op a limb higher. Two independent cost models disagree by 2x:
++1.1-1.6 s from the measured per-leg proxies, +3.4-6.6 s from limb scaling.
+**Net is between +4.2 s better and -1.3 s worse, and nothing measured settles
+it.**
+
+E1 is the cheapest to validate and needs no island keys at all, so it fits an
+A6000: run `HEONGPU_TB_STAGE=norm` and read the exit level off the ledger. It
+should move 3 -> 4 with the block error unchanged.
+
 ---
 
 ## 19. The SoftMax on 16 batched inputs: the layout is forced (2026-08-13)
@@ -2702,3 +2815,291 @@ accuracy.
 The two counts that are still projections and not measurements: the per-sublayer
 key-switch table in §21.2, and every millisecond in §21.3. No profile of this
 branch exists yet.
+
+## 22. Batch 16, and the layout the non-linear layers actually need (2026-08-13)
+
+A different question from every section above, and it changes the answer to
+all of them: **sixteen independent inputs at once, not one.**
+
+Sections 1-18 are the single-user problem. Kang's Algorithm 5 spends the batch
+axis of the matrix encryption on contracting ONE input, which is why the
+rectangular path exists and why `N/2 - 1` Galois keys are its wall. With
+sixteen users the axis has somewhere better to be, and `llama3_batch.cuh`
+already said so in its own header: Algorithm 1's `k/2` packed matrices are
+`k/2` INDEPENDENT INPUTS, and that is "the right answer when there are `k/2`
+users."
+
+This section is the non-linear half of that path -- RMSNorm, the reshape and
+SwiGLU. The SoftMax, the batch CCMM and the batch PCMM are three other
+sessions on the same encoding.
+
+**Everything below that is not marked MEASURED is arithmetic over the source.**
+
+### 22.1 Batch 16 pins the ring, uniquely
+
+`batch = k/2 = 16` forces `k = 32` and `d = N/32`. Three independent
+constraints then coincide:
+
+| constraint | source | consequence |
+|---|---|---|
+| tokens per block `== d` exactly | no token blocking exists on this path | `d = 128` for a 128-token block |
+| `d` divides `head_dim` | Algorithm 4's operands are square at `d` | `head_dim = 128` gives `per_head = 1` |
+| `batch = N/(2d)` | the ring | `N = 32d = 4096` |
+
+So **(N = 4096, d = 128, k = 32, batch = 16) is the unique solution** for
+Llama-3-8B's head dim at 128 tokens and batch 16. `N = 8192, d = 256` is
+legal as a layout but `attention()` rejects it -- `per_head` would be 0.5.
+`N = 8192, batch = 32` is legal and costs exactly 2x for exactly 2x the
+instances; bytes per instance are invariant, because ciphertext bytes scale
+with `N` and so does `batch`.
+
+The slot map is `slot b + (k/2)*u of the ciphertext for column j holds entry
+(u, j) of instance b`, a **bijection onto all 2048 slots** -- 16 instances x
+128 tokens, no dead slot, no packing mask anywhere.
+
+### 22.2 The layout answer: there isn't a second one
+
+**A channel is a whole ciphertext.** That one fact settles the layout
+question the non-linear layers were supposed to have:
+
+- **RMSNorm's channel reduction is a slot-wise ADDITION.** `count = 1` makes
+  `Llama3Operator`'s reduction loop not execute, so the mean costs no
+  rotation, no mask, no Galois key and no level. On the rectangular path the
+  same reduction is a blocked span of `k/2` costing `2*log2(k/2)` key
+  switches and the level a mask costs. This is the one place the batch
+  encoding is strictly better, and it is not a small place.
+- **The learned gain is a CONSTANT**, not a slot vector, so it folds into the
+  projection that reads the normalised stream: `W^T diag(g) y =
+  (diag(g) W)^T y`, exactly, on the host, free.
+- **The reshape is index arithmetic.** Head `h`, lane `c` is ciphertext
+  `h*head_dim + c`; the split is pointer arithmetic and the concat is
+  `push_back` in head order. **Grouped-query attention is index REUSE** -- the
+  same run of ciphertexts is handed to `group` query heads -- so the key and
+  value projections stay narrow by the full 4x at 32 heads over 8. The
+  rectangular path has to widen the KV weights on the host instead, and buys
+  nothing for it.
+- **SwiGLU is slot-wise** and never reads an index.
+
+There is no separate non-linear layout, so there is no conversion to reach
+one. The seam question answers itself in both directions.
+
+### 22.3 What it does cost: the bridge, and only the bridge
+
+A Hadamard product and a polynomial fit are slot-wise; a matrix encryption is
+a COEFFICIENT encoding, where multiplying two columns convolves them. So every
+non-linearity crosses the row bridge.
+
+Per column at `N = 4096, d = 128`: **22 key switches**, 128 plaintext
+products, 8 rescales, one level. *Not* `d - 1 = 127` -- `bridge()` calls
+`baby_steps()` unconditionally and it returns the balanced BSGS split
+(`n1 = 16, n2 = 8`) whenever the override is 0, which is the default.
+**BSGS is already on**; the doc comment on `to_slots` is stale by 5.8x.
+
+One block at the 8B batch-16 shape bridges **67,584 columns** across 374 calls:
+
+| leg | columns | key switches | share of bridging |
+|---|---:|---:|---:|
+| SwiGLU (gate, up, hidden) | 43,008 | 946,176 | 63.6% |
+| RMSNorm x2 (down and back) | 16,384 | 360,448 | 24.2% |
+| attention's SoftMax seam | 8,192 | 180,224 | 12.1% |
+
+**Bridging is 98.3% of every Galois rotation in the block** and 88.3% of all
+key switches including relinearisation. Everything else -- the CMTs, the
+CCMMs, every slot-form reduction -- is the remaining 1.7% of rotations.
+
+### 22.4 Eight levels a block, for four host-side multiplications
+
+The batch path never wired through the config knobs the rectangular path grew.
+Every one of these is EXACT -- a host-side rescaling of a plaintext, not
+precision traded for depth:
+
+| lever | saves | why it is free |
+|---|---|---|
+| `newton_iterations` 2 -> 0 | **6 levels** | a step is `y^2`, `x/2` times it, and the product; the fit alone already meets 12 bits over a calibrated range |
+| `fold_mean_into_fit` | 1 level/norm | `1/sqrt(s/C + eps)` over the summed square is the same value from the same ciphertext as `1/sqrt(m + eps)` over the mean |
+| gain folded into the weight | 1 level/norm, and `d_model` plaintext encodes | `W^T diag(g) y = (diag(g) W)^T y` |
+| `fold_silu_domain_into_gate` | 1 level | the gate projection feeds the SiLU and nothing else, so `1/bound` needs no undoing |
+
+The fifth -- the `1/sqrt` fit's own domain map -- has **no plaintext product to
+ride on here, precisely because the reduction is free**. On the rectangular
+path the mask carries it; here there is nothing between the reduction and the
+fit. `sum_pre_scaled` lets a caller who owns the upstream weight carry it
+there instead: the sum is quadratic in the input, so the factor is
+`sqrt(domain_scale)` and `output_scale = 1/c` takes it back out of the
+numerator in the fit's coefficients. Off by default, because folding one half
+and not the other is silent.
+
+### 22.5 The seam contract, for the other three sessions
+
+```
+CONSUMES  d_model ciphertexts, matrix-encryption (coefficient) form,
+          one level and one scale, rows == d == 128.
+PRODUCES  the same.
+INDEX     matrix form: entry (i,j) of instance b lives in the k-coefficient
+          run i, i+d, ..., i+(k-1)d of ciphertext j, as the EVALUATION of that
+          run at zeta^{5^b}.
+          slot form: slot b + 16*u of ciphertext j is (token u, channel j) of
+          instance b.
+RESHAPE   head h, lane c  ==  ciphertext h*head_dim + c.
+          GQA: query head h reads kv head h/(heads/kv_heads). A VIEW, never a copy.
+KEYS      the non-linear layers use no Galois index the CMT does not already
+          require; the bridge's 22 BSGS shifts are a subset of the CMT's 127.
+```
+
+Nothing here asks the SoftMax, the PCMM or the CCMM to change anything.
+
+### 22.6 The open question that is worth more than everything above
+
+Bridging is 98.3% of the block's rotations and the SwiGLU is 64% of the
+bridging. All of it exists because `project()` is *assumed* to need the
+coefficient encoding.
+
+It may not. Algorithm 1 encodes its weight through `BatchMatrixEncoder`, and
+the weight is **one real matrix shared by all sixteen instances**, so its
+`R_k` image is the CONSTANT polynomial -- and multiplying by a constant of
+`R_k` is scalar multiplication. The projection degenerates to
+`out_c = sum_j W[j][c] * ct_j`, a scalar multiply-accumulate ACROSS
+ciphertexts, which cannot care what a ciphertext encodes. The bridge is linear
+and acts WITHIN a column. Two such maps commute.
+
+Supporting evidence from the source: `pcmm` checks only depth and count, never
+`encoding_` or `in_ntt_domain_`, and it copies both from input to output
+(`batchmatrix.cu:1449-1451`).
+
+If it holds, **only Algorithm 4 genuinely needs the coefficient encoding** --
+because a ciphertext-ciphertext matrix product is what the `R_k` structure is
+FOR -- and the non-linear half of a block never leaves slot form.
+`CKKS_Llama3Batch16_ProjectionCommutesWithTheBridge` is the experiment; the
+result is recorded in 22.7.
+
+### 22.7 Measured
+
+Sicily **GPU 2** (GPU 0 was at 100% from another user, GPU 1 idle but holding
+27 GB), tree `HEonGPU-b16nl`, commit `a697686`, CUDA 12.0, sm_86.
+**17 of 17 green, 8.7 s**, at the real batch-16 ring `N = 4096, d = 128,
+k = 32, batch = 16` — the first time anything in this repo has executed at
+that shape.
+
+**1. `project()` COMMUTES with the bridge. CONFIRMED.**
+`ProjectionCommutesWithTheBridge` checks the slot-form projection against a
+host reference *and* against the matrix-form path, so it cannot pass by being
+wrong in the same way. This is the load-bearing result of the section: the
+crossings that are 98.3% of a block's rotations exist because the projection
+was assumed to need the coefficient encoding, and it does not. **Only
+Algorithm 4 genuinely needs it.**
+
+**2. The instances stay separate.** `RMSNormKeepsInstancesIndependent` and
+`FeedForwardKeepsInstancesIndependent` perturb ONE of the sixteen and require
+the other fifteen to move by less than 1e-4 while the perturbed one moves by
+more than 1e-2. Not exact equality: two runs are two encryptions, so the floor
+is CKKS noise, and mixing would be an O(1) move — the bound sits three orders
+above the noise and three below the signal. Nothing here is asserted by a
+round trip, which a pair of mutually inverse mistakes would also pass.
+
+**3. The reshape is free, and the test proves it by POINTER IDENTITY.**
+`ReshapeIsIndexArithmeticAndAliasesTheInput` asserts
+`view[lane] == &ct.column[channel_of(h, lane)]` — the difference between free
+and `d` ciphertext deep copies per head. GQA maps 4 query heads onto each kv
+head as a view, and `kv_channels` stays at 1024 against `q_channels` 4096.
+
+**4. Every level claim, asserted as an exact depth rather than argued.**
+
+| claim | assertion | result |
+|---|---|---|
+| gain folds into the weight, exactly | value agreement + `depth_a == depth_b + 1` | holds |
+| the SiLU domain map folds onto the gate weight | value agreement + `depth_a == depth_b - 1` | holds |
+| a pre-scaled sum skips the fit's affine multiply | value agreement + `depth_b == depth_a - 1` | holds |
+| `hidden_block` changes only the association of a sum | value agreement + equal depth | holds |
+| RoPE costs one level | `after == before + 1` | holds |
+
+**5. Two claims I made were REFUTED by the tests and are corrected above.**
+
+- **`slot_resident` does not save a level.** I wrote that two crossings
+  replacing three would drop one; measured, both arrangements land at depth 9.
+  Three crossing CALLS are only two crossing LEVELS, because the gate and the
+  up projection cross concurrently. The saving is bridged columns —
+  43,008 -> 8,192 — and nothing else. The test now pins the equality.
+- **The levels are in FULL slot residency instead**, where the norm's return
+  crossing and the SwiGLU's entry crossing are adjacent and cancel outright:
+  `SlotResidentSublayersNeedNoCrossing` asserts exactly `-2` levels for a
+  norm/SwiGLU pair, and every non-attention bridged column disappears with
+  them.
+
+**6. The one test failure worth reporting, because it is not a bug.**
+`RMSNormMatchesThePlaintextLayer` first failed at 3.2e-3 against a tolerance I
+had guessed at 1e-3. That number is the CHEBYSHEV FIT and nothing else: 1/sqrt
+has a branch point at zero, so its interpolation error is set by how close the
+fitted interval comes to it, and a fixture with eight channels of uniform
+noise is the worst case — the summed square spans about 14x. At the real
+`d_model = 4096` the summed square concentrates as `1/sqrt(4096)` and the span
+collapses towards 1.1x. The test now bounds at 5e-3 and *proves the
+attribution* by re-running the identical circuit at degree 31 and requiring
+the error to collapse by 4x; if it did not, the error would be coming from the
+encoding rather than the series.
+
+**7. Relinearisation counts, corrected from a source simulation** of
+`gen_power`, `optimal_split` and `evaluate_poly_recurse` including the re-split
+branch that does fire: degree 7 -> **5**, degree 15 -> **8**, degree 31 ->
+**14**. Earlier hand estimates in this document said 4 / 7 / 11, a 27%
+undercount at degree 31.
+
+**What is NOT measured.** No timing, no `nsys` capture, and nothing at the 8B
+width — every key-switch and byte figure in 22.3 and 22.8 is arithmetic over
+the source. The tests run at `d_model` 4-8 and `hidden` 8-16; what they
+establish is the LAYOUT, the LEVELS and the SEPARATION, which are properties
+of the circuit and not of the width. The cost model is unvalidated on this
+path.
+
+### 22.8 The three things that could sink this shape, none of them layout
+
+1. **Security.** `N = 4096` with the ~70-limb chain one refresh-free block
+   needs is roughly 3,240 bits of modulus, astronomically outside any
+   security level, and batch 16 at 128 tokens *forces* `N = 4096`. This shape
+   cannot be made secure without dropping the batch or the token count. The
+   profile runs `sec_level_type::none` and this is the same accepted stance
+   as every other section here -- but it is a larger overage than the
+   rectangular path's 22.8x.
+2. **Memory.** `Llama3BatchOperator::rms_norm` holds the slot copy alive
+   across the return crossing, so its own frame peaks at 20,480 resident
+   ciphertexts -- **87.5 GiB at 70 limbs, over an 80 GiB A100** before any key
+   material. Releasing it (which `feed_forward` already does for its own
+   branches) is 17.5 GiB.
+3. **There is no refresh on this path at all**, and it cannot be switched on:
+   `Llama3BatchOperator` never passes a boot key, so the two aux-refresh hooks
+   are unreachable. One block spends ~67 levels of a 70-limb chain, of which
+   the bridge is only 9.
+
+### 22.9 RoPE, which was missing entirely
+
+Rotary embedding is **absent from the Algorithm-1 path** -- not configured
+off, absent: `llama3_batch.cu` never mentions it and `BatchAttentionConfig`
+has no field for it. It is the one non-linearity of this session's scope with
+no implementation anywhere, so `rope_slots()` is it.
+
+It is cheap here for the two reasons everything else is. The head-dim pairing
+`c <-> c + head_dim/2` is a pairing of whole CIPHERTEXTS, because a channel is
+a ciphertext -- no homomorphic rotation, no Galois key. And the angle
+`(u + offset) * theta^(-2c/head_dim)` depends on the TOKEN, which is the slow
+slot axis, so one plaintext per lane pair serves every instance and every
+head. Four plaintext products, two additions, **one level**, measured.
+
+The minus sign goes on the plaintext, not on the ciphertext: negating
+homomorphically is `multiply_constant`, a plaintext product and a rescale, and
+the two halves of a pair would then be at different depths and could not be
+added at all.
+
+**Known cost, named rather than hidden:** the three slot vectors a lane needs
+are built once per lane but applied through `multiply_vector`, which encodes
+on every call -- so the same plaintext is re-encoded once per head, 8,192
+encodes for Q where 192 would do. It is the same defect the SiLU's domain map
+has when its fold is off. The fix needs an `HEEncoder` on the constructor; the
+arithmetic is unaffected either way.
+
+### 22.10 Coverage, stated plainly
+
+Before this session **nothing in the repo had ever run at the batch-16
+shape**: the GPU suite is `N = 4096, d = 8` (i.e. `k = 512, batch = 256`) and
+`profile_llama3_batch.cpp` defaults to `HEONGPU_ONEMM_LOGN = 11`, which is
+batch **8**. Multi-head and GQA are untested everywhere -- every existing test
+sets `heads = 1`, so the head-indexing arithmetic has only ever run at
+`h = 0`.
