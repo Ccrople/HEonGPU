@@ -35,6 +35,7 @@
 #include <heongpu/host/ckks/batchmatrix.cuh>
 #include <heongpu/host/ckks/llama3.cuh>
 #include <heongpu/host/ckks/llama3_batch.cuh>
+#include <heongpu/host/ckks/llama3_batch16.cuh>
 #include <heongpu/host/ckks/llama3_rect.cuh>
 #include <heongpu/host/ckks/ringswitch.cuh>
 
