@@ -32,6 +32,7 @@
 #include <heongpu/host/ckks/operator.cuh>
 #include <heongpu/host/ckks/mpcmanager.cuh>
 #include <heongpu/host/ckks/precision.cuh>
+#include <heongpu/host/ckks/baepcmm.cuh>
 #include <heongpu/host/ckks/batchmatrix.cuh>
 #include <heongpu/host/ckks/llama3.cuh>
 #include <heongpu/host/ckks/llama3_batch.cuh>

@@ -86,6 +86,7 @@ set(HEONGPU_KERNEL_SOURCES
     lib/kernel/encryption.cu
     lib/kernel/keygeneration.cu
     lib/kernel/multiplication.cu
+    lib/kernel/baepcmm.cu
     lib/kernel/ringswitch.cu
     lib/kernel/small_ntt.cu
     lib/kernel/switchkey.cu
@@ -173,6 +174,7 @@ set_target_properties(heongpu_host_bfv PROPERTIES
 )
 
 set(HEONGPU_HOST_CKKS_SOURCES
+    lib/host/ckks/baepcmm.cu
     lib/host/ckks/batchmatrix.cu
     lib/host/ckks/chebyshev_interpolation.cu
     lib/host/ckks/ciphertext.cu
