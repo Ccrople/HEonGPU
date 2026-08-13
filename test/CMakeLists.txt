@@ -47,6 +47,7 @@ set(EXECUTABLES
     ckks_llama3_batch16_testcases test_ckks_llama3_batch16.cpp
     ckks_llama3_rect_testcases test_ckks_llama3_rect.cpp
     ckks_ringswitch_testcases test_ckks_ringswitch.cpp
+    ckks_batch_ringswitch_testcases test_ckks_batch_ringswitch.cpp
     ckks_tworing_bridge_testcases test_ckks_tworing_bridge.cpp
 
     tfhe_gate_boot_testcases test_tfhe_gate_boot.cpp
