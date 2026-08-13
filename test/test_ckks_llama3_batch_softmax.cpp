@@ -26,7 +26,7 @@
 // 5. That the mask cache and the hoisted crossings change the work and not the
 //    answer.
 
-#include "heongpu.hpp"
+#include <heongpu/heongpu.hpp>
 #include <gtest/gtest.h>
 
 #include <algorithm>
