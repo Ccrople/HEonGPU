@@ -610,6 +610,72 @@ TEST(HEonGPU, CKKS_Llama3Batch16_RMSNormRejectsAWrongGainLength)
 }
 
 // ----------------------------------------------------------------------
+// Rotary position embedding
+// ----------------------------------------------------------------------
+
+// RoPE is absent from the Algorithm-1 path entirely, so this is the first
+// assertion of it on this encoding. It is cheap here for the two reasons
+// everything else is: the lane pairing c <-> c + head_dim/2 is a pairing of
+// whole ciphertexts (no rotation, no Galois key), and the angle depends on
+// the TOKEN, which is the slow slot axis -- so one plaintext per lane pair
+// serves every instance and every head.
+TEST(HEonGPU, CKKS_Llama3Batch16_RopeMatchesThePlaintextRotation)
+{
+    llama::Batch16Shape shape = SmallShape();
+    shape.heads = 1;
+    shape.kv_heads = 1;
+    shape.head_dim = Fixture::d;
+    shape.d_model = shape.q_channels();
+    Fixture f(shape, 6);
+
+    const int channels = shape.d_model;
+    const int half = shape.head_dim / 2;
+    const auto x = f.random_batch(channels, 271828u, 0.5);
+
+    llama::Llama3Batch16Operator::RopeConfig rope;
+    rope.theta = 500000.0;
+    rope.position_offset = 0;
+
+    auto ct = f.op->encrypt(x, Fixture::d, channels, *f.encryptor, f.scale);
+    auto slots = f.op->to_slots(ct, *f.galois);
+    const int before = slots.front().depth();
+    f.nl->rope_slots(slots, rope);
+    const int after = slots.front().depth();
+
+    EXPECT_EQ(after, before + 1) << "RoPE should cost exactly one level";
+
+    double worst = 0.0;
+    for (int c = 0; c < half; ++c)
+    {
+        const double omega = std::pow(
+            rope.theta, -2.0 * static_cast<double>(c) /
+                            static_cast<double>(shape.head_dim));
+        const auto got0 = f.decode(slots[static_cast<size_t>(c)]);
+        const auto got1 = f.decode(slots[static_cast<size_t>(c + half)]);
+        for (int u = 0; u < Fixture::d; ++u)
+        {
+            const double angle = static_cast<double>(u) * omega;
+            const double cs = std::cos(angle);
+            const double sn = std::sin(angle);
+            for (int b = 0; b < Fixture::instances; ++b)
+            {
+                const size_t at0 =
+                    static_cast<size_t>(u) * channels + c;
+                const size_t at1 = at0 + static_cast<size_t>(half);
+                const double x0 = x[b][at0];
+                const double x1 = x[b][at1];
+                const int s = f.nl->slot_of(b, u);
+                worst = std::max(worst,
+                                 std::abs(got0[s] - (x0 * cs - x1 * sn)));
+                worst = std::max(worst,
+                                 std::abs(got1[s] - (x0 * sn + x1 * cs)));
+            }
+        }
+    }
+    EXPECT_LT(worst, 1e-3);
+}
+
+// ----------------------------------------------------------------------
 // SwiGLU
 // ----------------------------------------------------------------------
 
@@ -878,11 +944,13 @@ TEST(HEonGPU, CKKS_Llama3Batch16_ProjectionCommutesWithTheBridge)
            "after all";
 }
 
-// If the commutation above holds, the SwiGLU crosses twice around the whole
-// sublayer instead of three times over the hidden width -- 8,192 columns
-// instead of 43,008 at the 8B shape -- and drops a level, because two
-// crossings replace three. Same answer either way, which is what this checks.
-TEST(HEonGPU, CKKS_Llama3Batch16_SlotResidentFeedForwardAgreesAndIsShallower)
+// The commutation lets the SwiGLU cross twice around the whole sublayer
+// instead of three times over the hidden width -- 8,192 columns instead of
+// 43,008 at the 8B shape. Same answer, and the SAME DEPTH: three crossing
+// CALLS are only two crossing LEVELS, because the gate and the up projection
+// cross concurrently. The saving is bridged columns, not levels, and the
+// equality below is what pins that down.
+TEST(HEonGPU, CKKS_Llama3Batch16_SlotResidentFeedForwardAgreesAtEqualDepth)
 {
     llama::Batch16Shape shape = SmallShape();
     shape.d_model = 4;
@@ -915,8 +983,10 @@ TEST(HEonGPU, CKKS_Llama3Batch16_SlotResidentFeedForwardAgreesAndIsShallower)
     const auto got_b = f.op->decrypt(out_b, *f.decryptor, f.scale);
 
     EXPECT_LT(max_abs_diff(got_a, got_b), 1e-2);
-    EXPECT_EQ(depth_b, depth_a - 1)
-        << "two crossings instead of three should be one level shallower";
+    EXPECT_EQ(depth_b, depth_a)
+        << "moving the crossings should change what is bridged, not how deep "
+           "the sublayer is: the gate and the up projection already crossed "
+           "at the same depth";
 }
 
 // The end state the layout question is actually asking about: a stream held
@@ -928,7 +998,10 @@ TEST(HEonGPU, CKKS_Llama3Batch16_SlotResidentSublayersNeedNoCrossing)
     llama::Batch16Shape shape = SmallShape();
     shape.d_model = 4;
     shape.hidden = 8;
-    Fixture f(shape);
+    // Two whole sublayers back to back: the norm is 9 levels with its
+    // crossings and the SwiGLU 9, so the matrix-resident arm needs 18 and the
+    // default 14-limb fixture runs out inside the SiLU.
+    Fixture f(shape, 22);
 
     const auto x = f.random_batch(shape.d_model, 13579u, 0.5);
     llama::Llama3Batch16Operator::FeedForwardWeights w;
@@ -969,10 +1042,15 @@ TEST(HEonGPU, CKKS_Llama3Batch16_SlotResidentSublayersNeedNoCrossing)
 
     EXPECT_LT(max_abs_diff(got_a, got_b), 1e-2);
 
-    // Two sublayers, four crossings saved: the slot-resident pair is that
-    // much shallower.
-    EXPECT_LT(out_b.column.front().depth(), out_a.column.front().depth())
-        << "holding the stream in slot form should spend fewer levels";
+    // THIS is where the levels are. The norm's return crossing and the
+    // SwiGLU's entry crossing are adjacent and cancel outright when the
+    // stream simply stays in slot form, so the pair is two levels shallower
+    // -- and every one of the non-attention bridged columns is gone with
+    // them.
+    EXPECT_EQ(out_b.column.front().depth(),
+              out_a.column.front().depth() - 2)
+        << "a slot-resident norm/SwiGLU pair should drop exactly the two "
+           "crossings that meet between them";
 }
 
 // ----------------------------------------------------------------------

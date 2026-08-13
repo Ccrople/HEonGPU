@@ -524,6 +524,56 @@ namespace heongpu
                                   int in_channels, int out_channels);
 
             // ---------------------------------------------------------------
+            // Rotary position embedding
+            // ---------------------------------------------------------------
+            //
+            // RoPE is absent from the Algorithm-1 path entirely -- not
+            // configured off, ABSENT: llama3_batch.cu never mentions it and
+            // BatchAttentionConfig has no field for it. It is a non-linearity
+            // of the position rather than of the value, and it belongs to
+            // whoever owns the layer, so it is provided here as a free
+            // function on slot-form ciphertexts and called by nobody in this
+            // module.
+            //
+            // It is CHEAP on this encoding, and for the same two reasons
+            // everything else here is:
+            //
+            //   - the head-dim pairing c <-> c + head_dim/2 is a pairing of
+            //     whole CIPHERTEXTS, because a channel is a ciphertext. No
+            //     homomorphic rotation, no Galois key.
+            //   - the angle (u + offset) * theta^(-2c/head_dim) depends on the
+            //     TOKEN, which is the slow slot axis at stride k/2 -- so it is
+            //     an ordinary slot plaintext, and the SAME one serves every
+            //     instance, every head and every ciphertext of a lane pair.
+            //
+            // Two plaintext products and one addition per output ciphertext,
+            // one level. The rectangular path pays the same level but has to
+            // insert it at a crossing's slot midpoint to get there; here the
+            // stream is already in slot form when Q and K are formed.
+
+            /** @brief Rotary embedding settings. */
+            struct RopeConfig
+            {
+                /// Llama-3's base is 500000; Llama-2's is 10000.
+                double theta = 500000.0;
+                /// Absolute position of token 0, for a windowed run.
+                int position_offset = 0;
+            };
+
+            /**
+             * @brief RoPE in place on slot-form Q or K.
+             *
+             * @param slots `heads * head_dim` ciphertexts for Q, or
+             *              `kv_heads * head_dim` for K, in the slot reading,
+             *              at one level and one scale. Channel
+             *              `h*head_dim + c` is head h, head-dim lane c.
+             *
+             * One level. Applies to Q and K only -- V is not rotated.
+             */
+            void rope_slots(std::vector<Ciphertext<Scheme::CKKS>>& slots,
+                            const RopeConfig& config);
+
+            // ---------------------------------------------------------------
             // SwiGLU
             // ---------------------------------------------------------------
 
@@ -580,16 +630,24 @@ namespace heongpu
                 /// So the SiLU and the gate product can meet the projections
                 /// in slot form, and the sublayer crosses 2 * in_channels
                 /// columns instead of 3 * hidden_channels: 8,192 instead of
-                /// 43,008 at the 8B shape, 946,176 key switches down to
-                /// 180,224. It also removes one level, since two crossings
-                /// replace three.
+                /// 43,008 at the 8B shape, and 946,176 key switches down to
+                /// 180,224.
                 ///
-                /// OFF by default until the commutation is asserted by a
-                /// passing test rather than by this paragraph --
-                /// CKKS_Llama3Batch16_ProjectionCommutesWithTheBridge is that
-                /// test. A caller holding the stream in slot form across the
-                /// whole block should use feed_forward_slots() instead and
-                /// pay no crossing here at all.
+                /// IT DOES NOT SAVE A LEVEL, and the first version of this
+                /// comment said it did. Three crossing CALLS are only two
+                /// crossing LEVELS, because the gate and the up projection
+                /// cross concurrently at the same depth -- so both
+                /// arrangements spend exactly two, and the win is entirely in
+                /// bridged columns. Measured: both land at depth 9.
+                ///
+                /// The commutation is asserted by
+                /// CKKS_Llama3Batch16_ProjectionCommutesWithTheBridge, which
+                /// passes. This is OFF by default anyway, so no existing
+                /// measurement moves until a caller opts in. A caller holding
+                /// the stream in slot form across the whole block should use
+                /// feed_forward_slots() instead and pay no crossing here at
+                /// all -- THAT is where the levels are, two of them per
+                /// norm/SwiGLU pair.
                 bool slot_resident = false;
             };
 
