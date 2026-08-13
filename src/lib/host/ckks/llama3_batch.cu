@@ -826,11 +826,270 @@ namespace heongpu
             return mask;
         }
 
+        const std::vector<std::vector<double>>&
+        Llama3BatchOperator::causal_masks()
+        {
+            if (causal_mask_cache_.empty())
+            {
+                causal_mask_cache_.reserve(layout_.d);
+                for (int j = 0; j < layout_.d; ++j)
+                {
+                    causal_mask_cache_.push_back(causal_column_mask(j));
+                }
+            }
+            return causal_mask_cache_;
+        }
+
+        // -------------------------------------------------------------------
+        // The SoftMax seam
+        // -------------------------------------------------------------------
+
+        Llama3BatchOperator::SoftmaxLayout
+        Llama3BatchOperator::softmax_layout() const
+        {
+            const int d = layout_.d;
+            const int n1 = baby_steps();
+
+            SoftmaxLayout out;
+            // The key axis is the CIPHERTEXT axis, so the whole reduced axis
+            // runs across the parts and there is nothing left to reduce inside
+            // one. That is not a choice: d * (k/2) == N/2 exactly, so the slot
+            // vector is already full of (input, query) and the key has
+            // nowhere else to go.
+            out.parts = d;
+            out.count = 1;
+            out.stride = slot_count_;
+            out.strided = true;
+            out.reduction_rotations = 0;
+            // to_slots and from_slots, d columns each, n1 - 1 baby shifts and
+            // n2 - 1 giant ones per column.
+            out.crossing_rotations = 2 * d * (n1 + d / n1 - 2);
+            // Every shift the bridge takes is a multiple of k/2 below
+            // d * (k/2), which is exactly the set the CMT inside Algorithm 4
+            // already forces.
+            out.new_galois_indices = 0;
+            return out;
+        }
+
+        int Llama3BatchOperator::softmax_seam_levels(
+            const Llama3Operator::SoftmaxConfig& softmax,
+            const BatchSoftmaxSeamConfig& seam)
+        {
+            // What a degree-D Chebyshev evaluation costs, matching
+            // evaluate_poly's own recursion: ceil(log2 D).
+            auto fit_levels = [](int degree)
+            {
+                int levels = 0;
+                for (int reach = 1; reach < degree; reach <<= 1)
+                {
+                    levels++;
+                }
+                return levels;
+            };
+
+            const int mask = seam.causal ? 1 : 0;
+            // The fold rides on the mask, so it needs one; and a Newton step
+            // wants its argument unmapped, so it cannot have both. That is the
+            // same condition Llama3Operator::softmax applies, restated here so
+            // the ledger reports what will actually happen rather than what
+            // was asked for.
+            const bool fold = seam.fold_affine_into_mask && seam.causal &&
+                              softmax.inverse_newton <= 0;
+            const int exp_affine = seam.scores_carry_exp_domain ? 0 : 1;
+
+            int soft = exp_affine + fit_levels(softmax.exp_degree) + mask;
+            if (seam.refresh_denominator)
+            {
+                // The reciprocal is fitted above the wide track, on a
+                // refreshed denominator, so a round costs the parts the square
+                // and the normalising product and nothing else.
+                soft += 2 * softmax.iterations;
+            }
+            else
+            {
+                soft += softmax.iterations *
+                        (1                                     // square
+                         + (fold ? 0 : 1)                      // 1/x affine
+                         + fit_levels(softmax.inverse_degree)  // the fit
+                         + 2 * softmax.inverse_newton          // Newton steps
+                         + 1);                                 // normalise
+            }
+            // to_slots and from_slots, one level each and one is the floor:
+            // a d-point linear map cannot cost less.
+            return 1 + soft + 1;
+        }
+
+        BatchActivation Llama3BatchOperator::softmax_seam(
+            BatchActivation& scores,
+            const Llama3Operator::SoftmaxConfig& softmax,
+            const BatchSoftmaxSeamConfig& seam,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key, Galoiskey<Scheme::CKKS>* boot_key)
+        {
+            const int d = layout_.d;
+            const int step = layout_.k / 2;
+
+            if (scores.columns() != d)
+            {
+                throw std::invalid_argument(
+                    "The SoftMax seam takes the square score block Algorithm 4 "
+                    "hands back: exactly layout.d columns, the key on the "
+                    "columns and the query on the rows");
+            }
+            if (scores.rows != d)
+            {
+                throw std::invalid_argument(
+                    "A score block has layout.d rows, one per query");
+            }
+            // The parts are added together to form the denominator, so a
+            // mismatch here would be a silently wrong sum rather than an
+            // error.
+            require_uniform(scores, "softmax_seam");
+            if (!(softmax.bound > 0.0))
+            {
+                throw std::invalid_argument(
+                    "The SoftMax seam needs the input range [-bound, 0]");
+            }
+            if (!seam.score_shift_rows.empty() &&
+                static_cast<int>(seam.score_shift_rows.size()) != d)
+            {
+                throw std::invalid_argument(
+                    "score_shift_rows holds one shift per query row, so it "
+                    "must have layout.d entries");
+            }
+            if (!seam.score_shift_slots.empty() &&
+                static_cast<int>(seam.score_shift_slots.size()) != slot_count_)
+            {
+                throw std::invalid_argument(
+                    "score_shift_slots is a slot vector and must hold exactly "
+                    "slot_count() entries");
+            }
+            if (seam.refresh_denominator && boot_key == nullptr)
+            {
+                // Falling back silently would put the fit's levels back on the
+                // wide track and change the schedule the caller sized its
+                // chain for.
+                throw std::invalid_argument(
+                    "Refreshing the SoftMax denominator needs the boot Galois "
+                    "key");
+            }
+
+            Range _r_seam("softmax_seam");
+
+            // Hoisting is a property of the operator, and the seam is not the
+            // only thing that crosses; restore it so a caller's setting
+            // survives.
+            struct HoistGuard
+            {
+                Llama3BatchOperator* op;
+                bool previous;
+                ~HoistGuard() { op->set_hoisted_crossings(previous); }
+            } guard{this, hoisted_crossings_};
+            set_hoisted_crossings(seam.hoisted_crossings);
+
+            // The d masks serve every head, so one entry per key position is
+            // the whole working set. Only ever raised: a caller that wants a
+            // deeper cache keeps it.
+            if (seam.causal && seam.cache_masks &&
+                arith_.mask_plain_capacity() < static_cast<std::size_t>(d))
+            {
+                arith_.set_mask_plain_capacity(static_cast<std::size_t>(d));
+            }
+
+            std::vector<Ciphertext<Scheme::CKKS>> slots;
+            {
+                Range _r("softmax_seam.to_slots");
+                slots = to_slots(scores, galois_key);
+            }
+
+            // The shift is subtracted from the scores, so it is scaled with
+            // them. It is a constant either way, so this is free either way --
+            // and doing it here rather than at the call site is what lets the
+            // caller quote a shift in raw score units whichever fold is on.
+            const double exp_domain =
+                seam.scores_carry_exp_domain ? exp_domain_scale(softmax.bound)
+                                             : 1.0;
+            if (!seam.score_shift_slots.empty())
+            {
+                std::vector<double> flat = seam.score_shift_slots;
+                for (auto& entry : flat)
+                {
+                    entry *= -exp_domain;
+                }
+                arith_.add_vector(slots, flat);
+            }
+            else if (!seam.score_shift_rows.empty())
+            {
+                // Slot b + step*u holds query u of input b, so a per-query
+                // shift is one slot vector, constant along the batch axis.
+                std::vector<double> flat(slot_count_, 0.0);
+                for (int u = 0; u < d; ++u)
+                {
+                    const double value = -seam.score_shift_rows[u] * exp_domain;
+                    for (int b = 0; b < step; ++b)
+                    {
+                        flat[b + u * step] = value;
+                    }
+                }
+                arith_.add_vector(slots, flat);
+            }
+            else if (seam.score_shift != 0.0)
+            {
+                for (auto& column : slots)
+                {
+                    arith_.add_constant(column, -seam.score_shift * exp_domain);
+                }
+            }
+
+            Llama3Operator::SoftmaxConfig config = softmax;
+            // The key axis is entirely across ciphertexts: one coordinate per
+            // part, so nothing is reduced inside a ciphertext and the
+            // denominator costs a slot-wise addition and no rotation. This is
+            // forced by d * (k/2) == N/2, not chosen.
+            config.strided = true;
+            config.stride = slot_count_;
+            config.count = 1;
+            config.pre_scaled_input = seam.scores_carry_exp_domain;
+            // Round zero's domain map rides on the causal mask, so it can only
+            // be folded when there is one.
+            config.fold_affine_into_mask =
+                seam.fold_affine_into_mask && seam.causal;
+            config.refresh_denominator = seam.refresh_denominator;
+
+            // By reference: the table is d slot vectors and copying it per
+            // head is the host-side half of the same waste the plaintext
+            // cache cures on the device side.
+            static const std::vector<std::vector<double>> no_masks;
+            const std::vector<std::vector<double>>& masks =
+                seam.causal ? causal_masks() : no_masks;
+            std::vector<int> mask_ids;
+            if (seam.causal)
+            {
+                mask_ids.reserve(d);
+                for (int j = 0; j < d; ++j)
+                {
+                    mask_ids.push_back(seam.cache_masks ? j : -1);
+                }
+            }
+
+            std::vector<Ciphertext<Scheme::CKKS>> probabilities;
+            {
+                Range _r("softmax_seam.softmax");
+                probabilities =
+                    arith_.softmax(slots, config, masks, mask_ids, galois_key,
+                                   relin_key, boot_key);
+            }
+            slots.clear();
+
+            Range _r("softmax_seam.from_slots");
+            return from_slots(probabilities, d, galois_key);
+        }
+
         BatchActivation Llama3BatchOperator::attention(
             BatchActivation& x, const BatchAttentionWeights& weights,
             const BatchAttentionConfig& config,
             Galoiskey<Scheme::CKKS>& galois_key,
-            Relinkey<Scheme::CKKS>& relin_key)
+            Relinkey<Scheme::CKKS>& relin_key, Galoiskey<Scheme::CKKS>* boot_key)
         {
             const int d = layout_.d;
             const int heads = config.heads;
@@ -867,10 +1126,22 @@ namespace heongpu
                 config.head_scale != 0.0
                     ? config.head_scale
                     : 1.0 / std::sqrt(static_cast<double>(per_head * d));
+
+            // And so does the domain map of the exponential, for exactly the
+            // same reason. The SoftMax fits exp over [-bound, 0] and has to
+            // carry its argument onto [-1, 1] first, which is a plaintext
+            // product and a level -- unless the scores arrive already carrying
+            // it, and every score is a linear function of this weight. So the
+            // seam's assertion is made true here, where it is free.
+            const double exp_domain =
+                config.seam.scores_carry_exp_domain
+                    ? exp_domain_scale(config.softmax.bound)
+                    : 1.0;
+
             std::vector<double> query_weight = weights.query;
             for (auto& w : query_weight)
             {
-                w *= head_scale;
+                w *= head_scale * exp_domain;
             }
 
             BatchActivation q = project(x, query_weight, config.in_channels,
@@ -912,6 +1183,19 @@ namespace heongpu
             // group then reads the same row-wise copy.
             std::vector<bool> value_is_row_wise(
                 static_cast<size_t>(std::max(v.columns(), 0)), false);
+
+            // The seam's settings, with the sublayer's shape filled in. A
+            // configuration that names no shift on the seam keeps the
+            // sublayer-level one, so an existing caller still means what it
+            // meant. Built once: the seam is identical for every head, which
+            // is exactly why its masks are worth encoding once.
+            BatchSoftmaxSeamConfig seam = config.seam;
+            seam.causal = config.causal;
+            if (seam.score_shift == 0.0 && seam.score_shift_rows.empty() &&
+                seam.score_shift_slots.empty())
+            {
+                seam.score_shift = config.score_shift;
+            }
 
             BatchActivation out;
             out.rows = x.rows;
@@ -959,43 +1243,16 @@ namespace heongpu
 
                 // The SoftMax is slot-wise, so this is where the sublayer
                 // leaves the matrix encoding -- and the only place it does.
+                // Everything between the two Algorithm-4 products is the seam,
+                // and it owns the layout decision along with the two folds and
+                // the auxiliary track. @see softmax_seam.
                 BatchActivation score_matrix;
                 score_matrix.rows = d;
                 score_matrix.column = std::move(scores);
-                std::vector<Ciphertext<Scheme::CKKS>> slots =
-                    to_slots(score_matrix, galois_key);
 
-                if (config.score_shift != 0.0)
-                {
-                    for (auto& c : slots)
-                    {
-                        arith_.add_constant(c, -config.score_shift);
-                    }
-                }
-
-                Llama3Operator::SoftmaxConfig softmax = config.softmax;
-                // The key axis is entirely across ciphertexts: one coordinate
-                // per part, so nothing is reduced inside a ciphertext and the
-                // denominator costs a slot-wise addition and no rotation.
-                softmax.strided = true;
-                softmax.stride = slot_count_;
-                softmax.count = 1;
-
-                std::vector<std::vector<double>> masks;
-                if (config.causal)
-                {
-                    masks.reserve(d);
-                    for (int j = 0; j < d; ++j)
-                    {
-                        masks.push_back(causal_column_mask(j));
-                    }
-                }
-
-                std::vector<Ciphertext<Scheme::CKKS>> p_slots =
-                    arith_.softmax(slots, softmax, masks, galois_key,
-                                   relin_key);
-
-                BatchActivation p = from_slots(p_slots, d, galois_key);
+                BatchActivation p =
+                    softmax_seam(score_matrix, config.softmax, seam, galois_key,
+                                 relin_key, boot_key);
 
                 // The value blocks are still where the projection left them,
                 // several levels above P, so they come down to meet it. The

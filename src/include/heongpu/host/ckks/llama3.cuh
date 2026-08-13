@@ -56,8 +56,10 @@
 #include <heongpu/host/ckks/operator.cuh>
 #include <heongpu/host/ckks/plaintext.cuh>
 
+#include <cstdint>
 #include <functional>
 #include <map>
+#include <tuple>
 #include <vector>
 
 namespace heongpu
@@ -781,6 +783,62 @@ namespace heongpu
                     Galoiskey<Scheme::CKKS>& galois_key,
                     Relinkey<Scheme::CKKS>& relin_key,
                     Galoiskey<Scheme::CKKS>* boot_key = nullptr);
+
+            /**
+             * @brief The same SoftMax, with the masks encoded once and kept.
+             *
+             * A mask is a slot vector, and turning one into a plaintext is an
+             * NTT over every live limb. The masks of an attention sublayer do
+             * not depend on the head -- the causal triangle is a property of
+             * the query and key indices alone -- so a sublayer running H heads
+             * over d key positions encodes the same d vectors H times over. At
+             * the Llama-3 shape that is 4096 encodes where 128 would do, and
+             * it is the same disease the bridge's diagonal cache already
+             * cured.
+             *
+             * @param mask_ids One identifier per part, naming WHICH mask it
+             *                 is. Two parts sharing an id must hold identical
+             *                 values, and the caller owns that guarantee: the
+             *                 id is the cache key and nothing here compares
+             *                 the vectors. A negative id, or an empty list,
+             *                 encodes that part afresh as the overload above
+             *                 does.
+             *
+             * Everything else -- the arithmetic, the levels, the order of the
+             * operations -- is the overload above, unchanged. Only the number
+             * of times a plaintext is built differs.
+             */
+            std::vector<Ciphertext<Scheme::CKKS>>
+            softmax(std::vector<Ciphertext<Scheme::CKKS>>& parts,
+                    const SoftmaxConfig& config,
+                    const std::vector<std::vector<double>>& masks,
+                    const std::vector<int>& mask_ids,
+                    Galoiskey<Scheme::CKKS>& galois_key,
+                    Relinkey<Scheme::CKKS>& relin_key,
+                    Galoiskey<Scheme::CKKS>* boot_key = nullptr);
+
+            /**
+             * @brief Encoded mask plaintexts kept at once, over every id.
+             *
+             * An entry is one plaintext of N words per live limb, so this is
+             * bounded rather than unlimited. Eviction is whole-entry and the
+             * entry is rebuilt on demand, so this trades memory for encodes
+             * and never for correctness. Zero disables the cache.
+             */
+            void set_mask_plain_capacity(std::size_t entries);
+            std::size_t mask_plain_capacity() const noexcept
+            {
+                return mask_plain_capacity_;
+            }
+
+            /** @brief Drop every cached mask plaintext. */
+            void clear_mask_plain_cache() { mask_plain_.clear(); }
+
+            /** @brief Encodes the cache served rather than performed. */
+            std::size_t mask_plain_hits() const noexcept
+            {
+                return mask_plain_hits_;
+            }
 
             /**
              * @brief RoPE as one plaintext-ciphertext product pair.
@@ -1683,6 +1741,28 @@ namespace heongpu
             /// slots_to_coeff_at_level and kept, because the encoding is a
             /// host-side matrix generation and the level repeats.
             std::map<int, CKKSEncodingTransformContext> slot_transforms_;
+
+            /// Encoded SoftMax masks, keyed by everything an encoding depends
+            /// on and nothing else: which mask the caller says it is, the
+            /// weight the fold rides on it, the depth it was dropped to, and
+            /// the prime the rescale after it divides by. The weight is in the
+            /// key by its exact bit pattern rather than by a convention,
+            /// because it is derived from the fitted ranges and two calls with
+            /// different calibration would otherwise share one entry.
+            /// @see the mask_ids overload of softmax.
+            std::map<std::tuple<int, uint64_t, int, uint64_t>,
+                     Plaintext<Scheme::CKKS>>
+                mask_plain_;
+            std::size_t mask_plain_capacity_ = 0;
+            std::size_t mask_plain_hits_ = 0;
+
+            /// ct *= weight * mask, taking the plaintext from the cache when
+            /// the caller has named the mask and the cache is on. Identical
+            /// arithmetic either way -- multiply_plain_inplace then rescale,
+            /// exactly as multiply_vector does.
+            void multiply_mask(Ciphertext<Scheme::CKKS>& ct,
+                               const std::vector<double>& values, double weight,
+                               int mask_id);
         };
 
     } // namespace llama

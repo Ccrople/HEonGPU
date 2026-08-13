@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -1401,6 +1402,83 @@ namespace heongpu
                 .front();
         }
 
+        void Llama3Operator::set_mask_plain_capacity(std::size_t entries)
+        {
+            mask_plain_capacity_ = entries;
+            while (mask_plain_.size() > mask_plain_capacity_)
+            {
+                mask_plain_.erase(mask_plain_.begin());
+            }
+        }
+
+        void Llama3Operator::multiply_mask(Ciphertext<Scheme::CKKS>& ct,
+                                           const std::vector<double>& values,
+                                           double weight, int mask_id)
+        {
+            if (static_cast<int>(values.size()) != slot_count_)
+            {
+                throw std::invalid_argument(
+                    "A SoftMax mask must hold exactly slot_count() entries");
+            }
+            const double plain_scale = rescale_prime(ct);
+
+            // The weighted mask, built only when it is not already encoded.
+            auto weighted = [&]
+            {
+                if (weight == 1.0)
+                {
+                    return values;
+                }
+                std::vector<double> scaled = values;
+                for (auto& entry : scaled)
+                {
+                    entry *= weight;
+                }
+                return scaled;
+            };
+
+            if (mask_id < 0 || mask_plain_capacity_ == 0)
+            {
+                Plaintext<Scheme::CKKS> plain =
+                    encode(weighted(), plain_scale, ct.depth());
+                multiply_plain_inplace(ct, plain);
+                rescale_inplace(ct);
+                return;
+            }
+
+            // Everything an encoding depends on, and nothing else.
+            // rescale_prime returns a modulus, so its double is an exact
+            // integer and safe to key on; the weight is keyed by its exact
+            // bits, so a differently calibrated fold cannot collide with this
+            // entry.
+            uint64_t weight_bits = 0;
+            std::memcpy(&weight_bits, &weight, sizeof(weight_bits));
+            const auto key = std::make_tuple(mask_id, weight_bits, ct.depth(),
+                                             static_cast<uint64_t>(plain_scale));
+            auto found = mask_plain_.find(key);
+            if (found == mask_plain_.end())
+            {
+                while (mask_plain_.size() >= mask_plain_capacity_)
+                {
+                    // Whole-entry eviction. The next call that wants this
+                    // (mask, weight, level) pays the encode again and gets the
+                    // same plaintext, so the only thing at stake is time.
+                    mask_plain_.erase(mask_plain_.begin());
+                }
+                found = mask_plain_
+                            .emplace(key, encode(weighted(), plain_scale,
+                                                 ct.depth()))
+                            .first;
+            }
+            else
+            {
+                mask_plain_hits_++;
+            }
+
+            multiply_plain_inplace(ct, found->second);
+            rescale_inplace(ct);
+        }
+
         std::vector<Ciphertext<Scheme::CKKS>> Llama3Operator::softmax(
             std::vector<Ciphertext<Scheme::CKKS>>& parts,
             const SoftmaxConfig& config,
@@ -1409,6 +1487,29 @@ namespace heongpu
             Relinkey<Scheme::CKKS>& relin_key,
             Galoiskey<Scheme::CKKS>* boot_key)
         {
+            const std::vector<int> unnamed;
+            return softmax(parts, config, masks, unnamed, galois_key, relin_key,
+                           boot_key);
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>> Llama3Operator::softmax(
+            std::vector<Ciphertext<Scheme::CKKS>>& parts,
+            const SoftmaxConfig& config,
+            const std::vector<std::vector<double>>& masks,
+            const std::vector<int>& mask_ids,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key,
+            Galoiskey<Scheme::CKKS>* boot_key)
+        {
+            if (!mask_ids.empty() && mask_ids.size() != parts.size())
+            {
+                // Silently ignoring a short list would cache under the wrong
+                // name, which is the one failure mode of a caller-keyed cache
+                // and is not detectable downstream.
+                throw std::invalid_argument(
+                    "A named SoftMax mask list needs one id per part, or none "
+                    "at all");
+            }
             if (parts.empty())
             {
                 throw std::invalid_argument(
@@ -1582,20 +1683,15 @@ namespace heongpu
                     // square root.
                     if (!masks.empty() && !masks[p].empty())
                     {
-                        if (fold_affine)
-                        {
-                            std::vector<double> scaled = masks[p];
-                            const double weight = std::sqrt(domain[0]);
-                            for (auto& entry : scaled)
-                            {
-                                entry *= weight;
-                            }
-                            multiply_vector(y.back(), scaled);
-                        }
-                        else
-                        {
-                            multiply_vector(y.back(), masks[p]);
-                        }
+                        // Round zero's denominator is the sum of the SQUARES
+                        // of these, so the map it wants rides on the mask as
+                        // its own square root. The weight goes into the cache
+                        // key rather than into the values, so the same mask at
+                        // two calibrations is two entries and never one.
+                        const double weight =
+                            fold_affine ? std::sqrt(domain[0]) : 1.0;
+                        const int id = mask_ids.empty() ? -1 : mask_ids[p];
+                        multiply_mask(y.back(), masks[p], weight, id);
                     }
                 }
             }
