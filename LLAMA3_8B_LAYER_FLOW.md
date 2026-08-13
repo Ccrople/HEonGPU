@@ -2166,3 +2166,35 @@ it.**
 E1 is the cheapest to validate and needs no island keys at all, so it fits an
 A6000: run `HEONGPU_TB_STAGE=norm` and read the exit level off the ledger. It
 should move 3 -> 4 with the block error unchanged.
+
+### 18.5 E1, measured
+
+Sicily A6000 GPU 1, `HEONGPU_TB_STAGE=norm`, `shared = 4`, `NORM_DEGREE=7`,
+at **15 <-> 12 rather than the real 16 <-> 13**: this leg's level walk is
+ring-INDEPENDENT, and the real shape needs 27 GiB of dnum-4 rotation keys
+(155 MB a key at 2^16, 175 keys) which an A6000 cannot hold. The level claim
+is what this measures.
+
+| | A: fold OFF | B: fold ON |
+|---|---|---|
+| **normed island l** | **3** | **4** |
+| skip island l | 4 | 4 |
+| norm leg max abs error | 1.204e-04 | 1.245e-04 |
+| skip copy max abs error | 3.840e-05 | 3.919e-05 |
+| `scale_norm` leg | 3.2 ms, 1 call | **absent** |
+
+**The entry level moves 3 -> 4 and the norm stays correct.** That is the level
+the six-step spend was short of. 38/38 rect tests green with the change in the
+binary, confirming `normalize_to`'s default leaves every existing `block_map`
+call site alone.
+
+**The wall-clock in this run is noise and proves nothing about E1's cost.**
+TOTAL went 3,648.6 -> 4,466.6 ms, but `boot.norm` -- which runs BEFORE the
+fold point and cannot be affected by it -- moved 1,890.8 -> 2,410.9 ms, the
+same ~27%, and `rmsnorm` and `wide.block_map` drifted with it. Single runs on
+a shared machine with an external job pinning GPU 0. On mechanism E1 strictly
+removes work (one `match_scale` per ciphertext) and adds none.
+
+**E1 alone frees no boot.** It is one of the four preconditions in §18.1; E2,
+S1, `shared = 5` and `P <= 45` are still needed together. The next step is E2,
+which is a host-side weight fold and needs no library change at all.
