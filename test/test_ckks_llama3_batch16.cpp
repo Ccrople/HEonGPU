@@ -405,19 +405,21 @@ TEST(HEonGPU, CKKS_Llama3Batch16_RMSNormKeepsInstancesIndependent)
 
     auto x = f.random_batch(cols, 909u);
     auto y = x;
-    for (auto& v : y[poisoned])
+    // Instance 3 gets completely different data of the SAME amplitude. Same
+    // amplitude matters: a perturbation that moved the summed square out of
+    // the fitted range would move every instance through the fit's error and
+    // hide exactly the mixing this test is looking for.
     {
-        v *= 3.0; // only instance 3 moves, and it moves a long way
+        const auto fresh = f.random_batch(cols, 5555u);
+        y[poisoned] = fresh[poisoned];
     }
 
     llama::Llama3Batch16Operator::RMSNormConfig config;
-    bracket_sum(y, Fixture::d, cols, config.sum_lo, config.sum_hi);
-    // One range for both runs: a range difference would move every instance
-    // and hide exactly the mixing this test is looking for.
-    double lo2, hi2;
-    bracket_sum(x, Fixture::d, cols, lo2, hi2);
-    config.sum_lo = std::min(config.sum_lo, lo2);
-    config.sum_hi = std::max(config.sum_hi, hi2);
+    double lo_x, hi_x, lo_y, hi_y;
+    bracket_sum(x, Fixture::d, cols, lo_x, hi_x);
+    bracket_sum(y, Fixture::d, cols, lo_y, hi_y);
+    config.sum_lo = std::min(lo_x, lo_y);
+    config.sum_hi = std::max(hi_x, hi_y);
     config.degree = 15;
     config.newton_iterations = 0;
 
@@ -439,18 +441,22 @@ TEST(HEonGPU, CKKS_Llama3Batch16_RMSNormKeepsInstancesIndependent)
 
         if (b == poisoned)
         {
-            // RMSNorm is scale invariant, so tripling one instance must
-            // leave its OWN output alone too -- which is a second, sharper
-            // statement than independence and comes free with this fixture.
-            EXPECT_LT(worst, 1e-3) << "instance " << b << " is not scale "
-                                      "invariant";
+            // The test needs power as well as a null: a layer that ignored
+            // its input entirely would pass every "unchanged" check below.
+            EXPECT_GT(worst, 1e-2)
+                << "instance " << b
+                << " did not move even though its own data changed";
         }
         else
         {
-            EXPECT_LT(worst, 1e-6)
+            // Not exact zero: the two runs are separate encryptions, so the
+            // floor is CKKS noise, not bit equality. Mixing would show up as
+            // an O(1) move, so this sits three orders above the noise and
+            // three below the signal.
+            EXPECT_LT(worst, 1e-4)
                 << "instance " << b
-                << " moved when only instance 3 changed: the reduction is "
-                   "crossing the batch axis";
+                << " moved when only instance " << poisoned
+                << " changed: the reduction is crossing the batch axis";
         }
     }
 }
@@ -697,7 +703,11 @@ TEST(HEonGPU, CKKS_Llama3Batch16_HiddenStreamingChangesNothing)
     auto out_b = f.nl->feed_forward(ct_b, w, streamed, *f.galois, *f.relin);
     const auto got_b = f.op->decrypt(out_b, *f.decryptor, f.scale);
 
-    EXPECT_LT(max_abs_diff(got_a, got_b), 1e-6);
+    // Two separate encryptions, so the floor is CKKS noise. What is being
+    // asserted is that the ASSOCIATION of the down projection's sum is all
+    // that changed -- a different chunking that changed the arithmetic would
+    // show up far above this.
+    EXPECT_LT(max_abs_diff(got_a, got_b), 1e-4);
     EXPECT_EQ(out_a.column.front().depth(), out_b.column.front().depth());
 }
 
@@ -736,17 +746,26 @@ TEST(HEonGPU, CKKS_Llama3Batch16_FeedForwardKeepsInstancesIndependent)
     auto out_y = f.nl->feed_forward(ct_y, w, config, *f.galois, *f.relin);
     const auto got_y = f.op->decrypt(out_y, *f.decryptor, f.scale);
 
+    double moved = 0.0;
     for (int b = 0; b < Fixture::instances; ++b)
     {
-        if (b == poisoned)
-            continue;
         double worst = 0.0;
         for (size_t e = 0; e < got_x[b].size(); ++e)
             worst = std::max(worst, std::abs(got_x[b][e] - got_y[b][e]));
-        EXPECT_LT(worst, 1e-6)
+        if (b == poisoned)
+        {
+            moved = worst;
+            continue;
+        }
+        // Two separate encryptions, so the floor is CKKS noise rather than
+        // bit equality; mixing would be an O(1) move.
+        EXPECT_LT(worst, 1e-4)
             << "instance " << b << " moved when only instance " << poisoned
             << " changed";
     }
+    EXPECT_GT(moved, 1e-2)
+        << "instance " << poisoned << " did not move even though its own "
+                                     "data changed";
 }
 
 // ----------------------------------------------------------------------

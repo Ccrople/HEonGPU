@@ -318,7 +318,9 @@ namespace heongpu
                 }
             }
 
-            const double c = static_cast<double>(channels);
+            // Named apart from the pre-scale factor c above, which is a
+            // different number entirely and lives on the host.
+            const double channel_count = static_cast<double>(channels);
             const double eps = config.eps;
             const double gain = config.output_scale;
 
@@ -327,8 +329,8 @@ namespace heongpu
                 Range _r_fit("b16.rms_norm.inverse_sqrt");
                 factor = arith().evaluate_function(
                     total,
-                    [c, eps, gain](double s)
-                    { return gain / std::sqrt(s / c + eps); },
+                    [channel_count, eps, gain](double s)
+                    { return gain / std::sqrt(s / channel_count + eps); },
                     config.sum_lo, config.sum_hi, config.degree, relin_key,
                     /*pre_scaled=*/true);
             }
