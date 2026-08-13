@@ -840,6 +840,113 @@ namespace heongpu
             return causal_mask_cache_;
         }
 
+        void Llama3BatchOperator::rope_slots(
+            std::vector<Ciphertext<Scheme::CKKS>>& slots, int head_dim,
+            double theta, int position_offset)
+        {
+            const int channels = static_cast<int>(slots.size());
+            if (channels == 0 || channels % head_dim != 0)
+            {
+                throw std::invalid_argument(
+                    "RoPE takes a whole number of heads: the channel count "
+                    "must be a multiple of head_dim");
+            }
+            if (head_dim % 2 != 0)
+            {
+                throw std::invalid_argument(
+                    "RoPE pairs lane c with lane c + head_dim/2, so head_dim "
+                    "must be even");
+            }
+            if (!(theta > 0.0))
+            {
+                throw std::invalid_argument("The RoPE base must be positive");
+            }
+            for (std::size_t j = 1; j < slots.size(); ++j)
+            {
+                // The two halves of a pair are added together after their
+                // plaintext products, so a level or scale drift is a silently
+                // wrong rotation rather than an error.
+                if (slots[j].depth() != slots[0].depth() ||
+                    slots[j].scale() != slots[0].scale())
+                {
+                    throw std::invalid_argument(
+                        "rope_slots needs every channel at one level and one "
+                        "scale");
+                }
+            }
+
+            Range _r("rope_slots");
+
+            const int heads = channels / head_dim;
+            const int half = head_dim / 2;
+
+            // One cosine and one sine vector per LANE PAIR, shared by every
+            // head and every instance: the angle depends on the token and the
+            // lane, and the token is the slow slot axis. At head_dim = 128
+            // that is 64 pairs, not 4096 channels.
+            for (int c = 0; c < half; ++c)
+            {
+                const double omega = std::pow(
+                    theta,
+                    -2.0 * static_cast<double>(c) /
+                        static_cast<double>(head_dim));
+
+                std::vector<double> cos_v(
+                    static_cast<std::size_t>(slot_count_), 0.0);
+                std::vector<double> sin_v(cos_v.size(), 0.0);
+                // The minus sign of the rotation goes on the PLAINTEXT. A
+                // homomorphic negation would be multiply_constant, which is a
+                // plaintext product and a rescale -- a second level, and then
+                // the two halves of the pair would no longer be at the same
+                // depth to be added at all.
+                std::vector<double> neg_sin_v(cos_v.size(), 0.0);
+                for (int u = 0; u < layout_.d; ++u)
+                {
+                    const double angle =
+                        (static_cast<double>(u + position_offset)) *
+                        omega;
+                    const double cs = std::cos(angle);
+                    const double sn = std::sin(angle);
+                    for (int b = 0; b < layout_.batch; ++b)
+                    {
+                        const std::size_t s =
+                            static_cast<std::size_t>((b + layout_.batch * u));
+                        cos_v[s] = cs;
+                        sin_v[s] = sn;
+                        neg_sin_v[s] = -sn;
+                    }
+                }
+
+                for (int h = 0; h < heads; ++h)
+                {
+                    const std::size_t j0 =
+                        static_cast<std::size_t>(h * head_dim + c);
+                    const std::size_t j1 = j0 + static_cast<std::size_t>(half);
+
+                    // out0 = x0 cos - x1 sin,  out1 = x0 sin + x1 cos.
+                    // Four plaintext products, two additions, ONE level: each
+                    // multiply_vector encodes at the prime its own rescale
+                    // removes, so all four terms come back at one scale and
+                    // one depth and the additions are exact.
+                    Ciphertext<Scheme::CKKS> x0_cos = slots[j0];
+                    Ciphertext<Scheme::CKKS> x0_sin = slots[j0];
+                    Ciphertext<Scheme::CKKS> x1_cos = slots[j1];
+                    Ciphertext<Scheme::CKKS> x1_neg_sin = slots[j1];
+
+                    arith_.multiply_vector(x0_cos, cos_v);
+                    arith_.multiply_vector(x0_sin, sin_v);
+                    arith_.multiply_vector(x1_cos, cos_v);
+                    arith_.multiply_vector(x1_neg_sin, neg_sin_v);
+
+                    arith_.add_inplace(x0_cos, x1_neg_sin);
+                    arith_.add_inplace(x0_sin, x1_cos);
+
+                    slots[j0] = std::move(x0_cos);
+                    slots[j1] = std::move(x0_sin);
+                }
+            }
+        }
+
         // -------------------------------------------------------------------
         // The SoftMax seam
         // -------------------------------------------------------------------
@@ -1172,6 +1279,36 @@ namespace heongpu
             // operand in the GEMM and is the dominant term in the product's
             // error.
             const int group = heads / kv_heads;
+
+            // Rotary embedding, on Q and K and not on V.
+            //
+            // Three levels, and only one of them is the rotation: the angle
+            // varies with the token, which is the slow SLOT axis, and Q and K
+            // are in the coefficient encoding here, so reaching slot form and
+            // returning costs a crossing each way. Both operands take exactly
+            // the same treatment, which is what keeps them at one level for
+            // the score product.
+            //
+            // Under a slot-resident stream Q and K are already in slot form
+            // when they are formed and this is one level and no crossing at
+            // all; see LLAMA3_8B_LAYER_FLOW.md 22.6.
+            if (config.rope)
+            {
+                Range _r_rope("attention.rope");
+                const int head_dim = per_head * d;
+                std::vector<Ciphertext<Scheme::CKKS>> qs =
+                    to_slots(q, galois_key);
+                rope_slots(qs, head_dim, config.rope_theta,
+                           config.rope_position_offset);
+                q = from_slots(qs, x.rows, galois_key);
+                qs.clear();
+
+                std::vector<Ciphertext<Scheme::CKKS>> ks =
+                    to_slots(k, galois_key);
+                rope_slots(ks, head_dim, config.rope_theta,
+                           config.rope_position_offset);
+                k = from_slots(ks, x.rows, galois_key);
+            }
 
             // V does still owe the step-1 transpose: P V wants V row-wise and
             // the projection leaves it column-wise, and no reordering of the

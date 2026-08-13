@@ -442,6 +442,29 @@ namespace heongpu
                 /// bound, iterations and the degrees are the caller's. stride
                 /// and count are fixed by this encoding and overwritten: the
                 /// key axis is entirely across ciphertexts, so count is one.
+                /// Rotary position embedding on Q and K.
+                ///
+                /// OFF by default, and the default is not a preference: this
+                /// path had no RoPE AT ALL until it was added, so every
+                /// measurement taken before it was taken without positional
+                /// information. Leaving it off keeps those reproducible;
+                /// turning it on is what makes the sublayer Llama-3's.
+                ///
+                /// It costs THREE levels here and only one of them is the
+                /// rotation. The angle varies with the TOKEN, which is the
+                /// slow slot axis, so the map is an ordinary slot plaintext
+                /// product -- but Q and K live in the coefficient encoding
+                /// between the projection and the score product, so reaching
+                /// slot form and returning costs a crossing each way. Under a
+                /// slot-resident stream (LLAMA3_8B_LAYER_FLOW.md 22.6) Q and
+                /// K are already in slot form when they are formed and RoPE
+                /// costs its one level and nothing else.
+                bool rope = false;
+                /// Llama-3's base is 500000; Llama-2's is 10000.
+                double rope_theta = 500000.0;
+                /// Absolute position of token 0, for a windowed run.
+                int rope_position_offset = 0;
+
                 Llama3Operator::SoftmaxConfig softmax;
                 /// Everything between the two Algorithm-4 products.
                 /// @see BatchSoftmaxSeamConfig, softmax_seam.
@@ -466,6 +489,30 @@ namespace heongpu
              * Llama3Operator::set_mask_plain_capacity.
              */
             std::vector<double> causal_column_mask(int key) const;
+
+            /**
+             * @brief Rotary position embedding, in place on slot-form Q or K.
+             *
+             * Cheap on this encoding for two reasons, both of them the same
+             * fact: a channel is a whole ciphertext. The head-dim pairing
+             * c <-> c + head_dim/2 is therefore a pairing of whole
+             * CIPHERTEXTS -- no homomorphic rotation, no Galois key -- and the
+             * angle (u + offset) * theta^(-2c/head_dim) depends on the TOKEN,
+             * which is the slow slot axis, so one plaintext per lane pair
+             * serves every instance and every head.
+             *
+             * Four plaintext products, two additions, ONE level. The minus
+             * sign rides on the plaintext: negating homomorphically is a
+             * plaintext product and a rescale, and the two halves of a pair
+             * would then sit at different depths and could not be added.
+             *
+             * @param slots     heads * head_dim ciphertexts in the slot
+             *                  reading, at one level and one scale.
+             * @param head_dim  Channels in one head; must be even and divide
+             *                  the column count.
+             */
+            void rope_slots(std::vector<Ciphertext<Scheme::CKKS>>& slots,
+                            int head_dim, double theta, int position_offset);
 
             // ---------------------------------------------------------------
             // The SoftMax seam, continued

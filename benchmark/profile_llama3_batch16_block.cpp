@@ -138,12 +138,45 @@ namespace
     // conventions: 1/sqrt(head_dim) on the query, the causal set j <= u, and
     // a true SoftMax -- the mask's row-count equaliser and the score shift
     // both cancel in the normalisation, which is what they are for.
-    Mat attention_host(const Mat& x, const AttnWeights& w, int rows, int in_c,
-                       int q_c, int kv_c, int heads, int kv_heads, int hd)
+    // The same rotation rope_slots applies: lane c pairs with c + hd/2 and
+    // the angle depends on the token.
+    void rope_host(Mat& m, int rows, int cols, int hd, double theta,
+                   int offset)
     {
-        const Mat q = matmul(x, w.q, rows, in_c, q_c);
-        const Mat k = matmul(x, w.k, rows, in_c, kv_c);
+        const int half = hd / 2;
+        for (int h = 0; h * hd < cols; ++h)
+            for (int c = 0; c < half; ++c)
+            {
+                const double omega = std::pow(
+                    theta, -2.0 * static_cast<double>(c) /
+                               static_cast<double>(hd));
+                for (int u = 0; u < rows; ++u)
+                {
+                    const double a =
+                        static_cast<double>(u + offset) * omega;
+                    const size_t i0 =
+                        static_cast<size_t>(u) * cols + h * hd + c;
+                    const size_t i1 = i0 + static_cast<size_t>(half);
+                    const double x0 = m[i0], x1 = m[i1];
+                    m[i0] = x0 * std::cos(a) - x1 * std::sin(a);
+                    m[i1] = x0 * std::sin(a) + x1 * std::cos(a);
+                }
+            }
+    }
+
+    Mat attention_host(const Mat& x, const AttnWeights& w, int rows, int in_c,
+                       int q_c, int kv_c, int heads, int kv_heads, int hd,
+                       bool rope = false, double theta = 500000.0,
+                       int offset = 0)
+    {
+        Mat q = matmul(x, w.q, rows, in_c, q_c);
+        Mat k = matmul(x, w.k, rows, in_c, kv_c);
         const Mat v = matmul(x, w.v, rows, in_c, kv_c);
+        if (rope)
+        {
+            rope_host(q, rows, q_c, hd, theta, offset);
+            rope_host(k, rows, kv_c, hd, theta, offset);
+        }
         const double scale = 1.0 / std::sqrt(static_cast<double>(hd));
         const int group = heads / kv_heads;
 
@@ -424,6 +457,9 @@ int main()
         cfg.heads = heads;
         cfg.kv_heads = kv_heads;
         cfg.causal = true;
+        cfg.rope = use_rope;
+        cfg.rope_theta = 500000.0;
+        cfg.rope_position_offset = 0;
 
         // The score range, off the host, the way calibration supplies it.
         AttnWeights gw = aw;
@@ -435,8 +471,13 @@ int main()
         const double hscale = 1.0 / std::sqrt(static_cast<double>(hd));
         for (int b = 0; b < instances; ++b)
         {
-            const Mat q = matmul(ref_normed[b], gw.q, d, model, q_channels);
-            const Mat k = matmul(ref_normed[b], gw.k, d, model, kv_channels);
+            Mat q = matmul(ref_normed[b], gw.q, d, model, q_channels);
+            Mat k = matmul(ref_normed[b], gw.k, d, model, kv_channels);
+            if (use_rope)
+            {
+                rope_host(q, d, q_channels, hd, 500000.0, 0);
+                rope_host(k, d, kv_channels, hd, 500000.0, 0);
+            }
             const int group = heads / kv_heads;
             for (int h = 0; h < heads; ++h)
                 for (int u = 0; u < d; ++u)
@@ -473,10 +514,13 @@ int main()
             const int group = heads / kv_heads;
             for (int b = 0; b < instances; ++b)
             {
-                const Mat q =
-                    matmul(ref_normed[b], gw.q, d, model, q_channels);
-                const Mat k =
-                    matmul(ref_normed[b], gw.k, d, model, kv_channels);
+                Mat q = matmul(ref_normed[b], gw.q, d, model, q_channels);
+                Mat k = matmul(ref_normed[b], gw.k, d, model, kv_channels);
+                if (use_rope)
+                {
+                    rope_host(q, d, q_channels, hd, 500000.0, 0);
+                    rope_host(k, d, kv_channels, hd, 500000.0, 0);
+                }
                 for (int h = 0; h < heads; ++h)
                     for (int u = 0; u < d; ++u)
                     {
@@ -539,7 +583,8 @@ int main()
             for (int b = 0; b < instances; ++b)
                 ref_sub[b] =
                     attention_host(ref_normed[b], hw, d, model, q_channels,
-                                   kv_channels, heads, kv_heads, hd);
+                                   kv_channels, heads, kv_heads, hd, use_rope,
+                                   500000.0, 0);
         }
         note("attention", ms(t0, t1), din, dout,
              worst_error(ref_sub, decrypt(sub)), q_channels);
@@ -621,22 +666,6 @@ int main()
              worst_error(ref, decrypt(stream)), model);
     }
 
-    // ---- RoPE, checked on its own: it is not wired into attention() ---
-    if (use_rope)
-    {
-        llama::BatchActivation qact =
-            op.encrypt(random_batch(instances, d, q_channels, 99u, 0.5), d,
-                       q_channels, encryptor, scale);
-        auto slots = op.to_slots(qact, galois);
-        auto t0 = tick();
-        const int din = slots.front().depth();
-        llama::Llama3Batch16Operator::RopeConfig rc;
-        nl.rope_slots(slots, rc);
-        const int dout = slots.front().depth();
-        auto t1 = tick();
-        note("rope(standalone)", ms(t0, t1), din, dout, 0.0, q_channels);
-    }
-
     // ---- report -------------------------------------------------------
     std::cout << "\n[b16] " << std::left << std::setw(18) << "stage"
               << std::right << std::setw(11) << "ms" << std::setw(8) << "cols"
@@ -661,10 +690,18 @@ int main()
     std::cout << "[b16] levels spent " << spent << " of " << limbs - 1
               << " available" << std::endl;
 
+    // This is the RMM POOL RESERVATION plus the context, not the working
+    // set: the pool takes a fixed fraction of free VRAM at context generate
+    // and holds it whatever the shape is. Reading it as demand is the mistake
+    // the project has already made once -- a 128-channel norm does not use
+    // 43 GiB. What it IS good for is the ceiling: if a shape runs at all, its
+    // working set fitted inside this, and if it OOMs at this number the cause
+    // is fragmentation rather than size.
     std::size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
-    std::cout << "[b16] device memory " << std::fixed << std::setprecision(2)
-              << gib(total_b - free_b) << " / " << gib(total_b) << " GiB in use"
+    std::cout << "[b16] device " << std::fixed << std::setprecision(2)
+              << gib(total_b - free_b) << " / " << gib(total_b)
+              << " GiB reserved (RMM pool + context, NOT the working set)"
               << std::endl;
 
     double worst = 0.0;

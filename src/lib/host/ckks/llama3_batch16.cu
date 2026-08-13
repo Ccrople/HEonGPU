@@ -553,108 +553,12 @@ namespace heongpu
             std::vector<Ciphertext<Scheme::CKKS>>& slots,
             const RopeConfig& config)
         {
-            const int head_dim = shape_.head_dim;
-            const int channels = static_cast<int>(slots.size());
-            if (channels == 0 || channels % head_dim != 0)
-            {
-                throw std::invalid_argument(
-                    "RoPE takes a whole number of heads: the channel count "
-                    "must be a multiple of head_dim");
-            }
-            if (head_dim % 2 != 0)
-            {
-                throw std::invalid_argument(
-                    "RoPE pairs lane c with lane c + head_dim/2, so head_dim "
-                    "must be even");
-            }
-            if (!(config.theta > 0.0))
-            {
-                throw std::invalid_argument("The RoPE base must be positive");
-            }
-            for (std::size_t j = 1; j < slots.size(); ++j)
-            {
-                // The two halves of a pair are added together after their
-                // plaintext products, so a level or scale drift is a silently
-                // wrong rotation rather than an error.
-                if (slots[j].depth() != slots[0].depth() ||
-                    slots[j].scale() != slots[0].scale())
-                {
-                    throw std::invalid_argument(
-                        "rope_slots needs every channel at one level and one "
-                        "scale");
-                }
-            }
-
-            Range _r("b16.rope_slots");
-
-            const int heads = channels / head_dim;
-            const int half = head_dim / 2;
-
-            // One cosine and one sine vector per LANE PAIR, shared by every
-            // head and every instance: the angle depends on the token and the
-            // lane, and the token is the slow slot axis. At head_dim = 128
-            // that is 64 pairs, not 4096 channels.
-            for (int c = 0; c < half; ++c)
-            {
-                const double omega = std::pow(
-                    config.theta,
-                    -2.0 * static_cast<double>(c) /
-                        static_cast<double>(head_dim));
-
-                std::vector<double> cos_v(
-                    static_cast<std::size_t>(slot_count_), 0.0);
-                std::vector<double> sin_v(cos_v.size(), 0.0);
-                // The minus sign of the rotation goes on the PLAINTEXT. A
-                // homomorphic negation would be multiply_constant, which is a
-                // plaintext product and a rescale -- a second level, and then
-                // the two halves of the pair would no longer be at the same
-                // depth to be added at all.
-                std::vector<double> neg_sin_v(cos_v.size(), 0.0);
-                for (int u = 0; u < tokens(); ++u)
-                {
-                    const double angle =
-                        (static_cast<double>(u + config.position_offset)) *
-                        omega;
-                    const double cs = std::cos(angle);
-                    const double sn = std::sin(angle);
-                    for (int b = 0; b < instances(); ++b)
-                    {
-                        const std::size_t s =
-                            static_cast<std::size_t>(slot_of(b, u));
-                        cos_v[s] = cs;
-                        sin_v[s] = sn;
-                        neg_sin_v[s] = -sn;
-                    }
-                }
-
-                for (int h = 0; h < heads; ++h)
-                {
-                    const std::size_t j0 =
-                        static_cast<std::size_t>(h * head_dim + c);
-                    const std::size_t j1 = j0 + static_cast<std::size_t>(half);
-
-                    // out0 = x0 cos - x1 sin,  out1 = x0 sin + x1 cos.
-                    // Four plaintext products, two additions, ONE level: each
-                    // multiply_vector encodes at the prime its own rescale
-                    // removes, so all four terms come back at one scale and
-                    // one depth and the additions are exact.
-                    Ciphertext<Scheme::CKKS> x0_cos = slots[j0];
-                    Ciphertext<Scheme::CKKS> x0_sin = slots[j0];
-                    Ciphertext<Scheme::CKKS> x1_cos = slots[j1];
-                    Ciphertext<Scheme::CKKS> x1_neg_sin = slots[j1];
-
-                    arith().multiply_vector(x0_cos, cos_v);
-                    arith().multiply_vector(x0_sin, sin_v);
-                    arith().multiply_vector(x1_cos, cos_v);
-                    arith().multiply_vector(x1_neg_sin, neg_sin_v);
-
-                    arith().add_inplace(x0_cos, x1_neg_sin);
-                    arith().add_inplace(x0_sin, x1_cos);
-
-                    slots[j0] = std::move(x0_cos);
-                    slots[j1] = std::move(x0_sin);
-                }
-            }
+            // One implementation, on the operator attention() can reach. This
+            // is the shape-aware front door: head_dim comes from the model
+            // shape rather than from the caller, so a channel count that is
+            // not a whole number of heads is refused with the shape named.
+            batch_.rope_slots(slots, shape_.head_dim, config.theta,
+                              config.position_offset);
         }
 
         // -------------------------------------------------------------------
