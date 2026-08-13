@@ -357,6 +357,94 @@ namespace heongpu
         g[comp] = OPERATOR_GPU_64::mult(g[comp], s, p);
     }
 
+    template <int TILE>
+    __global__ void
+    bm_scalar_combine_kernel(Data64* const* out, const Data64* const* in,
+                             const Data64* weight, const Modulus64* modulus,
+                             int inner, int cols, int n, int num_limbs)
+    {
+        // blockIdx.z carries both the limb and the ciphertext component, so
+        // the coefficient axis keeps grid.x to itself. A component is a whole
+        // second copy of the polynomial and shares every scalar with the
+        // first, so the two differ only in where they read and write.
+        const int limb = blockIdx.z % num_limbs;
+        const int comp = blockIdx.z / num_limbs;
+        const Modulus64 p = modulus[limb];
+
+        const int coeff =
+            static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+        if (coeff >= n)
+            return;
+
+        const int j0 = static_cast<int>(blockIdx.y) * TILE;
+
+        // [component][limb][coefficient], the addressing every ciphertext in
+        // this file uses.
+        const size_t offset =
+            (static_cast<size_t>(comp) * num_limbs + limb) * n + coeff;
+
+        Data64 acc[TILE];
+#pragma unroll
+        for (int u = 0; u < TILE; ++u)
+            acc[u] = 0;
+
+        const Data64* w = weight + static_cast<size_t>(limb) * inner * cols;
+
+        // Only the last tile can be short, and hoisting the check out of the
+        // accumulation keeps the common case branch-free and fully unrolled.
+        const int live = (cols - j0 < TILE) ? (cols - j0) : TILE;
+
+        if (live == TILE)
+        {
+            for (int t = 0; t < inner; ++t)
+            {
+                const Data64 av = in[t][offset];
+                const Data64* wt = w + static_cast<size_t>(t) * cols + j0;
+#pragma unroll
+                for (int u = 0; u < TILE; ++u)
+                {
+                    const Data64 s =
+                        acc[u] + OPERATOR_GPU_64::mult(av, wt[u], p);
+                    acc[u] = (s >= p.value) ? s - p.value : s;
+                }
+            }
+        }
+        else
+        {
+            for (int t = 0; t < inner; ++t)
+            {
+                const Data64 av = in[t][offset];
+                const Data64* wt = w + static_cast<size_t>(t) * cols + j0;
+                for (int u = 0; u < live; ++u)
+                {
+                    const Data64 s =
+                        acc[u] + OPERATOR_GPU_64::mult(av, wt[u], p);
+                    acc[u] = (s >= p.value) ? s - p.value : s;
+                }
+            }
+        }
+
+        for (int u = 0; u < live; ++u)
+            out[j0 + u][offset] = acc[u];
+    }
+
+    template __global__ void
+    bm_scalar_combine_kernel<1>(Data64* const*, const Data64* const*,
+                                const Data64*, const Modulus64*, int, int, int,
+                                int);
+    template __global__ void
+    bm_scalar_combine_kernel<2>(Data64* const*, const Data64* const*,
+                                const Data64*, const Modulus64*, int, int, int,
+                                int);
+    template __global__ void
+    bm_scalar_combine_kernel<4>(Data64* const*, const Data64* const*,
+                                const Data64*, const Modulus64*, int, int, int,
+                                int);
+    template __global__ void
+    bm_scalar_combine_kernel<8>(Data64* const*, const Data64* const*,
+                                const Data64*, const Modulus64*, int, int, int,
+                                int);
+
     __global__ void bm_gemm_kernel(Data64* C, const Data64* A, const Data64* B,
                                    const Modulus64* modulus, int d, int inner,
                                    int cols, int k, int b_row_stride,

@@ -223,6 +223,65 @@ namespace heongpu
                                      double scale);
 
         /**
+         * @brief Upload a plaintext matrix that is the SAME real matrix for
+         *        every one of the k/2 batched instances.
+         *
+         * This is the only kind of plaintext a model weight ever is. The batch
+         * axis carries k/2 independent INPUTS through one model, so a
+         * projection's weight does not vary along it -- and Definition 1 puts
+         * the batch index in the EVALUATION domain of R_k, so an entry that is
+         * constant across the batch inverts to the CONSTANT polynomial.
+         * BatchMatrixEncoder::encode returns exactly that: v at Y^0 and zero at
+         * every other power, because the constant polynomial is the unique
+         * preimage of a constant vector under a bijective transform.
+         *
+         * Taking the general route to discover that is expensive. encode() runs
+         * an O(k^2) transform per entry to produce a delta;
+         * encode_plaintext_matrix() then stores and transforms k coefficients
+         * per entry where one carries the information; and pcmm() moves four
+         * [limb][row][col][k] tensors through the subring domain in order to
+         * multiply by it. Here the host writes one rounded integer per entry,
+         * the device lifts it into the RNS base, and nothing is transformed at
+         * all.
+         *
+         * A subsequent pcmm() picks this form up automatically. Given the same
+         * integers the two routes agree BIT FOR BIT -- the cancellation in
+         * pcmm() is exact in Z_p, not approximate -- so the only question is
+         * whether the two ENCODERS produce the same integers, and there this
+         * one is the more accurate of the two rather than the equal of it.
+         * BatchMatrixEncoder::encode sums k/2 double products per coefficient
+         * and leaves a relative residue of ~1.8e-16 at the powers that should
+         * be zero; llround kills it while scale * |w| < 2^51.5 and does not
+         * above, which a 60-bit prime scale reaches. This route rounds the
+         * value itself and is exact at every scale. **So do not write an
+         * equality regression against the general encoder** -- it holds only
+         * below that threshold, and where it fails this side is right.
+         *
+         * Real and batch-invariant are enforced by the signature rather than
+         * by a check: the parameter is one real matrix, so there is no way to
+         * express a per-instance or complex weight and reach this path by
+         * accident. A caller that grows one must go back to
+         * encode_plaintext_matrix, which still handles the general case.
+         *
+         * @param weight Row-major @p rows x @p cols real matrix, shared by the
+         *               whole batch.
+         * @param scale  Scaling factor; entry (i,j) is stored as
+         *               llround(weight[i][j] * scale).
+         */
+        void encode_shared_plaintext_matrix(const std::vector<double>& weight,
+                                            int rows, int cols, int depth,
+                                            double scale);
+
+        /**
+         * @brief Whether the uploaded plaintext is in the shared form.
+         *
+         * True after encode_shared_plaintext_matrix, false after
+         * encode_plaintext_matrix. Exposed so a test can pin that the two
+         * routes agree rather than assume it.
+         */
+        bool plaintext_is_shared() const noexcept { return plain_shared_; }
+
+        /**
          * @brief Batch PCMM, Algorithm 1.
          *
          * Treats @p in as the columns of a matrix encryption (Definition 2) and
@@ -431,6 +490,13 @@ namespace heongpu
       private:
         const BatchSubringTables& tables_for(int depth);
 
+        /// Algorithm 1 against a plaintext uploaded by
+        /// encode_shared_plaintext_matrix. Validation lives in pcmm, which
+        /// dispatches here once the operands have been checked.
+        void pcmm_shared(std::vector<Ciphertext<Scheme::CKKS>>& out,
+                         const std::vector<Ciphertext<Scheme::CKKS>*>& in,
+                         bool rescale);
+
         /// The operator at the layout (N, N/2), built on first use. Algorithm
         /// 5's summation is a CMT read at k = 2, and cmt()/tweak()/tables_for()
         /// are all bound to layout_, so the second reading needs its own
@@ -480,6 +546,11 @@ namespace heongpu
         int plain_cols_ = 0;
         int plain_depth_ = -1;
         double plain_scale_ = 0.0;
+        /// Set by encode_shared_plaintext_matrix, cleared by
+        /// encode_plaintext_matrix. When set, plain_ holds
+        /// [limb][row][col] scalars rather than [limb][row][col][k] subring
+        /// elements, and pcmm takes the scalar path.
+        bool plain_shared_ = false;
     };
 
 } // namespace heongpu

@@ -39,6 +39,56 @@ namespace heongpu
                                          size_t per_limb, int num_limbs);
 
     /**
+     * @brief Algorithm 1 for a plaintext matrix that is CONSTANT over R_k.
+     *
+     * out[j] = sum_t weight[t][j] * in[t], every ciphertext taken whole and
+     * every product a modular scalar multiplication.
+     *
+     * WHY THIS IS THE WHOLE OF ALGORITHM 1 WHEN THE WEIGHT IS SHARED. A batch
+     * matrix encoding puts the k/2 batched instances in the EVALUATION domain
+     * of R_k, so an entry that carries the same real value for every instance
+     * inverts to the constant polynomial: BatchMatrixEncoder::encode returns
+     * v at Y^0 and exactly zero at every other power, because the constant
+     * polynomial is the unique preimage of a constant vector. A Llama weight
+     * is real and shared by the batch -- the sixteen instances are sixteen
+     * independent inputs through ONE model -- so this is the only case a
+     * projection ever presents.
+     *
+     * Then the subring machinery has nothing left to do. The general path
+     * transforms both operands into the R_k NTT domain, runs
+     * C[i][j][s] = sum_t A[i][t][s] * B[t][j][s] pointwise in s, and
+     * transforms back; with B[t][j][s] = v_tj independent of s that middle
+     * step is a scalar multiplication, and the transform is Z_p-linear, so
+     * T^-1(sum_t T(a_t) * v_t) = sum_t v_t * a_t. The transforms cancel
+     * identically rather than approximately, and this kernel computes the
+     * same residues the general path does, bit for bit.
+     *
+     * What it saves is everything around the arithmetic: the host-side
+     * length-k DFT (O(k^2) per entry, and a delta by construction), the four
+     * subring transform passes, the k-fold expansion of the plaintext, and
+     * the four [limb][row][col][k] temporaries -- 2.7 GiB per call at the 8B
+     * projection shape, against 42 MiB for the scalars alone.
+     *
+     * Each thread owns one (component, limb, coefficient) position and a tile
+     * of TILE output columns, so one load of an input word feeds TILE
+     * multiply-accumulates. The weight is broadcast: every thread of a block
+     * reads the same weight[t][j].
+     *
+     * @param out      [cols] pointers to output ciphertexts.
+     * @param in       [inner] pointers to input ciphertexts, laid out
+     *                 [component][limb][coefficient].
+     * @param weight   [num_limbs][inner][cols] residues, as
+     *                 bm_crt_expand_kernel leaves them.
+     * @param cols     Output ciphertexts; the tail below a full tile is
+     *                 bounds-checked rather than padded.
+     */
+    template <int TILE>
+    __global__ void
+    bm_scalar_combine_kernel(Data64* const* out, const Data64* const* in,
+                             const Data64* weight, const Modulus64* modulus,
+                             int inner, int cols, int n, int num_limbs);
+
+    /**
      * @brief Forward negacyclic NTT of length k, one transform per block.
      *
      * Output lands in bit-reversed order, matching the ordering that

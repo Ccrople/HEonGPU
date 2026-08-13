@@ -18,6 +18,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace heongpu
 {
@@ -645,6 +646,81 @@ namespace heongpu
         plain_cols_ = cols;
         plain_depth_ = depth;
         plain_scale_ = scale;
+        plain_shared_ = false;
+    }
+
+    void HEBatchMatrixOperator<Scheme::CKKS>::encode_shared_plaintext_matrix(
+        const std::vector<double>& weight, int rows, int cols, int depth,
+        double scale)
+    {
+        const size_t entries = static_cast<size_t>(rows) * cols;
+        if (weight.size() != entries)
+            throw std::invalid_argument(
+                "the shared plaintext matrix must have rows*cols entries");
+
+        const BatchSubringTables& t = tables_for(depth);
+        const int num_limbs = t.num_limbs;
+
+        // One rounded integer per entry, and no transform at all. The length-k
+        // encoding of a batch-invariant real value is the constant polynomial,
+        // so the general encoder's O(k^2) work per entry produces a delta whose
+        // only non-zero coefficient is this number -- and its k - 1 zeros then
+        // occupy k - 1 words of every limb and ride through four subring
+        // transform passes in order to multiply by nothing.
+        std::vector<int64_t> coeffs(entries);
+        for (size_t e = 0; e < entries; ++e)
+            coeffs[e] = std::llround(scale * weight[e]);
+
+        // Staged in the first limb's slice and expanded in place, exactly as
+        // encode_plaintext_matrix does, so no second buffer is allocated.
+        plain_ = DeviceVector<Data64>(static_cast<size_t>(num_limbs) * entries);
+        HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+            plain_.data(), coeffs.data(), entries * sizeof(int64_t),
+            cudaMemcpyHostToDevice, cudaStreamDefault));
+        {
+            const int threads = 256;
+            const dim3 grid(
+                static_cast<unsigned>((entries + threads - 1) / threads));
+            bm_crt_expand_kernel<<<grid, threads>>>(
+                plain_.data(),
+                reinterpret_cast<const int64_t*>(plain_.data()),
+                t.modulus.data(), entries, num_limbs);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+        }
+
+        if (bm_encode_check_enabled())
+        {
+            const size_t total = static_cast<size_t>(num_limbs) * entries;
+            std::vector<Data64> got(total);
+            HEONGPU_CUDA_CHECK(cudaMemcpy(got.data(), plain_.data(),
+                                          total * sizeof(Data64),
+                                          cudaMemcpyDeviceToHost));
+            std::vector<Modulus64> all = context_->get_key_modulus();
+            for (int l = 0; l < num_limbs; ++l)
+            {
+                const Data64 p = all[l].value;
+                for (size_t i = 0; i < entries; ++i)
+                {
+                    const Data64 want = centered_to_modular(coeffs[i], p);
+                    const size_t at = static_cast<size_t>(l) * entries + i;
+                    if (got[at] != want)
+                    {
+                        throw std::runtime_error(
+                            "bm_crt_expand_kernel disagrees with the host "
+                            "expansion for a shared plaintext at limb " +
+                            std::to_string(l) + " index " + std::to_string(i) +
+                            ": device " + std::to_string(got[at]) + " host " +
+                            std::to_string(want));
+                    }
+                }
+            }
+        }
+
+        plain_rows_ = rows;
+        plain_cols_ = cols;
+        plain_depth_ = depth;
+        plain_scale_ = scale;
+        plain_shared_ = true;
     }
 
     void HEBatchMatrixOperator<Scheme::CKKS>::load_coefficients(
@@ -1175,6 +1251,74 @@ namespace heongpu
         HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
     }
 
+    void HEBatchMatrixOperator<Scheme::CKKS>::pcmm_shared(
+        std::vector<Ciphertext<Scheme::CKKS>>& out,
+        const std::vector<Ciphertext<Scheme::CKKS>*>& in, bool rescale)
+    {
+        const int inner = plain_rows_;
+        const int cols_out = plain_cols_;
+        const int depth = in[0]->depth_;
+
+        const BatchSubringTables& t = tables_for(depth);
+        const int num_limbs = t.num_limbs;
+
+        BmRange _r("PCMM.shared");
+
+        out.clear();
+        out.reserve(cols_out);
+        for (int j = 0; j < cols_out; ++j)
+            out.emplace_back(*in[0]); // inherits level, scale and shape
+
+        std::vector<Data64*> in_base(inner), out_base(cols_out);
+        for (int j = 0; j < inner; ++j)
+            in_base[j] = in[j]->data();
+        for (int j = 0; j < cols_out; ++j)
+            out_base[j] = out[j].data();
+
+        DeviceVector<Data64*> din(in_base);
+        DeviceVector<Data64*> dout(out_base);
+
+        // One load of an input word feeds TILE multiply-accumulates, so a wide
+        // projection wants the widest tile its column count fills. Narrow ones
+        // fall back rather than pad, because the tail branch costs more than
+        // the reuse buys below a full tile.
+        const int threads = 256;
+        const unsigned xblocks =
+            static_cast<unsigned>((n_ + threads - 1) / threads);
+        const unsigned zblocks = static_cast<unsigned>(2 * num_limbs);
+
+        auto launch = [&](auto tile)
+        {
+            constexpr int TILE = decltype(tile)::value;
+            const dim3 grid(xblocks,
+                            static_cast<unsigned>((cols_out + TILE - 1) / TILE),
+                            zblocks);
+            bm_scalar_combine_kernel<TILE><<<grid, threads>>>(
+                dout.data(), din.data(), plain_.data(), t.modulus.data(), inner,
+                cols_out, n_, num_limbs);
+        };
+
+        if (cols_out >= 8)
+            launch(std::integral_constant<int, 8>{});
+        else if (cols_out >= 4)
+            launch(std::integral_constant<int, 4>{});
+        else if (cols_out >= 2)
+            launch(std::integral_constant<int, 2>{});
+        else
+            launch(std::integral_constant<int, 1>{});
+
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+        HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Step 2 of Algorithm 1, unchanged: the product carries the plaintext
+        // scaling factor and the caller's rescale removes exactly that.
+        for (int j = 0; j < cols_out; ++j)
+        {
+            out[j].scale_ = in[0]->scale_ * plain_scale_;
+            out[j].rescale_required_ = rescale;
+        }
+    }
+
     void HEBatchMatrixOperator<Scheme::CKKS>::pcmm(
         std::vector<Ciphertext<Scheme::CKKS>>& out,
         const std::vector<Ciphertext<Scheme::CKKS>*>& in, bool rescale)
@@ -1201,6 +1345,56 @@ namespace heongpu
             if (c->depth_ != depth)
                 throw std::invalid_argument(
                     "all input ciphertexts must share a level");
+
+        // Three states this routine cannot represent and used to accept in
+        // silence. None of them is exotic -- a projection chained straight off
+        // another product reaches the first, and every one of them corrupts a
+        // result rather than failing.
+        for (auto* c : in)
+        {
+            // An unspent rescale is swallowed: out is built from in[0], which
+            // carries the flag over, and then scale_ and the flag are both
+            // overwritten below. The debt simply disappears and the product
+            // sits at a scale nothing downstream expects.
+            if (c->rescale_required_)
+                throw std::invalid_argument(
+                    "a PCMM input still owes a rescale; spend it first, "
+                    "because the product overwrites the scale and the flag "
+                    "and the debt would be lost rather than carried");
+            // Only components 0 and 1 are addressed, through comp_stride. A
+            // degree-3 operand would have its third component ignored and the
+            // output would inherit cipher_size_ = 3 while holding two.
+            if (c->relinearization_required_ || c->cipher_size_ != 2)
+                throw std::invalid_argument(
+                    "PCMM needs degree-two ciphertexts; relinearize first, "
+                    "because only two components are addressed and the third "
+                    "would be dropped without a word");
+            // data() returns a HOST pointer when the ciphertext is resident on
+            // the host, and it is handed straight to kernels below.
+            if (!c->is_on_device())
+                c->store_in_device();
+        }
+
+        // A batch-invariant plaintext is a scalar in R_k, and the subring
+        // transform is Z_p-linear, so
+        //     T^-1( sum_t T(a_t) * v_t ) = sum_t v_t * a_t
+        // and the four transform passes below cancel IDENTICALLY -- in Z_p,
+        // not to within noise. So for the same integers the scalar route
+        // returns the same residues bit for bit, and it returns them without
+        // transforming anything. (The two ENCODERS can still disagree at a
+        // large scale, where the general one's floating-point residue survives
+        // rounding; see encode_shared_plaintext_matrix.)
+        if (plain_shared_)
+        {
+            pcmm_shared(out, in, rescale);
+            return;
+        }
+
+        // cmt, ccmm and rectangular_pcmm all push a scope; pcmm had none, and
+        // on an encoding whose whole thesis is "the products are free and the
+        // crossings are not", a capture that cannot see the products settles
+        // nothing.
+        BmRange _r_pcmm("PCMM.general");
 
         const BatchSubringTables& t = tables_for(depth);
         const int num_limbs = t.num_limbs;

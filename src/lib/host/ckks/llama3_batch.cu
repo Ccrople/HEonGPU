@@ -592,7 +592,6 @@ namespace heongpu
                 in.push_back(&c);
             }
 
-            const int nslots = batch_encoder_.slots();
             // The weight is encoded at the prime the rescale that follows will
             // divide by, so the product comes back at exactly the activation's
             // own scale one level down. Encoding it at the nominal scale
@@ -609,35 +608,37 @@ namespace heongpu
             {
                 const int cols = std::min(column_block, out_channels - base);
 
-                // The weight is real and shared by the batch, so every one of
-                // the k/2 matrices handed to the encoder is the same slice.
-                std::vector<std::vector<std::complex<double>>> batch(
-                    nslots, std::vector<std::complex<double>>(
-                                static_cast<size_t>(in_channels) * cols));
+                // The weight is real and shared by the batch -- the k/2
+                // instances are k/2 independent inputs through ONE model -- so
+                // its R_k entries are CONSTANTS, and Definition 1 encodes a
+                // constant as the constant polynomial. The general encoder
+                // spends an O(k^2) transform per entry to discover that, and
+                // then k - 1 zeros per entry ride through the upload and four
+                // subring transform passes to multiply by nothing.
+                // encode_shared_plaintext_matrix writes the one number that
+                // carries the information. At the 8B projection shape that is a
+                // 32-fold plaintext upload and gigabytes of subring temporaries
+                // that stop happening -- and it is also the more accurate of
+                // the two, because plain_scale here is a PRIME (40 to 60 bits),
+                // which is exactly where the general encoder's rounding residue
+                // stops vanishing.
+                std::vector<double> slice(static_cast<size_t>(in_channels) *
+                                          cols);
                 for (int i = 0; i < in_channels; ++i)
                 {
                     for (int j = 0; j < cols; ++j)
                     {
-                        const double v =
+                        slice[static_cast<size_t>(i) * cols + j] =
                             weight[static_cast<size_t>(i) * out_channels +
                                    base + j];
-                        batch[0][static_cast<size_t>(i) * cols + j] =
-                            std::complex<double>(v, 0.0);
                     }
                 }
-                for (int s = 1; s < nslots; ++s)
-                {
-                    batch[s] = batch[0];
-                }
 
-                std::vector<int64_t> coeffs;
                 {
                     SuffixRange _r(range_name, "weight_encode");
-                    batch_encoder_.encode(batch, in_channels, cols,
-                                          plain_scale, coeffs);
-                    matrix_.encode_plaintext_matrix(coeffs, in_channels, cols,
-                                                    x.column.front().depth(),
-                                                    plain_scale);
+                    matrix_.encode_shared_plaintext_matrix(
+                        slice, in_channels, cols, x.column.front().depth(),
+                        plain_scale);
                 }
 
                 // Algorithm 1 itself: two matrix products over R_{q,k}, one
