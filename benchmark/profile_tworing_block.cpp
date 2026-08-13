@@ -2286,6 +2286,14 @@ int main()
                       << std::setprecision(3) << MaxAbsDiff(got_skip, x_plain)
                       << std::defaultfloat << std::endl;
         }
+        // The number this leg actually decides. Everything the norm spends
+        // above comes straight off the island entry -- from_slots_at and
+        // descend only DROP to their target -- so this is what the whole
+        // attention sublayer gets to work with, and it is what decides
+        // whether q and k can skip a refresh.
+        std::cout << "[tb] norm exit: normed island l = " << is_l(normed)
+                  << ", skip island l = " << is_l(skip) << " (shared "
+                  << shared << ")" << std::endl;
         ledger.print("norm leg (one refresh + norm, 16 big cts)");
         return 0;
     }
