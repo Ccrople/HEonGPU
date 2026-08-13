@@ -246,7 +246,16 @@ namespace
         double worst = 0.0;
         for (size_t b = 0; b < want.size(); ++b)
             for (size_t e = 0; e < want[b].size(); ++e)
-                worst = std::max(worst, std::abs(want[b][e] - got[b][e]));
+            {
+                const double diff = std::abs(want[b][e] - got[b][e]);
+                // A NaN loses every comparison, so std::max would keep the
+                // running maximum and a failed decrypt would report ZERO
+                // error -- the most dangerous possible reading. NaN in, NaN
+                // out, and the verdict tests for it.
+                if (!(diff == diff))
+                    return std::numeric_limits<double>::quiet_NaN();
+                worst = std::max(worst, diff);
+            }
         return worst;
     }
 
@@ -829,7 +838,7 @@ int main()
         llama::Llama3Batch16Operator::fold_gain(fg, gain2, model, hidden);
         llama::Llama3Batch16Operator::fold_gain(fu, gain2, model, hidden);
 
-        Batch ref_block(instances), ref_n2(instances);
+        Batch ref_block(instances), ref_n2(instances), ref_resid(instances);
         double gmax = 0.0;
         for (int b = 0; b < instances; ++b)
         {
@@ -838,6 +847,7 @@ int main()
                                heads, kv_heads, hd, use_rope, 500000.0, 0);
             for (size_t e = 0; e < s1.size(); ++e)
                 s1[e] += x[b][e];
+            ref_resid[b] = s1;
             ref_n2[b] = rms_norm_host(s1, d, model, {}, norm_cfg.eps);
             const Mat g = matmul(ref_n2[b], fg, d, model, hidden);
             for (double v : g)
@@ -863,7 +873,12 @@ int main()
         bcfg.fold_norm_scale = true;
         bcfg.attention_norm = norm_cfg;
         bcfg.feed_forward_norm = norm_cfg;
-        bracket_sum(ref_n2, model, bcfg.feed_forward_norm.sum_lo,
+        // From the RESIDUAL STREAM, which is what the second norm reads.
+        // Bracketing its OUTPUT instead puts the 1/sqrt fit two orders off --
+        // a normalised stream has summed square about d, a residual stream
+        // has whatever attention left -- and the fit is then evaluated far
+        // outside its interval and returns a value that outgrows the scale.
+        bracket_sum(ref_resid, model, bcfg.feed_forward_norm.sum_lo,
                     bcfg.feed_forward_norm.sum_hi);
         bcfg.attention.in_channels = model;
         bcfg.attention.q_channels = q_channels;
