@@ -1558,6 +1558,16 @@ namespace heongpu
         if (plain_rows_ != d || plain_cols_ != half)
             throw std::invalid_argument(
                 "rectangular_pcmm expects a d x (N/2) plaintext matrix");
+        // The shared form stores [limb][row][col] scalars where this reads
+        // [limb][row][col][k] subring elements. Reading one as the other runs
+        // k-fold off the end of the buffer, which is not a failure anyone
+        // would see -- Algorithm 5 contracts over the batch axis, so it needs
+        // the subring structure a batch-invariant weight does not have.
+        if (plain_shared_)
+            throw std::invalid_argument(
+                "rectangular_pcmm needs a plaintext from "
+                "encode_plaintext_matrix; the shared form carries no subring "
+                "structure and Algorithm 5 contracts over exactly that axis");
 
         BmRange _r_rect("RectangularPCMM");
 
