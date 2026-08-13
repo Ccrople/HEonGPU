@@ -1042,7 +1042,18 @@ TEST(HEonGPU, CKKS_Llama3Batch16Block_RefreshCarriesTheMatrixEncoding)
 // switch until the next refresh and then discarded.
 TEST(HEonGPU, CKKS_Llama3Batch16Block_LevelBudgetIsHonoured)
 {
-    BootFixture f(SmallShape(), 30);
+    // The chain has to be long enough that the refresh hands back MORE than
+    // the budget, or the budget is not exercised at all: a bootstrap returns
+    // chain - refresh_levels() limbs, which at 30 is five and at 40 is fifteen.
+    const int chain_wanted = 40;
+    const int returned =
+        chain_wanted - llama::Llama3Batch16Operator::refresh_levels(
+                           heongpu::BootstrappingConfig(3, 3, 11));
+    const int keep = 6;
+    ASSERT_GT(returned, keep)
+        << "the budget would be a no-op and the test would assert nothing";
+
+    BootFixture f(SmallShape(), chain_wanted);
     const int d = BootFixture::d;
     const int cols = 2;
 
@@ -1051,6 +1062,7 @@ TEST(HEonGPU, CKKS_Llama3Batch16Block_LevelBudgetIsHonoured)
         f.op->encrypt(want, d, cols, *f.encryptor, f.scale);
 
     const int chain = f.op->chain_limbs();
+    ASSERT_EQ(chain, chain_wanted);
     for (auto& c : x.column)
         for (int i = 0; i < chain - 1; ++i)
             f.op->arith().mod_drop_inplace(c);
@@ -1059,13 +1071,13 @@ TEST(HEonGPU, CKKS_Llama3Batch16Block_LevelBudgetIsHonoured)
     f.nl->level_budget = [&](const char* name)
     {
         saw = name;
-        return 6; // keep six limbs behind this seam
+        return keep;
     };
     f.nl->bootstrap(x, "test.budget", *f.boot_key, *f.relin);
     f.nl->level_budget = nullptr;
 
     EXPECT_EQ(saw, "test.budget") << "the hook is called with the seam's name";
-    EXPECT_EQ(chain - x.column.front().depth(), 6)
+    EXPECT_EQ(chain - x.column.front().depth(), keep)
         << "the budget is in LIMBS remaining, not in depth";
     for (const auto& c : x.column)
         EXPECT_EQ(c.depth(), x.column.front().depth());
