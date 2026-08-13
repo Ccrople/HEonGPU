@@ -235,8 +235,15 @@ TEST(HEonGPU, CKKS_BatchMatrix_SharedPcmmAgreesWithGeneralWordForWord)
     const int nslots = f.encoder->slots();
     ASSERT_EQ(nslots, 16) << "the batch-16 shape is the point of this file";
 
-    const double scale_in = std::pow(2.0, 30);
-    const double scale_w = std::pow(2.0, 30);
+    // The product lands at scale_in * scale_w and a coefficient of a matrix
+    // encryption is bounded by sqrt(2) * scale, so the output reaches
+    // inner * sqrt(2) * scale_in * scale_w ~ 2^59.5 here. extract_coefficients
+    // reports a centered coefficient as an int64 and throws above 2^63, which
+    // 2^30 apiece would reach. 2^28 also keeps the general encoder's rounding
+    // residue below the 2^51.5 where it stops vanishing, which the
+    // word-for-word comparison needs.
+    const double scale_in = std::pow(2.0, 28);
+    const double scale_w = std::pow(2.0, 28);
 
     const std::vector<std::vector<cd>> M =
         random_batch(nslots, Shape::d, Shape::in_channels, 97531u);
@@ -371,8 +378,15 @@ TEST(HEonGPU, CKKS_BatchMatrix_SharedPcmmMatchesReference)
     const int nslots = f.encoder->slots();
     ASSERT_EQ(nslots, 16);
 
-    const double scale_in = std::pow(2.0, 30);
-    const double scale_w = std::pow(2.0, 30);
+    // The product lands at scale_in * scale_w and a coefficient of a matrix
+    // encryption is bounded by sqrt(2) * scale, so the output reaches
+    // inner * sqrt(2) * scale_in * scale_w ~ 2^59.5 here. extract_coefficients
+    // reports a centered coefficient as an int64 and throws above 2^63, which
+    // 2^30 apiece would reach. 2^28 also keeps the general encoder's rounding
+    // residue below the 2^51.5 where it stops vanishing, which the
+    // word-for-word comparison needs.
+    const double scale_in = std::pow(2.0, 28);
+    const double scale_w = std::pow(2.0, 28);
 
     const std::vector<std::vector<cd>> M =
         random_batch(nslots, Shape::d, Shape::in_channels, 24680u);
@@ -409,9 +423,9 @@ TEST(HEonGPU, CKKS_BatchMatrix_SharedPcmmMatchesReference)
         for (size_t e = 0; e < ref.size(); ++e)
         {
             worst = std::max(worst, std::abs(got[s][e] - ref[e]));
-            ASSERT_NEAR(got[s][e].real(), ref[e].real(), 1e-4)
+            ASSERT_NEAR(got[s][e].real(), ref[e].real(), 1e-3)
                 << "instance " << s << " entry " << e;
-            ASSERT_NEAR(got[s][e].imag(), ref[e].imag(), 1e-4)
+            ASSERT_NEAR(got[s][e].imag(), ref[e].imag(), 1e-3)
                 << "instance " << s << " entry " << e;
         }
     }
