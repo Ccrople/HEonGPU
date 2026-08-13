@@ -372,7 +372,8 @@ namespace heongpu
 
         void Llama3RectOperator::block_map(
             std::vector<Ciphertext<Scheme::CKKS>>& ct, bool inverse,
-            const char* name, Galoiskey<Scheme::CKKS>& galois_key)
+            const char* name, Galoiskey<Scheme::CKKS>& galois_key,
+            double normalize_to)
         {
             const int step = layout_.batch;
             if (ct.empty() || step == 1)
@@ -386,7 +387,20 @@ namespace heongpu
             Range _r_block(name);
 
             const int depth = ct.front().depth();
-            const double plain_scale = rescale_prime(ct.front());
+            // The product below leaves the result at
+            //   s_ct * plain_scale / prime,
+            // and plain_scale IS the prime, so the map preserves the input's
+            // scale. Encoding the diagonals at plain_scale * (target / s_ct)
+            // instead lands the same rescale on `target`. That is exactly what
+            // match_scale computes -- and match_scale spends a level to do it,
+            // because it is a plaintext multiply of its own. Here it is free:
+            // these plaintexts are a per-call local, not a cached set, so
+            // nothing downstream can be poisoned by a per-call ratio.
+            double plain_scale = rescale_prime(ct.front());
+            if (normalize_to > 0.0)
+            {
+                plain_scale *= normalize_to / ct.front().scale();
+            }
             for (const auto& c : ct)
             {
                 if (c.depth() != depth)
@@ -402,7 +416,7 @@ namespace heongpu
             // become (n1 - 1) + (live giants - 1), 62 to 14 at step = 32.
             if (bsgs_block_steps_ > 1)
             {
-                block_map_bsgs(ct, diagonal, name, galois_key);
+                block_map_bsgs(ct, diagonal, name, galois_key, plain_scale);
                 return;
             }
 
@@ -516,13 +530,13 @@ namespace heongpu
         void Llama3RectOperator::block_map_bsgs(
             std::vector<Ciphertext<Scheme::CKKS>>& ct,
             const std::vector<std::vector<Complex64>>& diagonal,
-            const char* name, Galoiskey<Scheme::CKKS>& galois_key)
+            const char* name, Galoiskey<Scheme::CKKS>& galois_key,
+            double plain_scale)
         {
             const int step = layout_.batch;
             const int n = slot_count_;
             const int n1 = bsgs_block_steps_;
             const int depth = ct.front().depth();
-            const double plain_scale = rescale_prime(ct.front());
 
             // eps = n1*i + b, b in [0, n1). The window is
             // [-(step-1), step-1], so i runs between the floors of its ends;

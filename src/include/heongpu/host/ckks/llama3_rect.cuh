@@ -787,10 +787,20 @@ namespace heongpu
              * Costs k - 1 rotations, k - 1 plaintext products and one level per
              * ciphertext. The diagonals are shared by every ciphertext in the
              * call and encoded once, which the row bridge does not do.
+             *
+             * @param normalize_to when positive, the output lands on THIS scale
+             *        instead of the input's. The map already multiplies by
+             *        encoded diagonals and rescales, so carrying the ratio in
+             *        the diagonals costs nothing: the plaintexts are a free
+             *        local re-encoded every call, not a cached set. This is the
+             *        same expression match_scale computes, folded into a
+             *        product that was happening anyway -- which is a whole
+             *        level, because match_scale is itself a plaintext multiply.
              */
             void block_map(std::vector<Ciphertext<Scheme::CKKS>>& ct,
                            bool inverse, const char* name,
-                           Galoiskey<Scheme::CKKS>& galois_key);
+                           Galoiskey<Scheme::CKKS>& galois_key,
+                           double normalize_to = 0.0);
 
             /**
              * @brief Rectangular form to slot form.
@@ -1513,7 +1523,8 @@ namespace heongpu
             void block_map_bsgs(std::vector<Ciphertext<Scheme::CKKS>>& ct,
                                 const std::vector<std::vector<Complex64>>& diag,
                                 const char* name,
-                                Galoiskey<Scheme::CKKS>& galois_key);
+                                Galoiskey<Scheme::CKKS>& galois_key,
+                                double plain_scale);
         };
 
     } // namespace llama
