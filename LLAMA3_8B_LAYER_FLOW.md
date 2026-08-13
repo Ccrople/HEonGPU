@@ -2301,6 +2301,20 @@ decrypts as noise rather than throwing. Test:
 `test/test_ckks_llama3_bootv2.cpp`, 4/4, 18.13 bits worst-slot at logN 13
 through the module API.
 
+All green on a clean card (GPU 2, 4.3 GB used at launch): `ckks_llama3_rect`
+38/38 (409 s), `ckks_llama3` 53/53, `ckks_llama3_bootv2` 4/4,
+`ckks_llama3_batch` 12/12, `ckks_ringswitch` 9/9, `ckks_tworing_bridge` 2/2.
+
+**A trap that cost an hour here and will cost the next person the same.** While
+another session held ~44 GB of that card's 49, those same two suites failed
+*every* test with a verbatim RMM `maximum pool size exceeded` at a 3.72 GiB cap
+-- 0.9 x the 4.7 GB that was left -- several of them inside gtest `SetUp()` in
+4-5 ms. The pool is sized from FREE memory at context creation, so a busy card
+does not make a suite slow, it makes it fail, and a 4 ms failure reads exactly
+like a real regression. A suite can also come back **rc=143 (SIGTERM) with no
+output at all**, which is not a failure either. Read the verbatim error and
+re-run on a clean card before believing any of it.
+
 ### 19.5 What is left, priced
 
 1. **The constant-plaintext encode in `evaluate_poly`, ~4-6%.**
