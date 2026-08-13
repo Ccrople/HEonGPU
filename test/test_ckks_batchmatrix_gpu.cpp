@@ -1046,6 +1046,282 @@ TEST(HEonGPU, CKKS_BatchMatrix_CCMMMatchesReference)
     std::cout << "CCMM worst absolute error: " << worst << std::endl;
 }
 
+// A row-wise right operand makes Algorithm 4 compute A * B^T.
+//
+// This is the entry point the score product uses to stop transposing K twice:
+// the row-wise encryption of B^T is the column-wise encryption of B, so handing
+// the projection's own output over with the flag set computes Q K^T with no CMT
+// at all.
+//
+// The reference here is a HOST product, deliberately. Comparing
+// ccmm(a, b, row_wise) against ccmm(a, cmt(b), column_wise) would pass just as
+// happily if the flag were inverted, or if both paths shared an orientation
+// error -- it only pins the two against each other. Both operands carry a real
+// c1, which is the other half of what makes this test able to fail: the
+// orientation of the sk-graded terms is invisible on trivial encryptions, and
+// CCMMIsExactWithZeroC1 memsets c1 to zero.
+TEST(HEonGPU, CKKS_BatchMatrix_CCMMRowWiseRightOperandTransposes)
+{
+    const size_t degree = 4096;
+    const int d = 8;
+
+    heongpu::HEContext<S> context =
+        heongpu::GenHEContext<S>(heongpu::sec_level_type::none);
+    context->set_poly_modulus_degree(degree);
+    context->set_coeff_modulus_bit_sizes({60, 50}, {60});
+    context->generate();
+
+    heongpu::HEKeyGenerator<S> keygen(context);
+    heongpu::Secretkey<S> secret(context);
+    keygen.generate_secret_key(secret);
+    heongpu::Publickey<S> pub(context);
+    keygen.generate_public_key(pub, secret);
+    heongpu::HEEncryptor<S> encryptor(context, pub);
+    heongpu::HEDecryptor<S> decryptor(context, secret);
+    heongpu::HEEncoder<S> encoder_slots(context);
+    heongpu::HEArithmeticOperator<S> ops(context, encoder_slots);
+
+    heongpu::BatchMatrixLayout layout(static_cast<int>(degree), d);
+    std::vector<int> rot = heongpu::get_batch_cmt_rotation_indices(layout);
+    heongpu::Galoiskey<S> galois_key(context, rot);
+    keygen.generate_galois_key(galois_key, secret);
+    heongpu::Relinkey<S> relin_key(context);
+    keygen.generate_relin_key(relin_key, secret);
+
+    heongpu::HEBatchMatrixOperator<S> op(context, layout);
+    heongpu::BatchMatrixEncoder encoder(layout.k);
+
+    // Same asymmetric split as CCMMMatchesReference. Skipping step 1 removes
+    // the CMT whose noise this split exists to absorb, so the tolerance below
+    // is met with room to spare -- see the error printed at the end.
+    const double scale_a = std::pow(2.0, 25);
+    const double scale_b = std::pow(2.0, 35);
+
+    const int nslots = encoder.slots();
+    std::vector<std::vector<cd>> M(
+        nslots, std::vector<cd>(static_cast<size_t>(d) * d));
+    std::vector<std::vector<cd>> U(
+        nslots, std::vector<cd>(static_cast<size_t>(d) * d));
+    std::mt19937_64 rng(24680u);
+    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+    for (auto& m : M)
+        for (auto& z : m)
+            z = cd(dist(rng), dist(rng));
+    for (auto& u : U)
+        for (auto& z : u)
+            z = cd(dist(rng), dist(rng));
+
+    auto encrypt_matrix = [&](const std::vector<std::vector<cd>>& mat,
+                              double scale, std::vector<heongpu::Ciphertext<S>>&
+                                                cts)
+    {
+        std::vector<int64_t> coeffs;
+        encoder.encode(mat, d, d, scale, coeffs);
+        std::vector<std::vector<int64_t>> columns;
+        heongpu::build_matrix_encryption_coefficients(coeffs, layout, d, d,
+                                                      columns);
+        cts.clear();
+        cts.reserve(d);
+        for (int j = 0; j < d; ++j)
+        {
+            heongpu::Plaintext<S> pt(context);
+            op.load_coefficients(pt, columns[j], scale);
+            heongpu::Ciphertext<S> c(context);
+            encryptor.encrypt(c, pt);
+            cts.push_back(std::move(c));
+        }
+    };
+
+    std::vector<heongpu::Ciphertext<S>> ca, cb;
+    encrypt_matrix(M, scale_a, ca);
+    encrypt_matrix(U, scale_b, cb);
+
+    std::vector<heongpu::Ciphertext<S>*> pa, pb;
+    for (auto& c : ca)
+        pa.push_back(&c);
+    for (auto& c : cb)
+        pb.push_back(&c);
+
+    std::vector<heongpu::Ciphertext<S>> out;
+    op.ccmm(out, pa, pb, galois_key, relin_key, ops, /*rescale=*/false,
+            heongpu::HEBatchMatrixOperator<S>::RightOperandForm::row_wise);
+    ASSERT_EQ(out.size(), static_cast<size_t>(d));
+
+    std::vector<std::vector<int64_t>> out_columns(d);
+    for (int j = 0; j < d; ++j)
+    {
+        heongpu::Plaintext<S> pt(context);
+        decryptor.decrypt(pt, out[j]);
+        op.extract_coefficients(out_columns[j], pt);
+    }
+
+    std::vector<int64_t> got_coeffs;
+    heongpu::split_matrix_encryption_coefficients(out_columns, layout, d, d,
+                                                  got_coeffs);
+    std::vector<std::vector<cd>> got;
+    encoder.decode(got_coeffs, d, d, scale_a * scale_b, got);
+
+    ASSERT_EQ(got.size(), static_cast<size_t>(nslots));
+    double worst = 0.0;
+    for (int s = 0; s < nslots; ++s)
+    {
+        // The claim under test: the answer is M * U^T, not M * U.
+        std::vector<cd> ut(static_cast<size_t>(d) * d);
+        for (int r = 0; r < d; ++r)
+            for (int c = 0; c < d; ++c)
+                ut[static_cast<size_t>(r) * d + c] =
+                    U[s][static_cast<size_t>(c) * d + r];
+
+        const std::vector<cd> ref = matmul(M[s], ut, d, d, d);
+        for (size_t e = 0; e < ref.size(); ++e)
+        {
+            worst = std::max(worst, std::abs(got[s][e] - ref[e]));
+            ASSERT_NEAR(got[s][e].real(), ref[e].real(), 1e-2)
+                << "slot " << s << " entry " << e;
+            ASSERT_NEAR(got[s][e].imag(), ref[e].imag(), 1e-2)
+                << "slot " << s << " entry " << e;
+        }
+    }
+    std::cout << "CCMM row-wise worst absolute error: " << worst << std::endl;
+}
+
+// The two CMTs the score product used to pay compose to the identity.
+//
+// ccmm(a, cmt(b), column_wise) and ccmm(a, b, row_wise) must agree, because a
+// CMT is a transpose and therefore an involution on the encoding. This is the
+// substitution attention() makes, pinned directly. It is a weaker statement
+// than the test above -- it cannot see a shared orientation error -- so it runs
+// alongside it, not instead of it.
+TEST(HEonGPU, CKKS_BatchMatrix_CCMMRowWiseMatchesDoubleTranspose)
+{
+    const size_t degree = 4096;
+    const int d = 8;
+
+    heongpu::HEContext<S> context =
+        heongpu::GenHEContext<S>(heongpu::sec_level_type::none);
+    context->set_poly_modulus_degree(degree);
+    context->set_coeff_modulus_bit_sizes({60, 50}, {60});
+    context->generate();
+
+    heongpu::HEKeyGenerator<S> keygen(context);
+    heongpu::Secretkey<S> secret(context);
+    keygen.generate_secret_key(secret);
+    heongpu::Publickey<S> pub(context);
+    keygen.generate_public_key(pub, secret);
+    heongpu::HEEncryptor<S> encryptor(context, pub);
+    heongpu::HEDecryptor<S> decryptor(context, secret);
+    heongpu::HEEncoder<S> encoder_slots(context);
+    heongpu::HEArithmeticOperator<S> ops(context, encoder_slots);
+
+    heongpu::BatchMatrixLayout layout(static_cast<int>(degree), d);
+    std::vector<int> rot = heongpu::get_batch_cmt_rotation_indices(layout);
+    heongpu::Galoiskey<S> galois_key(context, rot);
+    keygen.generate_galois_key(galois_key, secret);
+    heongpu::Relinkey<S> relin_key(context);
+    keygen.generate_relin_key(relin_key, secret);
+
+    heongpu::HEBatchMatrixOperator<S> op(context, layout);
+    heongpu::BatchMatrixEncoder encoder(layout.k);
+
+    const double scale_a = std::pow(2.0, 25);
+    const double scale_b = std::pow(2.0, 35);
+
+    const int nslots = encoder.slots();
+    std::vector<std::vector<cd>> M(
+        nslots, std::vector<cd>(static_cast<size_t>(d) * d));
+    std::vector<std::vector<cd>> U(
+        nslots, std::vector<cd>(static_cast<size_t>(d) * d));
+    std::mt19937_64 rng(97531u);
+    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+    for (auto& m : M)
+        for (auto& z : m)
+            z = cd(dist(rng), dist(rng));
+    for (auto& u : U)
+        for (auto& z : u)
+            z = cd(dist(rng), dist(rng));
+
+    auto encrypt_matrix = [&](const std::vector<std::vector<cd>>& mat,
+                              double scale, std::vector<heongpu::Ciphertext<S>>&
+                                                cts)
+    {
+        std::vector<int64_t> coeffs;
+        encoder.encode(mat, d, d, scale, coeffs);
+        std::vector<std::vector<int64_t>> columns;
+        heongpu::build_matrix_encryption_coefficients(coeffs, layout, d, d,
+                                                      columns);
+        cts.clear();
+        cts.reserve(d);
+        for (int j = 0; j < d; ++j)
+        {
+            heongpu::Plaintext<S> pt(context);
+            op.load_coefficients(pt, columns[j], scale);
+            heongpu::Ciphertext<S> c(context);
+            encryptor.encrypt(c, pt);
+            cts.push_back(std::move(c));
+        }
+    };
+
+    auto decode_out = [&](std::vector<heongpu::Ciphertext<S>>& out,
+                          std::vector<std::vector<cd>>& got)
+    {
+        std::vector<std::vector<int64_t>> out_columns(d);
+        for (int j = 0; j < d; ++j)
+        {
+            heongpu::Plaintext<S> pt(context);
+            decryptor.decrypt(pt, out[j]);
+            op.extract_coefficients(out_columns[j], pt);
+        }
+        std::vector<int64_t> coeffs;
+        heongpu::split_matrix_encryption_coefficients(out_columns, layout, d, d,
+                                                      coeffs);
+        encoder.decode(coeffs, d, d, scale_a * scale_b, got);
+    };
+
+    std::vector<heongpu::Ciphertext<S>> ca, cb;
+    encrypt_matrix(M, scale_a, ca);
+    encrypt_matrix(U, scale_b, cb);
+
+    // The old path: transpose the right operand, then let step 1 transpose it
+    // back.
+    std::vector<heongpu::Ciphertext<S>> cb_t = cb;
+    op.cmt(cb_t, galois_key, ops);
+
+    std::vector<heongpu::Ciphertext<S>*> pa, pb, pb_t;
+    for (auto& c : ca)
+        pa.push_back(&c);
+    for (auto& c : cb)
+        pb.push_back(&c);
+    for (auto& c : cb_t)
+        pb_t.push_back(&c);
+
+    std::vector<heongpu::Ciphertext<S>> old_out, new_out;
+    op.ccmm(old_out, pa, pb_t, galois_key, relin_key, ops, /*rescale=*/false);
+    op.ccmm(new_out, pa, pb, galois_key, relin_key, ops, /*rescale=*/false,
+            heongpu::HEBatchMatrixOperator<S>::RightOperandForm::row_wise);
+
+    std::vector<std::vector<cd>> got_old, got_new;
+    decode_out(old_out, got_old);
+    decode_out(new_out, got_new);
+
+    ASSERT_EQ(got_old.size(), static_cast<size_t>(nslots));
+    ASSERT_EQ(got_new.size(), static_cast<size_t>(nslots));
+
+    double worst = 0.0;
+    for (int s = 0; s < nslots; ++s)
+    {
+        for (size_t e = 0; e < got_old[s].size(); ++e)
+        {
+            worst = std::max(worst, std::abs(got_new[s][e] - got_old[s][e]));
+            ASSERT_NEAR(got_new[s][e].real(), got_old[s][e].real(), 1e-2)
+                << "slot " << s << " entry " << e;
+            ASSERT_NEAR(got_new[s][e].imag(), got_old[s][e].imag(), 1e-2)
+                << "slot " << s << " entry " << e;
+        }
+    }
+    std::cout << "CCMM row-wise vs double-transpose worst difference: " << worst
+              << std::endl;
+}
+
 // Diagnostic: which of the four cross products is at fault.
 //
 // Giving an operand a zero c1 (a trivial encryption of the same message)

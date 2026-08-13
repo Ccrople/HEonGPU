@@ -885,13 +885,71 @@ namespace heongpu
         ct = std::move(result);
     }
 
+    const HEBatchMatrixOperator<Scheme::CKKS>::CmtSchedule&
+    HEBatchMatrixOperator<Scheme::CKKS>::schedule()
+    {
+        const int d = layout_.d;
+        if (static_cast<int>(schedule_.rot_index.size()) == d)
+            return schedule_;
+
+        const int k = layout_.k;
+        const uint64_t mod = 2ull * static_cast<uint64_t>(n_);
+
+        // A flat table over the 2N residues rather than a tree over N/2 of
+        // them: the walk is the same length but the lookups are O(1) and the
+        // allocation is one block. -1 marks a residue that is not a power of
+        // five, which is every even one.
+        std::vector<int32_t> galois_to_index(2 * static_cast<size_t>(n_), -1);
+        {
+            uint64_t g = 1;
+            for (int r = 0; r < n_ / 2; ++r)
+            {
+                galois_to_index[static_cast<size_t>(g)] = r;
+                g = (g * 5) % mod;
+            }
+        }
+
+        // t -> t* is a bijection, so the permutation is a pure reordering and
+        // each automorphism then runs in place.
+        std::vector<int> rot_index(d, 0);
+        std::vector<int> source(d, 0);
+        std::vector<bool> taken(d, false);
+        for (int t = 0; t < d; ++t)
+        {
+            const uint64_t h = (2ull * k * t + 1) % mod;
+            const uint64_t hinv = invmod_generic(h, mod);
+            const int tstar = static_cast<int>((hinv - 1) / (2ull * k));
+            if (tstar < 0 || tstar >= d)
+                throw std::runtime_error(
+                    "inverse Galois element fell outside the CMT index range");
+            const int32_t idx = galois_to_index[static_cast<size_t>(h)];
+            if (idx < 0)
+                throw std::runtime_error("automorphism X -> X^(2kt+1) is not a "
+                                         "slot rotation for this layout");
+            rot_index[t] = idx;
+            // Reordering by moving is only sound because t -> t* is injective;
+            // a repeat would leave a moved-from ciphertext behind rather than
+            // fail, so check it rather than trust it. Checked once here rather
+            // than on every call, because nothing it depends on can change.
+            if (taken[tstar])
+                throw std::runtime_error(
+                    "t -> t* is not injective; the CMT reordering would drop a "
+                    "ciphertext");
+            taken[tstar] = true;
+            source[t] = tstar;
+        }
+
+        schedule_.rot_index = std::move(rot_index);
+        schedule_.source = std::move(source);
+        return schedule_;
+    }
+
     void HEBatchMatrixOperator<Scheme::CKKS>::cmt(
         std::vector<Ciphertext<Scheme::CKKS>>& ct,
         Galoiskey<Scheme::CKKS>& galois_key,
         HEArithmeticOperator<Scheme::CKKS>& ops)
     {
         const int d = layout_.d;
-        const int k = layout_.k;
         if (static_cast<int>(ct.size()) != d)
             throw std::invalid_argument("cmt expects exactly d ciphertexts");
 
@@ -939,45 +997,17 @@ namespace heongpu
             HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
         }
 
-        const uint64_t mod = 2ull * static_cast<uint64_t>(n_);
-        std::map<uint64_t, int> galois_to_index;
-        {
-            uint64_t g = 1;
-            for (int r = 0; r < n_ / 2; ++r)
-            {
-                galois_to_index.emplace(g, r);
-                g = (g * 5) % mod;
-            }
-        }
-
-        // t -> t* is a bijection, so the permutation is a pure reordering and
-        // each automorphism then runs in place.
-        std::vector<int> rot_index(d, 0);
-        std::vector<int> source(d, 0);
-        std::vector<bool> taken(d, false);
-        for (int t = 0; t < d; ++t)
-        {
-            const uint64_t h = (2ull * k * t + 1) % mod;
-            const uint64_t hinv = invmod_generic(h, mod);
-            const int tstar = static_cast<int>((hinv - 1) / (2ull * k));
-            if (tstar < 0 || tstar >= d)
-                throw std::runtime_error(
-                    "inverse Galois element fell outside the CMT index range");
-            auto it = galois_to_index.find(h);
-            if (it == galois_to_index.end())
-                throw std::runtime_error("automorphism X -> X^(2kt+1) is not a "
-                                         "slot rotation for this layout");
-            rot_index[t] = it->second;
-            // Reordering by moving is only sound because t -> t* is injective;
-            // a repeat would leave a moved-from ciphertext behind rather than
-            // fail, so check it rather than trust it.
-            if (taken[tstar])
-                throw std::runtime_error(
-                    "t -> t* is not injective; the CMT reordering would drop a "
-                    "ciphertext");
-            taken[tstar] = true;
-            source[t] = tstar;
-        }
+        // The schedule depends on n_, d and k alone, all fixed at
+        // construction, so it is built once and reused. It used to be rebuilt
+        // per call, and the rebuild walked the whole rotation group: an
+        // n_/2-entry std::map to answer d lookups. That is 2048 modular
+        // multiplications and as many tree nodes per CMT at N = 4096, three
+        // CMTs per ccmm and hundreds per attention sublayer -- and it sits
+        // between a device synchronise and the first rotation, so the GPU is
+        // idle throughout and no GPU-busy profile can see it.
+        const CmtSchedule& sched = schedule();
+        const std::vector<int>& rot_index = sched.rot_index;
+        const std::vector<int>& source = sched.source;
 
         {
             std::vector<Ciphertext<Scheme::CKKS>> permuted;
@@ -1666,7 +1696,8 @@ namespace heongpu
         const std::vector<Ciphertext<Scheme::CKKS>*>& a,
         const std::vector<Ciphertext<Scheme::CKKS>*>& b,
         Galoiskey<Scheme::CKKS>& galois_key, Relinkey<Scheme::CKKS>& relin_key,
-        HEArithmeticOperator<Scheme::CKKS>& ops, bool rescale)
+        HEArithmeticOperator<Scheme::CKKS>& ops, bool rescale,
+        RightOperandForm b_form)
     {
         const int d = layout_.d;
         const int k = layout_.k;
@@ -1694,7 +1725,26 @@ namespace heongpu
         // than by moving data.
         BmRange _r_ccmm("CCMM");
 
+        const bool transpose_b = (b_form == RightOperandForm::column_wise);
+
+        // Skipping step 1 also skips the only call that would have validated
+        // the operand: cmt goes through rotate_rows, which refuses a
+        // ciphertext still owing a rescale or a relinearisation
+        // (operator.cuh). Those states are meaningless to the GEMM but
+        // catastrophic downstream, so the check has to be made here rather
+        // than inherited.
+        if (!transpose_b)
+        {
+            for (const auto* c : b)
+                if (c->rescale_required_ || c->relinearization_required_)
+                    throw std::invalid_argument(
+                        "a row-wise right operand must already be settled: an "
+                        "unspent rescale or relinearisation is what the CMT "
+                        "this call is skipping would have refused");
+        }
+
         std::vector<Ciphertext<Scheme::CKKS>> bcmt;
+        if (transpose_b)
         {
             BmRange _r("CCMM.step1_cmt_right");
             bcmt.reserve(d);
@@ -1707,7 +1757,10 @@ namespace heongpu
         for (int j = 0; j < d; ++j)
         {
             a_base[j] = a[j]->data();
-            b_base[j] = bcmt[j].data();
+            // Read-only from here: the subring kernels take the operand as
+            // const, so the caller's own ciphertexts can be pointed at
+            // directly rather than deep-copied.
+            b_base[j] = transpose_b ? bcmt[j].data() : b[j]->data();
         }
 
         DeviceVector<Data64> A0(elems), A1(elems), B0(elems), B1(elems);
@@ -1859,7 +1912,12 @@ namespace heongpu
                               mem + comp_stride, context_->modulus_->data(),
                               context_->n_power);
             HEONGPU_CUDA_CHECK(cudaGetLastError());
-            HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
+            // No synchronise here. The two copies, this addition and the
+            // relinearisation below all run on the default stream, which
+            // already orders them; the barrier only stopped the host from
+            // queueing the next column. It ran d times per call, fencing one
+            // addition and two copies each. The trailing synchronise after
+            // the loop still bounds the whole stage.
 
             c.cipher_size_ = 3;
             c.rescale_required_ = false;

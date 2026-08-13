@@ -455,6 +455,34 @@ namespace heongpu
                  HEArithmeticOperator<Scheme::CKKS>& ops);
 
         /**
+         * @brief Which orientation @p b is already in when it reaches ccmm.
+         *
+         * Algorithm 4's step 1 needs the right operand ROW-wise and gets there
+         * with a CMT. A caller that already holds the row-wise form -- or that
+         * holds a column-wise encryption of the matrix it wants transposed --
+         * has that CMT for free, and paying for it again is paying for the
+         * identity.
+         */
+        enum class RightOperandForm
+        {
+            /// @p b encrypts B column-wise, as Definition 2 and every other
+            /// entry point here produce it. ccmm transposes it itself.
+            column_wise,
+            /// @p b IS the row-wise encryption step 1 would have produced, so
+            /// step 1 is skipped. Because a row-wise encryption of B is the
+            /// same data as a column-wise encryption of B^T, this is how a
+            /// caller asks for A * B^T while handing over a column-wise B:
+            /// pass B here and the result is A * B^T.
+            ///
+            /// The saving is not only the d - 1 rotations of one CMT. It also
+            /// drops the deep copy of d ciphertexts step 1 makes, and it
+            /// LOWERS the error: the CMT's key-switching noise is multiplied
+            /// by the left operand in the GEMM and is the dominant term in the
+            /// product's error, as the reference test records.
+            row_wise
+        };
+
+        /**
          * @brief Batch CCMM, Algorithm 4.
          *
          * Multiplies two matrix encryptions. Writing A = a_0 + a_1 * s and
@@ -466,18 +494,33 @@ namespace heongpu
          *
          * Step 1 turns @p b into a row-wise matrix encryption with a CMT; the
          * transpose that implies is then absorbed into the GEMM strides rather
-         * than paid for as a data movement.
+         * than paid for as a data movement. @p b_form skips step 1 for a
+         * caller that already holds that form.
+         *
+         * The other two CMTs, the ones inside the fold, are NOT removable and
+         * it is worth recording why, because the reordering that would remove
+         * one of them is arithmetically inviting and silently wrong. They
+         * transpose each half BEFORE the combine multiplies the second half by
+         * the secret. Under R_N = R_k^d that multiplication is Toep(s) acting
+         * on the LEFT, and the transpose the CMT performs is R_k-linear but
+         * not R_N-linear: T(Toep(s) * M) = M^T * Toep(s)^T, not
+         * Toep(s) * M^T. So combining the four GEMM outputs into one
+         * degree-two ciphertext and transposing once at the end computes a
+         * different matrix, and it agrees with this one exactly when the left
+         * operand's c_1 is zero -- which is to say, on trivial encryptions,
+         * which is exactly what a test that cannot see the bug is built from.
          *
          * @param out        Receives d ciphertexts, the column-wise matrix
          *                   encryption of the product.
          * @param a,b        Exactly layout.d ciphertexts each, at a common
          *                   level.
          * @param galois_key Must carry the indices from
-         *                   get_batch_cmt_rotation_indices(layout); the three
+         *                   get_batch_cmt_rotation_indices(layout); the
          *                   internal CMTs need them.
          * @param relin_key  Relinearisation key for the degree-two part.
          * @param rescale    Mark the result for rescaling. Pass false to
          *                   inspect the product at the combined scale.
+         * @param b_form     Whether @p b still needs step 1's transpose.
          */
         void ccmm(std::vector<Ciphertext<Scheme::CKKS>>& out,
                   const std::vector<Ciphertext<Scheme::CKKS>*>& a,
@@ -485,10 +528,38 @@ namespace heongpu
                   Galoiskey<Scheme::CKKS>& galois_key,
                   Relinkey<Scheme::CKKS>& relin_key,
                   HEArithmeticOperator<Scheme::CKKS>& ops,
-                  bool rescale = true);
+                  bool rescale = true,
+                  RightOperandForm b_form = RightOperandForm::column_wise);
 
       private:
         const BatchSubringTables& tables_for(int depth);
+
+        /**
+         * @brief The CMT's per-index rotation and reordering schedule.
+         *
+         * @c rot_index[t] is the slot-rotation index of the automorphism
+         * X -> X^(2kt+1); @c source[t] is the t* the permutation reads from.
+         */
+        struct CmtSchedule
+        {
+            std::vector<int> rot_index;
+            std::vector<int> source;
+        };
+
+        /**
+         * @brief The schedule, built on first use and cached.
+         *
+         * It is a function of @c n_, @c layout_.d and @c layout_.k, which are
+         * fixed at construction and never reassigned, so there is no cache key
+         * -- unlike tables_for, which genuinely varies with the level. The
+         * cache must stay per-operator: half_operator() is a distinct object
+         * at a distinct layout and needs its own.
+         *
+         * Recomputing it per call cost an n_/2-entry std::map walk of the
+         * whole rotation group to serve d lookups, on the host, with the
+         * device idle.
+         */
+        const CmtSchedule& schedule();
 
         /// Algorithm 1 against a plaintext uploaded by
         /// encode_shared_plaintext_matrix. Validation lives in pcmm, which
@@ -539,6 +610,9 @@ namespace heongpu
 
         std::map<int, BatchSubringTables> table_cache_;
         std::unique_ptr<HEBatchMatrixOperator<Scheme::CKKS>> half_;
+
+        /// @see schedule(). Empty until first use.
+        CmtSchedule schedule_;
 
         // Most recently uploaded plaintext matrix.
         DeviceVector<Data64> plain_;
