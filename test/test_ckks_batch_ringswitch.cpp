@@ -714,6 +714,8 @@ TEST(HEonGPU, CKKS_BatchRingSwitch_CrossingIsLevelFreeAndTheIslandSpendsShared)
 
     // The shared prefix is the island's whole level budget: a big ciphertext
     // is only allowed down while it still has an active prime to descend with.
+    // (See the bootstrap test at the end of this file for why one level either
+    // way decides whether batch 16 has a legal parameter set at all.)
     heongpu::Ciphertext<S> deeper = back[0];
     f.ops->multiply_plain_inplace(deeper, gain, back[0].scale());
     f.ops->rescale_inplace(deeper);
@@ -723,4 +725,139 @@ TEST(HEonGPU, CKKS_BatchRingSwitch_CrossingIsLevelFreeAndTheIslandSpendsShared)
             f.rs->switch_down(deeper, *f.ops);
         (void) ok;
     }) << "depth 2 of a 3-prime shared chain is still one active prime";
+}
+
+// -----------------------------------------------------------------------
+// 6. Does a bootstrap carry a matrix encryption?
+// -----------------------------------------------------------------------
+
+// This is the question the whole batch-16 parameter set turns on, and it is
+// not about ring switching at all -- it is about what has to happen at the top
+// of the ascent.
+//
+// The island exits Algorithm 4 in MATRIX form. If the refresh has to be
+// preceded by a bridge back to slots, that bridge is a level, and the island
+// chain needs three Q primes plus a special = 140 bits against a cap of 109 at
+// N = 4096: batch 16 has no legal 128-bit parameter set. If instead the
+// refresh takes the matrix encryption as it stands, two Q primes and a special
+// (41 + 33 + 33 = 107) close it with two bits to spare.
+//
+// Structurally it ought to work: regular_bootstrapping is ModRaise ->
+// CoeffToSlot -> EvalMod -> SlotToCoeff, whose net effect on the PLAINTEXT
+// POLYNOMIAL is the identity with the modulus restored, and it reads no
+// encoding tag. What is not obvious is EvalMod's precision, because its bound
+// is on the plaintext COEFFICIENTS and the batch encoding's coefficients are
+// an inverse length-k DFT of the batch values rather than the values.
+//
+// Ring degree 4096 with k = 32 is the real batch-16 island shape; the chain
+// here is the library's own bootstrapping demo chain, which is far outside any
+// security level. That is deliberate -- what is being measured is whether the
+// encoding survives, and the encoding does not know what N's cap is.
+TEST(HEonGPU, CKKS_BatchRingSwitch_RegularBootstrapCarriesAMatrixEncryption)
+{
+    heongpu::HEContext<S> context =
+        heongpu::GenHEContext<S>(heongpu::sec_level_type::none);
+    const size_t degree = 4096;
+    context->set_poly_modulus_degree(degree);
+    context->set_coeff_modulus_bit_sizes(
+        {60, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50,
+         50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50},
+        {60, 60, 60});
+    context->generate();
+
+    // q0 / scale = 2^10 is the ratio the EvalMod fit is built around; any
+    // other ratio returns noise without saying so.
+    const double scale = std::pow(2.0, 50);
+
+    heongpu::HEKeyGenerator<S> keygen(context);
+    heongpu::Secretkey<S> secret(context, 16);
+    keygen.generate_secret_key(secret);
+    heongpu::Publickey<S> pub(context);
+    keygen.generate_public_key(pub, secret);
+    heongpu::Relinkey<S> relin_key(context);
+    keygen.generate_relin_key(relin_key, secret);
+
+    heongpu::HEEncoder<S> encoder(context);
+    heongpu::HEEncryptor<S> encryptor(context, pub);
+    heongpu::HEDecryptor<S> decryptor(context, secret);
+    heongpu::HEArithmeticOperator<S> ops(context, encoder);
+
+    heongpu::BootstrappingConfig boot_config(3, 3, 11, true);
+    ops.generate_bootstrapping_params(
+        scale, boot_config,
+        heongpu::arithmetic_bootstrapping_type::REGULAR_BOOTSTRAPPING);
+    std::vector<int> key_index = ops.bootstrapping_key_indexs();
+    heongpu::Galoiskey<S> galois_key(context, key_index);
+    keygen.generate_galois_key(galois_key, secret);
+
+    // The batch-16 island shape exactly: d = 128 = head_dim, k = 32,
+    // batch = 16.
+    heongpu::BatchMatrixLayout layout(static_cast<int>(degree), 128);
+    ASSERT_EQ(layout.k, 32);
+    ASSERT_EQ(layout.batch, 16);
+    heongpu::HEBatchMatrixOperator<S> bop(context, layout);
+    heongpu::BatchMatrixEncoder bm(layout.k);
+
+    const int rows = layout.d;
+    const int cols = 2;
+    std::mt19937_64 rng(31337u);
+    std::uniform_real_distribution<double> dist(-0.5, 0.5);
+    std::vector<std::vector<cd>> M(
+        bm.slots(), std::vector<cd>(static_cast<size_t>(rows) * cols));
+    for (auto& mat : M)
+        for (auto& z : mat)
+            z = cd(dist(rng), dist(rng));
+
+    std::vector<int64_t> coeffs;
+    bm.encode(M, rows, cols, scale, coeffs);
+    std::vector<std::vector<int64_t>> columns;
+    heongpu::build_matrix_encryption_coefficients(coeffs, layout, rows, cols,
+                                                  columns);
+
+    std::vector<heongpu::Ciphertext<S>> cts;
+    for (int j = 0; j < cols; j++)
+    {
+        heongpu::Plaintext<S> p(context);
+        bop.load_coefficients(p, columns[j], scale);
+        heongpu::Ciphertext<S> c(context);
+        encryptor.encrypt(c, p);
+        cts.push_back(std::move(c));
+    }
+
+    // ModRaise starts from one prime, so the input has to be at the bottom.
+    const int chain = context->get_ciphertext_modulus_count();
+    for (auto& c : cts)
+        for (int i = 0; i < chain - 1; i++)
+            ops.mod_drop_inplace(c);
+    ASSERT_EQ(cts[0].depth(), chain - 1);
+
+    std::vector<heongpu::Ciphertext<S>> refreshed;
+    for (auto& c : cts)
+        refreshed.push_back(ops.regular_bootstrapping(c, galois_key,
+                                                      relin_key));
+    std::cout << "depth after bootstrap: " << refreshed[0].depth() << " of "
+              << chain << ", scale 2^"
+              << std::log2(refreshed[0].scale()) << std::endl;
+    EXPECT_LT(refreshed[0].depth(), chain - 1)
+        << "a refresh has to return levels";
+
+    std::vector<std::vector<int64_t>> out(cols);
+    for (int j = 0; j < cols; j++)
+    {
+        heongpu::Plaintext<S> p(context);
+        decryptor.decrypt(p, refreshed[j]);
+        bop.extract_coefficients(out[j], p);
+    }
+    std::vector<int64_t> got_coeffs;
+    heongpu::split_matrix_encryption_coefficients(out, layout, rows, cols,
+                                                  got_coeffs);
+    std::vector<std::vector<cd>> got;
+    bm.decode(got_coeffs, rows, cols, refreshed[0].scale(), got);
+
+    const double worst = worst_error(got, M);
+    std::cout << "bootstrapped batch matrix worst error: " << worst
+              << "  (" << (worst > 0.0 ? -std::log2(worst) : 99.0)
+              << " bits)" << std::endl;
+    ASSERT_FALSE(std::isnan(worst));
+    EXPECT_LT(worst, 0.05);
 }
