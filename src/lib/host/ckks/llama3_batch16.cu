@@ -278,6 +278,60 @@ namespace heongpu
             }
         }
 
+        void Llama3Batch16Operator::check_norm_config(
+            const RMSNormConfig& config) const
+        {
+            if (config.sum_pre_scaled && config.newton_iterations > 0)
+            {
+                throw std::invalid_argument(
+                    "A Newton step refines against the unmapped summed square, "
+                    "and a pre-scaled sum arrives mapped");
+            }
+            if (config.sum_pre_scaled && !config.fold_mean_into_fit)
+            {
+                throw std::invalid_argument(
+                    "A pre-scaled sum has the fit's domain map already on it, "
+                    "and forming the mean would multiply that by 1/channels: "
+                    "the fit has to carry the division instead");
+            }
+            if (!(config.sum_hi > config.sum_lo) || !(config.sum_lo > 0.0))
+            {
+                throw std::invalid_argument(
+                    "RMSNorm needs a positive calibrated range for the summed "
+                    "square");
+            }
+        }
+
+        void Llama3Batch16Operator::fill_slot_config(
+            Llama3Operator::RMSNormConfig& slot_config,
+            const RMSNormConfig& config, int channels)
+        {
+            // THE LINE THIS MODULE EXISTS FOR. A channel is a whole
+            // ciphertext, so the channel axis is not inside a ciphertext at
+            // all: count = 1 makes Llama3Operator's reduction loop
+            // (`for (t = 1; t < count; t <<= 1)`) not execute, and the sum
+            // over channels is the slot-wise addition of the squares that
+            // precedes it. No rotation, no mask, no Galois key, no level.
+            slot_config.stride = arith().slot_count();
+            slot_config.count = 1;
+            slot_config.blocked_span = 0;
+            slot_config.channels = channels;
+            slot_config.token_blocks = 1;
+            slot_config.eps = config.eps;
+            slot_config.sum_lo = config.sum_lo;
+            slot_config.sum_hi = config.sum_hi;
+            slot_config.degree = config.degree;
+            slot_config.newton_iterations = config.newton_iterations;
+            slot_config.fold_mean_into_fit = config.fold_mean_into_fit;
+            // There is no mask on this path to carry the fit's domain map, so
+            // the slot core's fold_affine_into_mask is inapplicable and is
+            // left alone. The equivalent saving here rides on the upstream
+            // plaintext instead; see RMSNormConfig::sum_pre_scaled.
+            slot_config.fold_affine_into_mask = false;
+            slot_config.output_scale = config.output_scale;
+            slot_config.refresh_sum = false;
+        }
+
         std::vector<Ciphertext<Scheme::CKKS>>
         Llama3Batch16Operator::pre_scaled_norm(
             std::vector<Ciphertext<Scheme::CKKS>>& slots,
@@ -367,25 +421,7 @@ namespace heongpu
                     "which is the fast path: fold_gain() puts it on the "
                     "projection that reads this stream, for free");
             }
-            if (config.sum_pre_scaled && config.newton_iterations > 0)
-            {
-                throw std::invalid_argument(
-                    "A Newton step refines against the unmapped summed square, "
-                    "and a pre-scaled sum arrives mapped");
-            }
-            if (config.sum_pre_scaled && !config.fold_mean_into_fit)
-            {
-                throw std::invalid_argument(
-                    "A pre-scaled sum has the fit's domain map already on it, "
-                    "and forming the mean would multiply that by 1/channels: "
-                    "the fit has to carry the division instead");
-            }
-            if (!(config.sum_hi > config.sum_lo) || !(config.sum_lo > 0.0))
-            {
-                throw std::invalid_argument(
-                    "RMSNorm needs a positive calibrated range for the summed "
-                    "square");
-            }
+            check_norm_config(config);
 
             Range _r("b16.rms_norm");
             note_depth("rms_norm.in", x);
@@ -397,30 +433,73 @@ namespace heongpu
             }
 
             Llama3Operator::RMSNormConfig slot_config;
-            // THE LINE THIS MODULE EXISTS FOR. A channel is a whole
-            // ciphertext, so the channel axis is not inside a ciphertext at
-            // all: count = 1 makes Llama3Operator's reduction loop
-            // (`for (t = 1; t < count; t <<= 1)`) not execute, and the sum
-            // over channels is the slot-wise addition of the squares that
-            // precedes it. No rotation, no mask, no Galois key, no level.
-            slot_config.stride = arith().slot_count();
-            slot_config.count = 1;
-            slot_config.blocked_span = 0;
-            slot_config.channels = channels;
-            slot_config.token_blocks = 1;
-            slot_config.eps = config.eps;
-            slot_config.sum_lo = config.sum_lo;
-            slot_config.sum_hi = config.sum_hi;
-            slot_config.degree = config.degree;
-            slot_config.newton_iterations = config.newton_iterations;
-            slot_config.fold_mean_into_fit = config.fold_mean_into_fit;
-            // There is no mask on this path to carry the fit's domain map, so
-            // the slot core's fold_affine_into_mask is inapplicable and is
-            // left alone. The equivalent saving here rides on the upstream
-            // plaintext instead; see RMSNormConfig::sum_pre_scaled.
-            slot_config.fold_affine_into_mask = false;
-            slot_config.output_scale = config.output_scale;
-            slot_config.refresh_sum = false;
+            fill_slot_config(slot_config, config, channels);
+
+            std::vector<Ciphertext<Scheme::CKKS>> normalised =
+                norm_core(slots, gain, config, slot_config, galois_key,
+                          relin_key);
+            // Released before the return crossing, which
+            // Llama3BatchOperator::rms_norm does not do: 4096 ciphertexts and
+            // 17.5 GiB at the 8B shape, and the difference between its frame
+            // peaking at 87.5 GiB and at 70.
+            slots.clear();
+
+            Range _r_out("b16.rms_norm.from_slots");
+            BatchActivation out =
+                batch_.from_slots(normalised, x.rows, galois_key);
+            note_depth("rms_norm.out", out);
+            return out;
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>>
+        Llama3Batch16Operator::rms_norm_slots(
+            std::vector<Ciphertext<Scheme::CKKS>>& slots,
+            const std::vector<double>& gain, const RMSNormConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            if (slots.empty())
+            {
+                throw std::invalid_argument("RMSNorm needs a channel");
+            }
+            const int channels = static_cast<int>(slots.size());
+            if (!gain.empty() && static_cast<int>(gain.size()) != channels)
+            {
+                throw std::invalid_argument(
+                    "RMSNorm takes one learned scale per channel");
+            }
+            check_norm_config(config);
+            for (std::size_t j = 1; j < slots.size(); ++j)
+            {
+                if (slots[j].depth() != slots[0].depth() ||
+                    slots[j].scale() != slots[0].scale())
+                {
+                    throw std::invalid_argument(
+                        "rms_norm_slots needs every channel at one level and "
+                        "one scale: the squares are added together");
+                }
+            }
+
+            Range _r("b16.rms_norm_slots");
+            note_depth("rms_norm_slots.in", slots);
+
+            Llama3Operator::RMSNormConfig slot_config;
+            fill_slot_config(slot_config, config, channels);
+            std::vector<Ciphertext<Scheme::CKKS>> out = norm_core(
+                slots, gain, config, slot_config, galois_key, relin_key);
+            note_depth("rms_norm_slots.out", out);
+            return out;
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>>
+        Llama3Batch16Operator::norm_core(
+            std::vector<Ciphertext<Scheme::CKKS>>& slots,
+            const std::vector<double>& gain, const RMSNormConfig& config,
+            const Llama3Operator::RMSNormConfig& slot_config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            const int channels = static_cast<int>(slots.size());
 
             std::vector<Ciphertext<Scheme::CKKS>> normalised;
             if (config.sum_pre_scaled)
@@ -436,7 +515,6 @@ namespace heongpu
                 normalised = arith().rms_norm(slots, no_weights, slot_config,
                                               galois_key, relin_key);
             }
-            slots.clear();
             note_depth("rms_norm.normalised", normalised);
 
             if (!gain.empty())
@@ -464,11 +542,7 @@ namespace heongpu
                 }
             }
 
-            Range _r_out("b16.rms_norm.from_slots");
-            BatchActivation out =
-                batch_.from_slots(normalised, x.rows, galois_key);
-            note_depth("rms_norm.out", out);
-            return out;
+            return normalised;
         }
 
         // -------------------------------------------------------------------
@@ -527,6 +601,31 @@ namespace heongpu
 
             Range _r("b16.feed_forward");
             note_depth("feed_forward.in", x);
+
+            if (config.slot_resident)
+            {
+                // Cross ONCE around the whole sublayer instead of three times
+                // over the hidden width. 2 * d_model = 8,192 columns instead
+                // of 3 * hidden = 43,008 at the 8B shape, and one level fewer
+                // because two crossings replace three. Legal because a
+                // batch-shared real weight is the constant polynomial of R_k,
+                // so Algorithm 1 is a scalar multiply-accumulate across
+                // ciphertexts and does not read the encoding.
+                std::vector<Ciphertext<Scheme::CKKS>> slots;
+                {
+                    Range _r_in("b16.ffn.to_slots");
+                    slots = batch_.to_slots(x, galois_key);
+                }
+                std::vector<Ciphertext<Scheme::CKKS>> hidden_out =
+                    feed_forward_slots(slots, weights, config, relin_key);
+                slots.clear();
+
+                Range _r_out("b16.ffn.from_slots");
+                BatchActivation out =
+                    batch_.from_slots(hidden_out, x.rows, galois_key);
+                note_depth("feed_forward.out", out);
+                return out;
+            }
 
             int block =
                 config.hidden_block > 0 ? config.hidden_block : hidden;
@@ -620,6 +719,123 @@ namespace heongpu
             }
 
             note_depth("feed_forward.out", out);
+            return out;
+        }
+
+        std::vector<Ciphertext<Scheme::CKKS>>
+        Llama3Batch16Operator::feed_forward_slots(
+            std::vector<Ciphertext<Scheme::CKKS>>& slots,
+            const FeedForwardWeights& weights,
+            const FeedForwardConfig& config,
+            Relinkey<Scheme::CKKS>& relin_key)
+        {
+            const int in_channels = shape_.d_model;
+            const int hidden = shape_.hidden;
+            if (static_cast<int>(slots.size()) != in_channels)
+            {
+                throw std::invalid_argument(
+                    "feed_forward_slots takes d_model slot-form ciphertexts");
+            }
+            const std::size_t want = static_cast<std::size_t>(in_channels) *
+                                     static_cast<std::size_t>(hidden);
+            if (weights.gate.size() != want || weights.up.size() != want ||
+                weights.down.size() != want)
+            {
+                throw std::invalid_argument(
+                    "The SwiGLU weights must be d_model by hidden, and down "
+                    "its transpose shape");
+            }
+            if (!(config.silu_bound > 0.0))
+            {
+                throw std::invalid_argument("The SiLU bound must be positive");
+            }
+
+            Range _r("b16.feed_forward_slots");
+            note_depth("feed_forward_slots.in", slots);
+
+            int block =
+                config.hidden_block > 0 ? config.hidden_block : hidden;
+            block = std::min(block, hidden);
+
+            const double gate_scale =
+                config.fold_silu_domain_into_gate ? 1.0 / config.silu_bound
+                                                  : 1.0;
+
+            // project() takes a BatchActivation, so the slot-form ciphertexts
+            // are lent to one and taken back. Nothing is copied and nothing is
+            // reinterpreted: the projection is a scalar multiply-accumulate
+            // across whole ciphertexts, and `rows` is metadata pcmm does not
+            // read -- it strides by layout_.d regardless.
+            BatchActivation lent;
+            lent.rows = tokens();
+            lent.column = std::move(slots);
+
+            std::vector<Ciphertext<Scheme::CKKS>> out;
+
+            for (int base = 0; base < hidden; base += block)
+            {
+                const int cols = std::min(block, hidden - base);
+
+                std::vector<double> gate_w = gate_slice(
+                    weights.gate, in_channels, hidden, base, cols, gate_scale);
+                std::vector<double> up_w = gate_slice(
+                    weights.up, in_channels, hidden, base, cols, 1.0);
+
+                BatchActivation gate = batch_.project(
+                    lent, gate_w, in_channels, cols, "b16.ffn_slots.gate");
+                BatchActivation up = batch_.project(
+                    lent, up_w, in_channels, cols, "b16.ffn_slots.up");
+
+                // No crossing. The SiLU and the gate product are slot-wise and
+                // the operands are already in slot form.
+                std::vector<Ciphertext<Scheme::CKKS>> hidden_slots;
+                hidden_slots.reserve(gate.column.size());
+                {
+                    Range _r_silu("b16.ffn_slots.silu");
+                    for (std::size_t j = 0; j < gate.column.size(); ++j)
+                    {
+                        Ciphertext<Scheme::CKKS> activated = arith().silu(
+                            gate.column[j], config.silu_bound,
+                            config.silu_degree, relin_key,
+                            config.fold_silu_domain_into_gate);
+                        hidden_slots.push_back(arith().multiply_and_rescale(
+                            activated, up.column[j], relin_key));
+                    }
+                }
+                gate.column.clear();
+                up.column.clear();
+                note_depth("feed_forward_slots.hidden", hidden_slots);
+
+                BatchActivation h;
+                h.rows = tokens();
+                h.column = std::move(hidden_slots);
+
+                const std::vector<double> down_w(
+                    weights.down.begin() +
+                        static_cast<std::size_t>(base) * in_channels,
+                    weights.down.begin() +
+                        static_cast<std::size_t>(base + cols) * in_channels);
+                BatchActivation part = batch_.project(
+                    h, down_w, cols, in_channels, "b16.ffn_slots.down");
+
+                if (out.empty())
+                {
+                    out = std::move(part.column);
+                }
+                else
+                {
+                    Range _r_acc("b16.ffn_slots.accumulate");
+                    for (std::size_t j = 0; j < out.size(); ++j)
+                    {
+                        arith().add_inplace(out[j], part.column[j]);
+                    }
+                }
+            }
+
+            // Give the caller's ciphertexts back.
+            slots = std::move(lent.column);
+
+            note_depth("feed_forward_slots.out", out);
             return out;
         }
 

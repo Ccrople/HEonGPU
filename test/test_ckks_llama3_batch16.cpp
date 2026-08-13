@@ -851,6 +851,103 @@ TEST(HEonGPU, CKKS_Llama3Batch16_ProjectionCommutesWithTheBridge)
            "after all";
 }
 
+// If the commutation above holds, the SwiGLU crosses twice around the whole
+// sublayer instead of three times over the hidden width -- 8,192 columns
+// instead of 43,008 at the 8B shape -- and drops a level, because two
+// crossings replace three. Same answer either way, which is what this checks.
+TEST(HEonGPU, CKKS_Llama3Batch16_SlotResidentFeedForwardAgreesAndIsShallower)
+{
+    llama::Batch16Shape shape = SmallShape();
+    shape.d_model = 4;
+    shape.hidden = 8;
+    Fixture f(shape);
+
+    const auto x = f.random_batch(shape.d_model, 24680u, 0.5);
+    llama::Llama3Batch16Operator::FeedForwardWeights w;
+    w.gate = random_weight(shape.d_model, shape.hidden, 41u, 0.5);
+    w.up = random_weight(shape.d_model, shape.hidden, 42u, 0.5);
+    w.down = random_weight(shape.hidden, shape.d_model, 43u, 0.5);
+
+    llama::Llama3Batch16Operator::FeedForwardConfig crossing;
+    crossing.silu_bound = 4.0;
+    crossing.silu_degree = 15;
+
+    llama::Llama3Batch16Operator::FeedForwardConfig resident = crossing;
+    resident.slot_resident = true;
+
+    auto ct_a =
+        f.op->encrypt(x, Fixture::d, shape.d_model, *f.encryptor, f.scale);
+    auto out_a = f.nl->feed_forward(ct_a, w, crossing, *f.galois, *f.relin);
+    const int depth_a = out_a.column.front().depth();
+    const auto got_a = f.op->decrypt(out_a, *f.decryptor, f.scale);
+
+    auto ct_b =
+        f.op->encrypt(x, Fixture::d, shape.d_model, *f.encryptor, f.scale);
+    auto out_b = f.nl->feed_forward(ct_b, w, resident, *f.galois, *f.relin);
+    const int depth_b = out_b.column.front().depth();
+    const auto got_b = f.op->decrypt(out_b, *f.decryptor, f.scale);
+
+    EXPECT_LT(max_abs_diff(got_a, got_b), 1e-2);
+    EXPECT_EQ(depth_b, depth_a - 1)
+        << "two crossings instead of three should be one level shallower";
+}
+
+// The end state the layout question is actually asking about: a stream held
+// in slot form across the block. Both non-linear sublayers then cost NO
+// crossing, no rotation and no Galois key at all -- Algorithm 1 needs none by
+// construction and everything else here is slot-wise.
+TEST(HEonGPU, CKKS_Llama3Batch16_SlotResidentSublayersNeedNoCrossing)
+{
+    llama::Batch16Shape shape = SmallShape();
+    shape.d_model = 4;
+    shape.hidden = 8;
+    Fixture f(shape);
+
+    const auto x = f.random_batch(shape.d_model, 13579u, 0.5);
+    llama::Llama3Batch16Operator::FeedForwardWeights w;
+    w.gate = random_weight(shape.d_model, shape.hidden, 51u, 0.5);
+    w.up = random_weight(shape.d_model, shape.hidden, 52u, 0.5);
+    w.down = random_weight(shape.hidden, shape.d_model, 53u, 0.5);
+
+    llama::Llama3Batch16Operator::FeedForwardConfig config;
+    config.silu_bound = 4.0;
+    config.silu_degree = 15;
+
+    llama::Llama3Batch16Operator::RMSNormConfig norm;
+    bracket_sum(x, Fixture::d, shape.d_model, norm.sum_lo, norm.sum_hi);
+    norm.degree = 15;
+    norm.newton_iterations = 0;
+    const std::vector<double> no_gain;
+
+    // (a) matrix-resident: norm crosses twice, SwiGLU crosses twice.
+    auto ct_a =
+        f.op->encrypt(x, Fixture::d, shape.d_model, *f.encryptor, f.scale);
+    auto norm_a = f.nl->rms_norm(ct_a, no_gain, norm, *f.galois, *f.relin);
+    llama::Llama3Batch16Operator::FeedForwardConfig resident = config;
+    resident.slot_resident = true;
+    auto out_a = f.nl->feed_forward(norm_a, w, resident, *f.galois, *f.relin);
+    const auto got_a = f.op->decrypt(out_a, *f.decryptor, f.scale);
+
+    // (b) slot-resident: ONE crossing in, one out, for both sublayers
+    // together.
+    auto ct_b =
+        f.op->encrypt(x, Fixture::d, shape.d_model, *f.encryptor, f.scale);
+    auto slots = f.op->to_slots(ct_b, *f.galois);
+    auto normed = f.nl->rms_norm_slots(slots, no_gain, norm, *f.galois,
+                                       *f.relin);
+    auto hidden =
+        f.nl->feed_forward_slots(normed, w, config, *f.relin);
+    auto out_b = f.op->from_slots(hidden, Fixture::d, *f.galois);
+    const auto got_b = f.op->decrypt(out_b, *f.decryptor, f.scale);
+
+    EXPECT_LT(max_abs_diff(got_a, got_b), 1e-2);
+
+    // Two sublayers, four crossings saved: the slot-resident pair is that
+    // much shallower.
+    EXPECT_LT(out_b.column.front().depth(), out_a.column.front().depth())
+        << "holding the stream in slot form should spend fewer levels";
+}
+
 // ----------------------------------------------------------------------
 // The cost accounting
 // ----------------------------------------------------------------------

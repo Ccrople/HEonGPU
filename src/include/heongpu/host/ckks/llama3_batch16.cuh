@@ -481,6 +481,27 @@ namespace heongpu
                                      Relinkey<Scheme::CKKS>& relin_key);
 
             /**
+             * @brief The same norm on a stream that is ALREADY in slot form.
+             *
+             * No crossing either way, and therefore no rotation and no Galois
+             * key used at all -- the reduction is a slot-wise addition and
+             * every other step is slot-wise too. @p galois_key is taken only
+             * because the slot core's signature demands one; at count = 1 its
+             * reduction loop does not execute and the key is never touched.
+             *
+             * This is the entry point a caller wants when the stream is held
+             * in slot form across the block. Whether that is legal at all
+             * turns on whether Algorithm 1's projection commutes with the
+             * bridge -- see FeedForwardConfig::slot_resident.
+             */
+            std::vector<Ciphertext<Scheme::CKKS>>
+            rms_norm_slots(std::vector<Ciphertext<Scheme::CKKS>>& slots,
+                           const std::vector<double>& gain,
+                           const RMSNormConfig& config,
+                           Galoiskey<Scheme::CKKS>& galois_key,
+                           Relinkey<Scheme::CKKS>& relin_key);
+
+            /**
              * @brief Fold a per-channel scale into a projection weight, on the
              *        host.
              *
@@ -541,6 +562,35 @@ namespace heongpu
                 /// same products, same scales, same levels, only the order of
                 /// a homomorphic sum, and the peak falls to 4 * hidden_block.
                 int hidden_block = 0;
+                /// Cross ONCE around the whole sublayer instead of three
+                /// times over the hidden width.
+                ///
+                /// The three crossings exist because project() is assumed to
+                /// need the coefficient encoding. It does not. Algorithm 1
+                /// encodes its weight through BatchMatrixEncoder, and the
+                /// weight is ONE REAL MATRIX SHARED BY ALL SIXTEEN INSTANCES,
+                /// so its R_k image is the CONSTANT polynomial -- and
+                /// multiplying by a constant of R_k is scalar multiplication.
+                /// The projection is therefore
+                /// out_c = sum_j W[j][c] * ct_j, a scalar multiply-accumulate
+                /// ACROSS ciphertexts, which cannot care what a ciphertext
+                /// encodes; and the bridge is linear WITHIN a column. Two such
+                /// maps commute.
+                ///
+                /// So the SiLU and the gate product can meet the projections
+                /// in slot form, and the sublayer crosses 2 * in_channels
+                /// columns instead of 3 * hidden_channels: 8,192 instead of
+                /// 43,008 at the 8B shape, 946,176 key switches down to
+                /// 180,224. It also removes one level, since two crossings
+                /// replace three.
+                ///
+                /// OFF by default until the commutation is asserted by a
+                /// passing test rather than by this paragraph --
+                /// CKKS_Llama3Batch16_ProjectionCommutesWithTheBridge is that
+                /// test. A caller holding the stream in slot form across the
+                /// whole block should use feed_forward_slots() instead and
+                /// pay no crossing here at all.
+                bool slot_resident = false;
             };
 
             /**
@@ -563,6 +613,30 @@ namespace heongpu
                                          const FeedForwardConfig& config,
                                          Galoiskey<Scheme::CKKS>& galois_key,
                                          Relinkey<Scheme::CKKS>& relin_key);
+
+            /**
+             * @brief The same SwiGLU on a stream that is already in slot form.
+             *
+             * NO CROSSING, NO ROTATION, AND NO GALOIS KEY. Algorithm 1 needs
+             * none by construction -- it is two matrix products over R_{q,k}
+             * and that is the whole reason the batch path exists -- and every
+             * other step here is slot-wise. The only key switches the sublayer
+             * performs are the relinearisations inside the SiLU's series and
+             * the gate product.
+             *
+             * Legal for the same reason FeedForwardConfig::slot_resident is:
+             * a batch-shared real weight is the constant polynomial of R_k, so
+             * the projection is a scalar multiply-accumulate across
+             * ciphertexts and does not read the encoding.
+             *
+             * @param slots in_channels ciphertexts in the slot reading, at one
+             *              level and one scale.
+             */
+            std::vector<Ciphertext<Scheme::CKKS>>
+            feed_forward_slots(std::vector<Ciphertext<Scheme::CKKS>>& slots,
+                               const FeedForwardWeights& weights,
+                               const FeedForwardConfig& config,
+                               Relinkey<Scheme::CKKS>& relin_key);
 
             // ---------------------------------------------------------------
             // The bridge, which is the only thing here that costs anything
@@ -619,6 +693,26 @@ namespace heongpu
                             const std::vector<Ciphertext<Scheme::CKKS>>& ct)
                 const;
             void note_depth(const char* name, const BatchActivation& x) const;
+
+            /// Shape-independent config validation, shared by the two norm
+            /// entry points so a slot-form caller cannot skip it.
+            void check_norm_config(const RMSNormConfig& config) const;
+
+            /// Translate this module's config into the slot core's, including
+            /// the count = 1 that makes the channel reduction free.
+            void fill_slot_config(Llama3Operator::RMSNormConfig& slot_config,
+                                  const RMSNormConfig& config, int channels);
+
+            /// Everything between the two crossings: the fit, and the gain if
+            /// it was not folded. Shared by rms_norm and rms_norm_slots so the
+            /// two cannot drift.
+            std::vector<Ciphertext<Scheme::CKKS>>
+            norm_core(std::vector<Ciphertext<Scheme::CKKS>>& slots,
+                      const std::vector<double>& gain,
+                      const RMSNormConfig& config,
+                      const Llama3Operator::RMSNormConfig& slot_config,
+                      Galoiskey<Scheme::CKKS>& galois_key,
+                      Relinkey<Scheme::CKKS>& relin_key);
 
             /// The norm's slot core written out, so that the 1/sqrt fit can be
             /// told its argument arrives already mapped. @see
