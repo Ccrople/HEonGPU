@@ -77,17 +77,59 @@
 // and a polynomial fit are slot-wise, and the matrix encryption is a
 // COEFFICIENT encoding -- multiplying two columns convolves them. So every
 // non-linearity crosses the row bridge to slot form and back, and THE BRIDGE IS
-// THE ENTIRE COST OF THIS MODULE. It is d - 1 rotations, d plaintext products
-// and one level per column (llama3_batch.cu:244).
+// THE ENTIRE COST OF THIS MODULE.
 //
-// That is not a layout mistake to be designed away; it is what a non-linearity
-// costs in a coefficient encoding, and it is why this path is still the cheap
-// one -- the three projections it replaces were the widest key switching in the
-// block. What is available is to make the bridge cheaper rather than rarer, and
-// those levers already exist on Llama3BatchOperator and are all OFF by default:
-// set_bridge_baby_steps (BSGS), set_hoisted_crossings, set_bridge_plain_capacity.
-// This module does not turn them on behind a caller's back; use_fast_bridge()
-// does it in one call, and says so.
+// Per column, at N = 4096 and d = 128 (llama3_batch.cu:244 with baby_steps()
+// at :504): 22 key switches, d = 128 plaintext products, 8 rescales, ONE
+// level. Not d - 1 = 127 -- the doc comment on to_slots still says that and it
+// is stale by 5.8x, because bridge() calls baby_steps() unconditionally and
+// baby_steps() returns the balanced BSGS split whenever bridge_baby_steps_ is
+// 0, which is the default. BSGS IS ALREADY ON. Turning it off takes an
+// explicit set_bridge_baby_steps(1).
+//
+// This module bridges 2 * 2 * d_model + 3 * hidden = 59,392 columns per block
+// at the 8B shape; the attention seam adds 8,192 more, which belongs to
+// another module. Bridging is 98.3% of every Galois rotation in a block, and
+// the SwiGLU's three legs are 64% of the bridging -- so a lever that does not
+// touch 3 * hidden_channels is working on a third of the problem.
+//
+// That cost is not a layout mistake to be designed away; it is what a
+// non-linearity costs in a coefficient encoding, and it is why this path is
+// still the cheap one -- the three projections it replaces were the widest key
+// switching in the block. What is available is to make the bridge cheaper
+// rather than rarer:
+//
+//   set_hoisted_crossings   OFF by default and the one real lever left. The 15
+//                           baby shifts share one key-switch decomposition
+//                           instead of paying 15, so decompositions per column
+//                           go 22 -> 8 and the multiply-accumulate launches go
+//                           255 -> 8. Needs KEYSWITCHING_METHOD_II; method I
+//                           rebuilds the decomposition inside the shift loop
+//                           and gains nothing.
+//   set_bridge_baby_steps   already taken by the default. n1 = 16, n2 = 8 at
+//                           d = 128 -- note the header there claims n1 <= n2,
+//                           which is false for every d that is an odd power of
+//                           two. The count n1 + n2 - 2 is the same either way.
+//   set_bridge_plain_capacity  one block visits 8 distinct (direction, depth,
+//                           prime) sets and never has more than 2 hot, so the
+//                           default 4 does not thrash.
+//   set_bridge_plain_limb_limit  DO NOT USE ON THIS PATH. A rejected set is
+//                           re-encoded inside the per-COLUMN loop, so a 4096
+//                           column bridge does 524,288 encodes instead of 128.
+//                           It was written for the two-ring driver, where the
+//                           bridges are narrow.
+//
+// use_fast_bridge() turns on the one that is off and sizes the cache; it does
+// not touch the limb limit. This module never enables anything behind a
+// caller's back, so an unchanged measurement stays unchanged.
+//
+// MEMORY, which is the other reason this module exists. Llama3BatchOperator::
+// rms_norm holds the slot-form copy alive across the return crossing, so at the
+// 8B batch-16 shape its frame peaks at 20,480 resident ciphertexts -- 87.5 GiB
+// at the profile's 70 limbs, over an 80 GiB A100 before any key material. This
+// module releases the slot copy the moment the slot core returns, which is
+// 4096 ciphertexts and 17.5 GiB, exactly as feed_forward already does for its
+// own branches.
 //
 // WHERE THE LEVELS WENT
 // ---------------------
@@ -267,10 +309,19 @@ namespace heongpu
             // made once, named, and asserted by a test -- not so that anything
             // is computed.
             //
-            // The one place the reshape is NOT free is the K transpose, and
-            // that is a transpose rather than a reshape: Algorithm 3's CMT,
-            // d - 1 key switches per channel block. It belongs to the session
-            // that owns the products and is not reimplemented here.
+            // Two things this reshape is NOT, and both would be silent:
+            //
+            //   - it is not the K transpose. That is Algorithm 3's CMT, d - 1
+            //     key switches per channel block and zero levels, and it
+            //     belongs to the session that owns the products.
+            //   - it is not a TOKEN reshape, and there is no such thing on
+            //     this path. A BatchActivation always has exactly d rows;
+            //     llama3_batch.* has no token_blocks concept and attention()
+            //     takes no token-block argument, so a sequence longer than
+            //     d = 128 tokens has no code path here at all. The slot path
+            //     in llama3.cu does have that machinery, so the gap is an
+            //     omission rather than a naming difference. Nothing below
+            //     pretends otherwise.
 
             /** @brief Channels of query head @p h. */
             ChannelRange query_head(int h) const;
@@ -518,20 +569,26 @@ namespace heongpu
             // ---------------------------------------------------------------
 
             /**
-             * @brief Turn on every bridge lever Llama3BatchOperator already
-             *        has, in one call.
+             * @brief Turn on the bridge levers that are not already on.
              *
-             * BSGS over the bridge's diagonals, hoisted rotation trains, and a
-             * diagonal cache big enough for the (level, prime) pairs one block
-             * visits. All three are off by default there so that existing
-             * measurements stay reproducible, and none of them changes an
-             * answer beyond floating-point reassociation.
+             * In practice that is ONE lever: hoisted rotation trains. BSGS is
+             * already the default (see the note at the top of this file), and
+             * passing @p baby_steps = 0 restates it rather than changing it.
+             * The cache capacity is set for completeness; the default 4 is
+             * already right for one block.
              *
-             * This module never turns them on by itself. Call it, or do not,
-             * and say which in the report.
+             * Nothing here changes an answer beyond floating-point
+             * reassociation, and this module never calls it by itself -- a
+             * measurement should say whether it was called.
              *
-             * @param baby_steps 0 picks the balanced split.
-             * @param cache_sets Encoded diagonal sets kept at once.
+             * @param baby_steps 0 keeps the balanced split, which is n1 = 16
+             *                   at d = 128. 1 turns BSGS OFF and costs 127 key
+             *                   switches a column instead of 22.
+             * @param cache_sets Encoded diagonal sets kept at once. Each is
+             *                   d plaintexts at the FULL chain length --
+             *                   mod_drop on a plaintext moves its depth
+             *                   without reallocating -- so the resident cost
+             *                   does not fall as the stream descends.
              */
             void use_fast_bridge(int baby_steps = 0,
                                  std::size_t cache_sets = 4);

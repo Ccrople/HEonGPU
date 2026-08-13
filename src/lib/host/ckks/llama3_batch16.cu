@@ -442,10 +442,19 @@ namespace heongpu
             if (!gain.empty())
             {
                 // The slow path, kept so that the fold can be checked against
-                // it rather than believed. multiply_constant encodes the
-                // constant at exactly the prime the following rescale removes,
-                // so this is the same product the slot core would have done
-                // with an encoded plaintext -- and the same level.
+                // it rather than believed.
+                //
+                // multiply_constant encodes at the prime the following rescale
+                // removes and at the depth the ciphertext has NOW, which is
+                // also why it is used here rather than the encoded-plaintext
+                // route the other paths take: they build the gain plaintext at
+                // the depth of the INPUT and consume it against the output
+                // fifteen levels lower, so multiply_plaintext re-drops a fresh
+                // copy per channel and the trailing rescale divides by a
+                // different prime than the plaintext was encoded at. The value
+                // survives -- the tracked scale is exact -- but the activation
+                // stops sitting at default_scale, and on this path that is
+                // 4096 avoidable re-drops per norm.
                 Range _r_g("b16.rms_norm.gain");
                 for (int j = 0; j < channels; ++j)
                 {
