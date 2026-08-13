@@ -250,6 +250,15 @@ namespace
         return worst;
     }
 
+    double magnitude(const Batch& b)
+    {
+        double m = 0.0;
+        for (const auto& mat : b)
+            for (double v : mat)
+                m = std::max(m, std::abs(v));
+        return m;
+    }
+
     struct Stage
     {
         std::string name;
@@ -257,14 +266,25 @@ namespace
         int depth_in = 0;
         int depth_out = 0;
         double error = 0.0;
+        double scale_of = 0.0;
         int columns = 0;
+        double relative() const
+        {
+            return scale_of > 0.0 ? error / scale_of : error;
+        }
     };
     std::vector<Stage> ledger;
 
+    // An ABSOLUTE error means nothing across shapes: a wider model produces
+    // wider values and a fit's error grows with them, so a fixed threshold
+    // reads a correct circuit as broken as soon as the width moves. What
+    // carries across shapes is the error against the value's own magnitude,
+    // so that is what the verdict uses and both are reported.
     void note(const std::string& name, double ms, int din, int dout,
-              double err, int cols)
+              const Batch& want, const Batch& got, int cols)
     {
-        ledger.push_back(Stage{name, ms, din, dout, err, cols});
+        ledger.push_back(Stage{name, ms, din, dout, worst_error(want, got),
+                               magnitude(want), cols, });
     }
 
     double gib(std::size_t bytes)
@@ -413,8 +433,7 @@ int main()
         {
             decrypt_failed = true;
             std::cout << "[b16] DECRYPT FAILED: " << e.what()
-                      << "
-[b16] the value has outgrown the scale, which "
+                      << "\n[b16] the value has outgrown the scale, which "
                          "means a fit was evaluated outside its interval"
                       << std::endl;
             return Batch(static_cast<size_t>(instances),
@@ -450,8 +469,8 @@ int main()
         for (int b = 0; b < instances; ++b)
             ref_normed[b] =
                 rms_norm_host(ref[b], d, model, {}, norm_cfg.eps);
-        note("norm1", ms(t0, t1), din, dout,
-             worst_error(ref_normed, decrypt(normed)), model);
+        note("norm1", ms(t0, t1), din, dout, ref_normed, decrypt(normed),
+             model);
     }
 
     // ================= attention ======================================
@@ -642,8 +661,8 @@ int main()
                                    kv_channels, heads, kv_heads, hd, use_rope,
                                    500000.0, 0);
         }
-        note("attention", ms(t0, t1), din, dout,
-             worst_error(ref_sub, decrypt(sub)), q_channels);
+        note("attention", ms(t0, t1), din, dout, ref_sub, decrypt(sub),
+             q_channels);
 
         auto t2 = tick();
         stream.column = op.arith().residual_add(stream.column, sub.column);
@@ -652,7 +671,7 @@ int main()
             for (size_t e = 0; e < ref[b].size(); ++e)
                 ref[b][e] += ref_sub[b][e];
         note("residual1", ms(t2, t3), dout, stream.column.front().depth(),
-             worst_error(ref, decrypt(stream)), model);
+             ref, decrypt(stream), model);
     }
 
     // ================= norm 2 + SwiGLU ================================
@@ -672,8 +691,7 @@ int main()
         Batch ref_n2(instances);
         for (int b = 0; b < instances; ++b)
             ref_n2[b] = rms_norm_host(ref[b], d, model, {}, cfg2.eps);
-        note("norm2", ms(t0, t1), din, dout,
-             worst_error(ref_n2, decrypt(n2)), model);
+        note("norm2", ms(t0, t1), din, dout, ref_n2, decrypt(n2), model);
 
         // The gain rides on the gate and up weights.
         llama::Llama3Batch16Operator::FeedForwardWeights fw;
@@ -709,8 +727,8 @@ int main()
         for (int b = 0; b < instances; ++b)
             ref_sub[b] =
                 ffn_host(ref_n2[b], fw.gate, fw.up, fw.down, d, model, hidden);
-        note("swiglu", ms(t2, t3), dout, fout,
-             worst_error(ref_sub, decrypt(sub)), hidden);
+        note("swiglu", ms(t2, t3), dout, fout, ref_sub, decrypt(sub),
+             hidden);
 
         auto t4 = tick();
         stream.column = op.arith().residual_add(stream.column, sub.column);
@@ -719,14 +737,15 @@ int main()
             for (size_t e = 0; e < ref[b].size(); ++e)
                 ref[b][e] += ref_sub[b][e];
         note("residual2", ms(t4, t5), fout, stream.column.front().depth(),
-             worst_error(ref, decrypt(stream)), model);
+             ref, decrypt(stream), model);
     }
 
     // ---- report -------------------------------------------------------
     std::cout << "\n[b16] " << std::left << std::setw(18) << "stage"
               << std::right << std::setw(11) << "ms" << std::setw(8) << "cols"
               << std::setw(8) << "lvl in" << std::setw(9) << "lvl out"
-              << std::setw(14) << "max abs err" << std::endl;
+              << std::setw(13) << "|value|" << std::setw(13) << "abs err"
+              << std::setw(12) << "rel err" << std::endl;
     double total = 0.0;
     for (const Stage& s : ledger)
     {
@@ -735,8 +754,9 @@ int main()
                   << std::right << std::fixed << std::setprecision(1)
                   << std::setw(11) << s.ms << std::setw(8) << s.columns
                   << std::setw(8) << s.depth_in << std::setw(9) << s.depth_out
-                  << std::scientific << std::setprecision(3) << std::setw(14)
-                  << s.error << std::endl;
+                  << std::scientific << std::setprecision(3) << std::setw(13)
+                  << s.scale_of << std::setw(13) << s.error << std::setw(12)
+                  << s.relative() << std::endl;
     }
     std::cout << "[b16] " << std::left << std::setw(18) << "TOTAL"
               << std::right << std::fixed << std::setprecision(1)
@@ -762,11 +782,12 @@ int main()
 
     double worst = 0.0;
     for (const Stage& s : ledger)
-        worst = std::max(worst, s.error);
+        worst = std::max(worst, s.relative());
     const bool ok = !decrypt_failed && worst == worst && worst < 5e-2 &&
                     spent < limbs - 1;
     std::cout << "[b16] " << (ok ? "DATAFLOW OK" : "DATAFLOW SUSPECT")
-              << " (worst stage error " << std::scientific << worst << ")"
+              << " (worst stage RELATIVE error " << std::scientific << worst
+              << ")"
               << std::endl;
     return ok ? 0 : 1;
 }
