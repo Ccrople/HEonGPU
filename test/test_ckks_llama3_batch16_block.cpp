@@ -1327,9 +1327,12 @@ TEST(HEonGPU, CKKS_Llama3Batch16Block_TwoTokenBlocksWithARefreshRun)
     seq.block.push_back(
         f.op->encrypt(x1, d, shape.d_model, *f.encryptor, f.scale));
 
+    // ONE key for both roles, which is the whole point of the union: the
+    // sublayers' shifts and the bootstrap's are in the same Galoiskey, so
+    // there is no second key for a caller to hand over by mistake.
     llama::Llama3Batch16Operator::Batch16Sequence out;
     ASSERT_NO_THROW({
-        out = f.nl->transformer_block(seq, s.w, s.cfg, *f.galois, *f.relin,
+        out = f.nl->transformer_block(seq, s.w, s.cfg, *f.boot_key, *f.relin,
                                       f.boot_key.get());
     });
     f.nl->depth_trace = nullptr;
