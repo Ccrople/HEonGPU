@@ -3731,20 +3731,34 @@ Sicily, `N = 4096, d = 128, k = 32, batch = 16`. Model widths cut down —
 `d_model` 4-8, `hidden` 8-16 — because what is under test is the SCHEDULE and
 the CAUSALITY, which are properties of the circuit and not of the width.
 
+**19 of 19 green.**
+
 | what | measured |
 |---|---|
-| blocked mask reduces to the single-block one | exact, entry by entry |
-| `attention_sequence` at one block vs `attention` | **5.04e-08**, identical depth |
-| sequence block driver vs block driver at one block | **4.88e-08**, identical depth trace |
-| blocked seam vs an exact host SoftMax over a 2d row | 7.29e-04 worst, ~4.6% of the peak probability |
-| **a masked-off key** | **5.61e-07** — zero to the CKKS noise floor |
-| perturbing a token of block 1: block 0 moves | **1.45e-07** |
-| the same perturbation: block 1 moves | 2.92e-03 — a factor of **2.0e4** |
+| blocked mask reduces to the single-block one | exact, every key and every slot |
+| `attention_sequence` at one block vs `attention` | **5.00e-08**, identical depth |
+| sequence block driver vs block driver at one block | **4.23e-08**, identical depth trace |
+| blocked seam vs an exact host SoftMax over a 2d row | **7.94e-06**, 0.021% of the peak probability |
+| **a masked-off key** | **8.39e-09** — zero to the CKKS noise floor |
+| perturbing a token of block 1: block 0 moves | **1.50e-07** |
+| the same perturbation: block 1 moves | 2.92e-03 — a factor of **1.95e4** |
 | perturbing a token of block 0: block 1 moves | 3.09e-03 |
 | perturbing instance 5: instance 5 moves | 0.964 |
-| the same: every other instance moves | **1.27e-07** — a factor of **7.6e6** |
-| a refresh carries the matrix encryption | 3.34e-04, **11.5 bits** |
+| the same: every other instance moves | **1.25e-07** — a factor of **7.7e6** |
+| a refresh carries the matrix encryption | 3.99e-04, **11.3 bits** |
 | the boot-key union | 127 module + 35 bootstrapping = **146** (16 shared) |
+
+**And one number that is not about either gap: calibrating `concentration` is
+worth 92x on the blocked seam.** Left at its default of zero it keeps the worst
+case, `D` — and at a 2d-long row that is 256, so the reciprocal of the later
+rounds is fitted over 768:1. Measured from the data the bound is **3.36**, a
+76x narrower interval, and the seam's worst error goes **7.29e-04 → 7.94e-06**
+with the masked-off residue following it **5.61e-07 → 8.39e-09**. This is
+Section 4.3's whole argument, on this path, in one number: the range is a
+measurement of the model and not a property of the
+algorithm, and it is computable here because the causal mask's row weight is
+constant along the key axis and cancels exactly after round zero — which is the
+property the weight was chosen for in the first place.
 
 **The first per-seam level map of a batch-16 block**, from the depth trace of a
 whole block at the cheap fit degrees (a 13-level seam; the production seam is
@@ -3767,10 +3781,27 @@ returned `chain - 25` limbs to the digit. The feed-forward half then spent
 `44 - 25 = 19` levels, which is `9 + 9 + 1` from the table above, again to the
 digit.
 
-Regressions: every other batch-16 and shared suite green — `llama3_batch16`
-(17), `llama3_batch` (13), `llama3_batch_softmax` (9), `batchmatrix_shared`
-(6), `batchmatrix_gpu` (12), `batch_ringswitch` (7), plus the rectangular
-suites, which share `cmt`, `ccmm` and `causal_column_mask` with this path.
+**Regressions: 64 green, and three that could not be run.** Green:
+`llama3_batch16` (17), `llama3_batch` (13), `llama3_batch_softmax` (9),
+`batchmatrix_shared` (6), `batchmatrix_gpu` (12), `batch_ringswitch` (7), and
+35 of 38 in `llama3_rect`.
+
+The three that failed are `llama3_rect`'s attention tests, and they failed the
+same way each time: **an RMM pool ceiling at 21.88 GiB**, `current/max =
+21.882/21.884` — the `max == cap` signature that says the pool was sized small
+at context generate, not that the circuit grew. The tests print their score
+range and then die allocating 2.6 MiB. No card on the box had room to rerun
+them (three sessions were sharing it; the most free memory anywhere was 24 GB),
+so **they are unverified rather than green, and that is stated rather than
+rounded off.**
+
+What can be said without a card: the only behaviour this work exposes to the
+rectangular path is `causal_column_mask(key)`, which now delegates to
+`causal_column_mask(0, 0, key)` — and that delegation is asserted bit-identical
+by `ASSERT_DOUBLE_EQ` over **every** key in `[0, d)` and every slot, not a
+sample, precisely because `Llama3RectOperator::attention` calls it for every
+`j` and one ulp on one key would move that path's SoftMax silently. `cmt`,
+`ccmm` and every other shared entry point are untouched.
 
 **One thing this run established that is not about either gap.** The first
 attempt failed all twelve GPU tests at once with an RMM pool ceiling of 3.72
