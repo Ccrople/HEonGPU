@@ -2150,21 +2150,42 @@ property of the ring, not a limitation of Kang's algorithms.
 
 ### 19.4 So the levers are levels and encodes, and neither had been taken
 
-| lever | seam levels | cost |
-|---|---:|---|
-| baseline as it stood (`Ed=Id=15, Nw=2, R=2`, causal) | **30** | — |
-| `+ scores_carry_exp_domain` (exp map on the query weight) | 29 | free, host-side |
-| `+ fold_affine_into_mask` (1/x map on the causal mask, forces `Nw=0`) | **19** | calibration, not free |
-| `+ refresh_denominator` (the paper's auxiliary track) | **11** | 1 bootstrap of 1 ciphertext per round |
+**Measured**, Sicily GPU 2, tip `af90394`, `d = 128`, `batch = 16`, a full
+causal `128 x 128` score block per input against the true SoftMax:
 
-**30 -> 19 is eleven levels, and eight of them are the Newton steps.** That is
-an accuracy change, not bookkeeping: `fold_affine_into_mask` is silently ANDed
-with `inverse_newton <= 0`, so taking the fold deletes the refinement and the
-reciprocal becomes the bare degree-15 fit. It is safe *only* because
-`sum_lo`/`sum_hi` are measured — Section 4.3's whole argument — and they had
-never been set anywhere on this path, so the fit was being taken over exactly
-the worst-case interval the paper warns against. The new suite calibrates them
-off the host scores and measures both forms against the true SoftMax.
+| configuration | seam levels | worst abs error |
+|---|---:|---:|
+| baseline as it stood (`Ed=Id=15, Nw=2`, no folds) | **30** | — |
+| Newton-refined (`Id=15, Nw=2`), exp map folded | 29 | 1.76e-02 |
+| no folds, `Id=63, Nw=0`, calibrated | 26 | 2.72e-03 |
+| **both folds, `Id=63, Nw=0`, calibrated** | **23** | **2.84e-03** |
+| `+ refresh_denominator` (auxiliary track) | **11** | *predicted, not run* |
+
+**30 -> 23 is seven levels, and the circuit gets 6.2x MORE accurate on the
+way.** The ledger the code advertises is the ledger it spends — `predicted 23,
+spent 23`, measured by depth in and out rather than inferred from a limb
+allocation that merely fits.
+
+**The eleven levels the derivation offered were not eleven, and why is the
+useful part.** `fold_affine_into_mask` is silently ANDed with
+`inverse_newton <= 0`, so taking the fold deletes the Newton refinement and the
+reciprocal becomes a bare fit. At degree 15 that fit is **33% wrong**, and
+calibration does not rescue it: a causal triangle starting at `u = 0` has a row
+attending to ONE key, whose sum of squares after a round is exactly 1, so
+`concentration` is `d` whatever is measured and the later rounds are fitted
+over `[0.5/d, 1.5]` — **384:1 at d = 128**. Degree 63 carries it, which is
+exactly what the rect path already uses in production and for exactly this
+reason. So the fold costs two levels of fit degree and nets six, not ten.
+
+The two folds themselves are free, and now measured so: 26 -> 23 levels at
+2.72e-03 against 2.84e-03, the difference being noise.
+
+`sum_lo`/`sum_hi`/`concentration` had never been set anywhere on this path, so
+the reciprocal was being fitted over exactly the worst-case interval Section
+4.3 warns against. Calibrating them is what makes degree 63 enough rather than
+degree 127 — and it is also the reason `refresh_denominator` matters more here
+than the level count alone suggests: the auxiliary track takes the fit off the
+wide track entirely, so the degree stops being a budget item at all.
 
 `refresh_denominator` is the largest single lever and it is nearly free here:
 the denominator is **one** ciphertext however many parts the key axis is cut
@@ -2225,6 +2246,41 @@ for every query at once, and Algorithm 4 requires square `d x d` operands
 either side. Recovering it needs a triangular block schedule over a token grid,
 which is a different shape of attention and not a SoftMax change. **Name it as
 the ceiling and do not go looking for it inside the seam.**
+
+### 19.6bis Validation
+
+Sicily **GPU 2** (0 was at 99% on an external job, 1 had picked up a 12 GiB
+one; 2 was idle at 0% with only the long-standing 4.3 GiB `dp_relu`
+residents). Build: CMake 3.31.6, devtoolset-10, CUDA 12.0, sm_86, tree
+`JHJun/HEonGPU-b16sm`, tip `af90394`.
+
+**112 tests green, no regressions:**
+
+| suite | result |
+|---|---|
+| `ckks_llama3_batch_softmax` (new) | **9/9** |
+| `ckks_llama3_batch` | 12/12, attention 2.65e-08 |
+| `ckks_llama3` | 53/53 |
+| `ckks_llama3_rect` | 38/38, attention 9.15e-05 |
+
+The last three matter because the seam touched code they own: `attention()`
+was rewired to call `softmax_seam`, and `Llama3Operator::softmax` grew a
+mask-id overload that the rect path reaches through the old signature.
+
+What the new suite pins, beyond the numbers above: the reduction is 0
+rotations and the seam asks for 0 Galois indices Algorithm 4 did not already
+force; the bridge and CMT index sets are equal; the mask cache serves 0, 0 and
+then all 128 encodes across three identical seams and returns **exactly** the
+same plaintext each time; hoisted crossings are **bit-identical**; a per-query
+shift agrees with the scalar one to 1e-6; and the four contracts that must
+fail loudly do.
+
+Two of the first run's six failures were the test's own and are worth naming.
+The bit-identity tests encrypted afresh for each run, so they compared two
+samples of the encryption noise and reported a 4e-7 "difference" that had
+nothing to do with what they were testing; both now run every configuration
+off one ciphertext. And the level-delta assertion carried a spare `+1` for the
+exponential's affine map that both configurations already fold.
 
 ### 19.7 Left undone, deliberately
 
