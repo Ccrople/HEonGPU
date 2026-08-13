@@ -130,9 +130,16 @@ namespace
         // N/2 - 1 distinct Galois indices for the half-layout CMT.
         c.galois_keys = static_cast<double>(half - 1);
         c.levels = 1;
-        // The Algorithm-1 core underneath: d x (N/2) x k per call, over the
-        // subring index, i.e. two R_k matrix products per ciphertext pair.
-        c.macs = calls * static_cast<double>(d) * half * (N / d) * 2.0;
+        // The Algorithm-1 core underneath. bm_gemm_kernel walks
+        //   C[i][j][s] = sum_t A[i][t][s] * P[t][j][s]
+        // with i < d entries, j < cols = N/2, t < inner = d and s < k
+        // (src/lib/kernel/batchmatrix.cu:360-396), so one call is
+        // d * d * (N/2) * k MACs per ciphertext component and there are two
+        // components. Dropping the `inner` factor here understates Algorithm
+        // 5 by 128x at these shapes and inverts the comparison, so it is
+        // spelled out rather than folded.
+        c.macs = calls * static_cast<double>(d) * d * half *
+                 static_cast<double>(N / d) * 2.0;
         // Algorithm 5 covers only d3 = d tokens per call; scale to d3.
         const double token_calls =
             static_cast<double>(d3) / static_cast<double>(d);
