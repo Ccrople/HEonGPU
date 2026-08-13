@@ -2423,7 +2423,38 @@ regression. See §21.1.
    one, `operator.cuh:1218-1237` says the result is identical to the bit, and it
    was worth 14% on the nobatch path. Nothing on the batch path calls
    `set_hoisted_crossings`.
-4. **Noise gained by deleting the two K CMTs.** Direction is certain (strictly
-   non-increasing); magnitude is an estimate, at most ~4 bits at `d = 128`.
-   Cheap probe: rerun the CCMM sweep with symmetric scales, which should now
-   pass where the asymmetric 2^35 / 2^25 split was previously required.
+4. ~~**Noise gained by deleting the two K CMTs.**~~ **Settled — measured
+   below.**
+
+### 21.6 Validation (2026-08-13, Sicily GPU 2)
+
+Built at `95e1d5e` in an isolated tree (`JHJun/HEonGPU-b16ccmm`), CUDA 12.0,
+sm_86. **77 tests, all green, zero failures**: batch-matrix GPU 12, batch-matrix
+host 5, llama3-batch 13, shared-PCMM 6, rect batch-matrix 3, llama3-rect 38. The
+last three suites are regressions — the rect path shares `cmt` and `ccmm` with
+this one, so the schedule cache and the removed barrier had to be shown harmless
+there too.
+
+**Open question 4 is answered, and the direction was right.** The score
+product's error, same shape and same scales:
+
+| path | worst absolute error |
+|---|---|
+| with step-1 CMT (`CCMMMatchesReference`) | 3.21e-04 |
+| without it (`CCMMRowWiseRightOperandTransposes`) | **9.57e-05** |
+
+**3.4x more accurate**, about 1.75 bits, from deleting a transpose that was
+computing the identity. That is the step-1 CMT's key-switching noise leaving the
+product, and it is why the reference test needed asymmetric scales. The two
+paths agree to 3.59e-04 (`CCMMRowWiseMatchesDoubleTranspose`) — i.e. to within
+the noise of the noisier of the two, which is the most agreement that is
+available.
+
+Grouped-query attention, executed for the first time in this repo, lands at
+3.02e-08 against a host reference — indistinguishable from the single-head path
+at 2.41e-08, so sharing V's transpose across the group costs nothing in
+accuracy.
+
+The two counts that are still projections and not measurements: the per-sublayer
+key-switch table in §21.2, and every millisecond in §21.3. No profile of this
+branch exists yet.
