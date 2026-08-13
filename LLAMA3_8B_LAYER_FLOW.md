@@ -3163,19 +3163,38 @@ says WHERE and the end-to-end error says WHETHER.
 **The dataflow is correct**: every stage runs, the levels land exactly where
 the ledger predicts (attention is 27 = 1 + 1 + 23 + 1 + 1), and no
 orientation, scale or level disagreement appears at any seam. What degrades
-is ACCURACY, down a 56-level chain of degree-15 fits.
+is ACCURACY, down a 56-level chain of degree-15 fits — and the attribution is
+measured, not asserted. Raising ONLY the degrees, same circuit, same shape:
+
+| stage | deg 15 | deg 31 |
+|---|---:|---:|
+| norm1 | 5.4e-06 | 1.0e-05 |
+| attention (degrees unchanged) | 2.451e-03 | 2.445e-03 |
+| norm2 | 6.414e-02 | **8.467e-03** |
+| SwiGLU | 1.432e-01 | **1.864e-02** |
+| verdict | SUSPECT | **DATAFLOW OK** |
+
+The two stages whose degree moved improve 7.6x and 7.7x; attention, whose
+degrees were left alone, does not move at all. That is the signature of fit
+error and not of a dataflow fault, and it costs three more levels (56 -> 59).
 
 ### 23.4 The optimisation, measured
 
 `slot_resident` on the SwiGLU — the arrangement 22.6's commutation result
 unlocks, and which the `pcmm` guard above was silently blocking:
 
+Measured twice, in the whole block and on the sublayer alone:
+
 | | SwiGLU ms | levels | relative error |
 |---|---:|---:|---:|
-| three crossings over the hidden | 3,465 | 46 → 55 | 1.432e-01 |
-| two crossings around the sublayer | **1,601** | 46 → 55 | 1.432e-01 |
+| in-block, three crossings, deg 15 | 3,465 | 46 → 55 | 1.432e-01 |
+| in-block, two crossings, deg 15 | **1,601** | 46 → 55 | 1.432e-01 |
+| sublayer alone, three crossings, deg 31 | 19,467 | 9 → 19 | 2.264e-04 |
+| sublayer alone, two crossings, deg 31 | **9,120** | 9 → 19 | 2.264e-04 |
 
-**2.09x on the sublayer, identical depth, identical error to four digits.**
+**2.09x in the block and 2.13x on the sublayer, at identical depth and an
+error identical to four significant figures.** The arithmetic is the same
+arithmetic; what falls is the number of columns crossed.
 At this shape the bridged columns fall 3 x 256 = 768 to 2 x 128 = 256; at the
 8B shape the same move is 43,008 to 8,192.
 
