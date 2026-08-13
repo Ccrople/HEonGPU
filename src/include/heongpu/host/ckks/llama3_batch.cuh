@@ -162,6 +162,19 @@ namespace heongpu
             /** @brief Independent instances one activation carries, k/2. */
             int batch() const noexcept { return layout_.batch; }
 
+            /**
+             * @brief Q primes in the chain this operator was built on.
+             *
+             * The denominator of every level statement on this path: a
+             * ciphertext at depth t has chain_limbs() - t active primes, and a
+             * level budget is quoted in those rather than in depths, because a
+             * depth is only meaningful against a chain.
+             */
+            int chain_limbs() const
+            {
+                return context_->get_ciphertext_modulus_count();
+            }
+
             /** @brief Default scaling factor. */
             double default_scale() const noexcept { return default_scale_; }
 
@@ -491,6 +504,61 @@ namespace heongpu
             std::vector<double> causal_column_mask(int key) const;
 
             /**
+             * @brief The causal mask of one key column of one BLOCK PAIR.
+             *
+             * The generalisation of the above to a sequence longer than d
+             * tokens, and the only piece of token blocking that is not
+             * bookkeeping. A sequence of T tokens is T/d activations of d rows
+             * each; query block @p query_block attends key blocks 0 ..
+             * query_block, and the SoftMax reduces over all of them at once,
+             * so the seam is handed (query_block + 1) * d parts and needs one
+             * mask apiece.
+             *
+             * Three cases, and only the third has a triangle in it:
+             *
+             *   key_block >  query_block   never fed to the seam at all --
+             *                              those keys are in the future and
+             *                              the product is not computed
+             *   key_block <  query_block   every query sees every key: the
+             *                              mask is the row WEIGHT alone, with
+             *                              no zeros
+             *   key_block == query_block   the diagonal block, where the
+             *                              triangle lives: query u keeps keys
+             *                              0..u
+             *
+             * The weight is the same idea as the single-block one and reduces
+             * to it exactly at query_block = 0. Query u of block p sees
+             * p*d + u + 1 keys out of the (p+1)*d the seam reduces over, so
+             * the weight is sqrt((p+1)*d / (p*d + u + 1)) -- constant along
+             * the key axis, therefore cancelled exactly by the SoftMax rounds,
+             * and chosen so the sum of squares lands where a full row of
+             * (p+1)*d keys would leave it. Getting this wrong is not an error:
+             * it is a reciprocal fitted over the wrong range, which is the
+             * defect that cost this project a day on the other path.
+             *
+             * @param query_block Block of the query, in [0, T/d).
+             * @param key_block   Block of the key, in [0, query_block].
+             * @param key         Key inside its block, in [0, d).
+             */
+            std::vector<double> causal_column_mask(int query_block,
+                                                   int key_block,
+                                                   int key) const;
+
+            /**
+             * @brief The cache id of that mask, so the plaintext cache can
+             *        name it.
+             *
+             * A query block uses exactly d + 1 distinct masks -- d triangles
+             * on its diagonal block and one full-visibility mask for every
+             * block below it -- and every head of that block reuses the same
+             * d + 1. So a cache capacity of d + 1 gives a 100% hit rate across
+             * heads, which is where the reuse actually is; capacity for a
+             * whole sequence would be T/d times that and buys nothing, since a
+             * query block is visited once.
+             */
+            int causal_mask_id(int query_block, int key_block, int key) const;
+
+            /**
              * @brief Rotary position embedding, in place on slot-form Q or K.
              *
              * Cheap on this encoding for two reasons, both of them the same
@@ -628,6 +696,128 @@ namespace heongpu
                                       Relinkey<Scheme::CKKS>& relin_key,
                                       Galoiskey<Scheme::CKKS>* boot_key =
                                           nullptr);
+
+            // ---------------------------------------------------------------
+            // Token blocking: a sequence longer than d tokens
+            // ---------------------------------------------------------------
+            //
+            // d is the sequence length on this path -- permanently, and by
+            // arithmetic rather than by choice. A BatchActivation has exactly
+            // layout.d rows, three places enforce it, and at batch 16 the ring
+            // pins d = 128. Llama-3-8B's context is 8192, so everything above
+            // ran at 1/64 of the model and there was NO code path to the rest
+            // of it. These entry points are that path.
+            //
+            // WHAT IT COSTS AND WHAT IT DOES NOT
+            //
+            // The expensive-looking part is free and the free-looking part is
+            // the expensive one, so it is worth being precise.
+            //
+            //   - The SoftMax costs NO new rotations. The key axis is already
+            //     the ciphertext axis (d * (k/2) == N/2 leaves it nowhere else
+            //     to be), so lengthening the key axis just means handing the
+            //     reduction more parts. `count` stays 1, `sum_strided`'s loop
+            //     stays dead, and the denominator over 8192 keys costs exactly
+            //     what the denominator over 128 keys cost: zero. This is the
+            //     one place this encoding is strictly better than every other
+            //     one in the repo.
+            //   - The non-linear layers cost nothing new either. RMSNorm and
+            //     SwiGLU are token-wise, so a sequence is a loop over blocks
+            //     with no interaction between them.
+            //   - The products are the m^2, and there is no way around it:
+            //     query block p needs a score product against every key block
+            //     q <= p and a value product against each as well. A sequence
+            //     of B blocks costs B(B+1)/2 of each per head instead of B --
+            //     at B = 64 that is 2080 against 64, a 32.5x factor on the
+            //     Algorithm-4 half. Causality is what halves it; a
+            //     bidirectional model would pay B^2.
+            //   - The memory is the other m: query block p holds (p+1)*d slot
+            //     ciphertexts in the wide track at once, and the SoftMax
+            //     squares them. At B = 64 the last query block alone is 8192
+            //     ciphertexts. attention_sequence_peak_columns() reports it,
+            //     because a caller that discovers this by OOM has learnt
+            //     nothing.
+            //
+            // WHAT IS DELIBERATELY NOT HERE: a KV cache. Every key and value
+            // block is recomputed from the sequence on every call, because
+            // there is no incremental decode on this path -- the batch axis
+            // carries sixteen independent PROMPTS, not sixteen positions of
+            // one, so there is no autoregressive step to cache for.
+
+            /**
+             * @brief The SoftMax seam over a query block's whole visible past.
+             *
+             * @param scores    One square score block per key block, in key
+             *                  order 0 .. query_block. Every one is d columns
+             *                  at one level and one scale.
+             * @param query_block Which query block these scores belong to.
+             *                  Fixes the mask triangle and the row weights.
+             *
+             * @return One probability block per key block, in the same order,
+             *         each ready to be the LEFT operand of its own value
+             *         product with no transpose.
+             *
+             * The reduction runs across every part of every block at once --
+             * that is what makes it the SoftMax of the whole row rather than
+             * of one block -- so this cannot be decomposed into per-block
+             * seams and the whole visible past is resident here.
+             */
+            std::vector<BatchActivation> softmax_seam_blocked(
+                std::vector<BatchActivation>& scores, int query_block,
+                const Llama3Operator::SoftmaxConfig& softmax,
+                const BatchSoftmaxSeamConfig& seam,
+                Galoiskey<Scheme::CKKS>& galois_key,
+                Relinkey<Scheme::CKKS>& relin_key,
+                Galoiskey<Scheme::CKKS>* boot_key = nullptr);
+
+            /**
+             * @brief One attention sublayer over a sequence of token blocks.
+             *
+             * @param x One activation per token block, each d rows by
+             *          config.in_channels columns, block t holding tokens
+             *          [t*d, (t+1)*d) of every one of the k/2 instances. All
+             *          blocks at one level and one scale.
+             *
+             * @return One output activation per token block, same shape.
+             *
+             * Identical arithmetic to attention() when there is one block --
+             * asserted by test, not by inspection -- and the causal
+             * generalisation of it when there are more. RoPE positions
+             * continue across the blocks: block t starts at
+             * t*d + config.rope_position_offset, so the sequence is one
+             * sequence and not B independent ones.
+             */
+            std::vector<BatchActivation>
+            attention_sequence(std::vector<BatchActivation>& x,
+                               const BatchAttentionWeights& weights,
+                               const BatchAttentionConfig& config,
+                               Galoiskey<Scheme::CKKS>& galois_key,
+                               Relinkey<Scheme::CKKS>& relin_key,
+                               Galoiskey<Scheme::CKKS>* boot_key = nullptr);
+
+            /** @brief What a B-block causal sublayer costs, in products. */
+            struct SequenceProductCount
+            {
+                /// Algorithm-4 score products, B(B+1)/2 per head per block
+                /// pair.
+                long long score = 0;
+                /// Algorithm-4 value products, the same count.
+                long long value = 0;
+                /// Bridged columns, both directions, over the whole sublayer.
+                long long bridged_columns = 0;
+                /// Slot-form ciphertexts resident at the deepest query block.
+                long long peak_slot_columns = 0;
+            };
+
+            /**
+             * @brief That count, from the shape alone.
+             *
+             * Reports rather than decides, so a test can pin the m^2 and a
+             * caller can size a card before it runs anything.
+             */
+            SequenceProductCount
+            sequence_product_count(int blocks,
+                                   const BatchAttentionConfig& config) const;
 
             // ---------------------------------------------------------------
             // RMSNorm and SwiGLU
@@ -774,6 +964,17 @@ namespace heongpu
             /// 2 MiB at the Llama-3 shape.
             const std::vector<std::vector<double>>& causal_masks();
             std::vector<std::vector<double>> causal_mask_cache_;
+
+            /// The d + 1 masks of query block @p query_block: d triangles for
+            /// its own diagonal, then one full-visibility mask at index d for
+            /// every key block below it. Keyed by query block because the row
+            /// weight sqrt((p+1)*d / (p*d + u + 1)) depends on it; the single
+            /// block case is query_block = 0 and is served by the table above,
+            /// so an existing caller shares the plaintexts it already had.
+            const std::vector<std::vector<double>>&
+            causal_masks_blocked(int query_block);
+            std::map<int, std::vector<std::vector<double>>>
+                causal_block_mask_cache_;
 
             /// One direction of the bridge; @p inverse picks V^-1 over V.
             std::vector<Ciphertext<Scheme::CKKS>>

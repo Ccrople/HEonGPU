@@ -805,25 +805,82 @@ namespace heongpu
         std::vector<double>
         Llama3BatchOperator::causal_column_mask(int key) const
         {
+            // The single-block case IS the blocked case at query block zero,
+            // weights and all, so it is written once. A second formula here
+            // would be a second thing to keep in step, and a mask that has
+            // drifted is a reciprocal fitted over the wrong range -- silent.
+            return causal_column_mask(0, 0, key);
+        }
+
+        std::vector<double>
+        Llama3BatchOperator::causal_column_mask(int query_block, int key_block,
+                                                int key) const
+        {
             const int d = layout_.d;
             const int step = layout_.k / 2;
 
-            std::vector<double> mask(slot_count_, 0.0);
-            for (int u = key; u < d; ++u)
+            if (query_block < 0 || key_block < 0 || key < 0 || key >= d)
             {
-                // Query u admits keys 0..u, so it keeps u + 1 of the d
-                // coordinates. Weighting by sqrt(d / (u + 1)) is constant
-                // along the key axis and therefore cancels in the SoftMax
-                // rounds, but it leaves the sum of squares where a full row
-                // would have left it.
-                const double w = std::sqrt(static_cast<double>(d) /
-                                           static_cast<double>(u + 1));
+                throw std::invalid_argument(
+                    "A causal mask needs non-negative block indices and a key "
+                    "inside [0, layout.d)");
+            }
+            if (key_block > query_block)
+            {
+                // Not a clamp. A future key block is never fed to the seam at
+                // all, so asking for its mask means the schedule is wrong, and
+                // returning an all-zero mask would hide that.
+                throw std::invalid_argument(
+                    "A causal query block never sees a key block above it, so "
+                    "that mask is not something the schedule can want");
+            }
+
+            // The seam reduces over every key block 0..query_block at once, so
+            // a full row for this query block is (query_block + 1) * d keys.
+            const double full =
+                static_cast<double>(query_block + 1) * static_cast<double>(d);
+
+            std::vector<double> mask(slot_count_, 0.0);
+            // Below the diagonal every query sees every key; on the diagonal,
+            // query u sees keys 0..u of this block -- and every key of the
+            // blocks below, which is where the weight's numerator comes from.
+            const int first = key_block == query_block ? key : 0;
+            for (int u = first; u < d; ++u)
+            {
+                // Query u of block p admits p*d + u + 1 keys. Weighting by
+                // sqrt(full / visible) is constant along the key axis and
+                // therefore cancels exactly in the SoftMax rounds, but it
+                // leaves the sum of squares where a full row would have left
+                // it -- which is the range the reciprocal is fitted over.
+                const double visible =
+                    static_cast<double>(query_block) * static_cast<double>(d) +
+                    static_cast<double>(u) + 1.0;
+                const double w = std::sqrt(full / visible);
                 for (int b = 0; b < step; ++b)
                 {
                     mask[b + u * step] = w;
                 }
             }
             return mask;
+        }
+
+        int Llama3BatchOperator::causal_mask_id(int query_block, int key_block,
+                                                int key) const
+        {
+            if (query_block < 0 || key_block < 0 || key < 0 ||
+                key >= layout_.d || key_block > query_block)
+            {
+                throw std::invalid_argument(
+                    "causal_mask_id takes the same indices causal_column_mask "
+                    "does");
+            }
+            // d + 1 ids per query block: the d triangles of its own diagonal,
+            // then ONE shared id for every block below it, since they all use
+            // the same full-visibility mask. At query block zero this is
+            // exactly the key index, so the single-block path keeps the ids --
+            // and therefore the encoded plaintexts -- it already had.
+            return query_block * (layout_.d + 1) +
+                   (key_block == query_block ? key : layout_.d);
         }
 
         const std::vector<std::vector<double>>&
@@ -838,6 +895,53 @@ namespace heongpu
                 }
             }
             return causal_mask_cache_;
+        }
+
+        const std::vector<std::vector<double>>&
+        Llama3BatchOperator::causal_masks_blocked(int query_block)
+        {
+            if (query_block < 0)
+            {
+                throw std::invalid_argument(
+                    "A query block index is non-negative");
+            }
+            auto found = causal_block_mask_cache_.find(query_block);
+            if (found != causal_block_mask_cache_.end())
+            {
+                return found->second;
+            }
+
+            std::vector<std::vector<double>> table;
+            table.reserve(static_cast<std::size_t>(layout_.d + 1));
+            if (query_block == 0)
+            {
+                // Copy the single-block table rather than recompute it: the
+                // two agree by construction (causal_column_mask(key) IS
+                // causal_column_mask(0, 0, key)) and this keeps that fact
+                // load-bearing instead of decorative.
+                table = causal_masks();
+                // Index d is the full-visibility mask. At query block zero no
+                // key block lies below the diagonal so it is never read; it is
+                // present so the table has one shape at every query block.
+                table.push_back(std::vector<double>(
+                    static_cast<std::size_t>(slot_count_), 0.0));
+            }
+            else
+            {
+                for (int j = 0; j < layout_.d; ++j)
+                {
+                    table.push_back(
+                        causal_column_mask(query_block, query_block, j));
+                }
+                // Any key block strictly below the diagonal: all d keys
+                // visible to every query, so the mask is the row weight with
+                // no zeros in it. It is the same for every such block.
+                table.push_back(
+                    causal_column_mask(query_block, query_block - 1, 0));
+            }
+            return causal_block_mask_cache_
+                .emplace(query_block, std::move(table))
+                .first->second;
         }
 
         void Llama3BatchOperator::rope_slots(
@@ -1458,6 +1562,586 @@ namespace heongpu
             }
             return project(out, weights.output, config.q_channels,
                            config.in_channels, "attention.o");
+        }
+
+        // -------------------------------------------------------------------
+        // Token blocking
+        // -------------------------------------------------------------------
+
+        std::vector<BatchActivation> Llama3BatchOperator::softmax_seam_blocked(
+            std::vector<BatchActivation>& scores, int query_block,
+            const Llama3Operator::SoftmaxConfig& softmax,
+            const BatchSoftmaxSeamConfig& seam,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key, Galoiskey<Scheme::CKKS>* boot_key)
+        {
+            const int d = layout_.d;
+            const int step = layout_.k / 2;
+            const int blocks = static_cast<int>(scores.size());
+
+            if (query_block < 0)
+            {
+                throw std::invalid_argument(
+                    "A query block index is non-negative");
+            }
+            if (blocks != query_block + 1)
+            {
+                // Exactly the visible past, no more and no less. Fewer would
+                // be a SoftMax over a truncated row -- a different model, and
+                // one that still returns numbers.
+                throw std::invalid_argument(
+                    "A causal query block sees exactly query_block + 1 key "
+                    "blocks, so that is how many score blocks the seam takes");
+            }
+            for (int q = 0; q < blocks; ++q)
+            {
+                if (scores[q].columns() != d || scores[q].rows != d)
+                {
+                    throw std::invalid_argument(
+                        "Every score block is the square block Algorithm 4 "
+                        "hands back: layout.d rows and layout.d columns");
+                }
+                require_uniform(scores[q], "softmax_seam_blocked");
+                // The parts of EVERY block are added together to form one
+                // denominator, so a drift across blocks is as wrong as a drift
+                // within one, and only this check sees it.
+                if (scores[q].column.front().depth() !=
+                        scores[0].column.front().depth() ||
+                    scores[q].column.front().scale() !=
+                        scores[0].column.front().scale())
+                {
+                    throw std::invalid_argument(
+                        "Every score block of one query block must be at one "
+                        "level and one scale: they share a denominator");
+                }
+            }
+            if (!(softmax.bound > 0.0))
+            {
+                throw std::invalid_argument(
+                    "The SoftMax seam needs the input range [-bound, 0]");
+            }
+            if (!seam.score_shift_rows.empty() &&
+                static_cast<int>(seam.score_shift_rows.size()) != d)
+            {
+                throw std::invalid_argument(
+                    "score_shift_rows holds one shift per query row, so it "
+                    "must have layout.d entries");
+            }
+            if (!seam.score_shift_slots.empty() &&
+                static_cast<int>(seam.score_shift_slots.size()) != slot_count_)
+            {
+                throw std::invalid_argument(
+                    "score_shift_slots is a slot vector and must hold exactly "
+                    "slot_count() entries");
+            }
+            if (seam.refresh_denominator && boot_key == nullptr)
+            {
+                throw std::invalid_argument(
+                    "Refreshing the SoftMax denominator needs the boot Galois "
+                    "key");
+            }
+
+            Range _r_seam("softmax_seam_blocked");
+
+            struct HoistGuard
+            {
+                Llama3BatchOperator* op;
+                bool previous;
+                ~HoistGuard() { op->set_hoisted_crossings(previous); }
+            } guard{this, hoisted_crossings_};
+            set_hoisted_crossings(seam.hoisted_crossings);
+
+            // A query block uses d + 1 distinct masks and every head of that
+            // block reuses the same d + 1, so this is the capacity that gives
+            // a 100% hit rate where the reuse actually is. Capacity for a
+            // whole sequence would be blocks times this and buy nothing: a
+            // query block is visited once.
+            if (seam.causal && seam.cache_masks &&
+                arith_.mask_plain_capacity() <
+                    static_cast<std::size_t>(d + 1))
+            {
+                arith_.set_mask_plain_capacity(
+                    static_cast<std::size_t>(d + 1));
+            }
+
+            // Cross every score block and concatenate. The key axis is the
+            // ciphertext axis, so "concatenate" is literally that -- the
+            // reduction below does not care which block a part came from, and
+            // that is the whole reason token blocking is cheap here.
+            std::vector<Ciphertext<Scheme::CKKS>> slots;
+            slots.reserve(static_cast<std::size_t>(blocks) *
+                          static_cast<std::size_t>(d));
+            {
+                Range _r("softmax_seam_blocked.to_slots");
+                for (int q = 0; q < blocks; ++q)
+                {
+                    std::vector<Ciphertext<Scheme::CKKS>> part =
+                        to_slots(scores[q], galois_key);
+                    for (auto& c : part)
+                    {
+                        slots.push_back(std::move(c));
+                    }
+                }
+            }
+
+            const double exp_domain =
+                seam.scores_carry_exp_domain ? exp_domain_scale(softmax.bound)
+                                             : 1.0;
+            if (!seam.score_shift_slots.empty())
+            {
+                std::vector<double> flat = seam.score_shift_slots;
+                for (auto& entry : flat)
+                {
+                    entry *= -exp_domain;
+                }
+                arith_.add_vector(slots, flat);
+            }
+            else if (!seam.score_shift_rows.empty())
+            {
+                std::vector<double> flat(slot_count_, 0.0);
+                for (int u = 0; u < d; ++u)
+                {
+                    const double value = -seam.score_shift_rows[u] * exp_domain;
+                    for (int b = 0; b < step; ++b)
+                    {
+                        flat[b + u * step] = value;
+                    }
+                }
+                arith_.add_vector(slots, flat);
+            }
+            else if (seam.score_shift != 0.0)
+            {
+                for (auto& column : slots)
+                {
+                    arith_.add_constant(column, -seam.score_shift * exp_domain);
+                }
+            }
+
+            Llama3Operator::SoftmaxConfig config = softmax;
+            // Unchanged from the single-block seam, and that is the point: a
+            // longer key axis is more PARTS, not a different layout. count
+            // stays one, sum_strided's loop stays dead, and the denominator
+            // over blocks*d keys costs exactly the zero rotations it cost over
+            // d of them.
+            config.strided = true;
+            config.stride = slot_count_;
+            config.count = 1;
+            config.pre_scaled_input = seam.scores_carry_exp_domain;
+            config.fold_affine_into_mask =
+                seam.fold_affine_into_mask && seam.causal;
+            config.refresh_denominator = seam.refresh_denominator;
+
+            std::vector<std::vector<double>> masks;
+            std::vector<int> mask_ids;
+            if (seam.causal)
+            {
+                // COST, stated rather than discovered: this materialises
+                // blocks*d slot vectors on the HOST, blocks*d*slot_count*8
+                // bytes -- 134 MB at 64 blocks and the 8B ring. It is built
+                // once per query block and shared by every head. The device
+                // side, blocks*d resident ciphertexts, is the binding one.
+                const std::vector<std::vector<double>>& table =
+                    causal_masks_blocked(query_block);
+                masks.reserve(static_cast<std::size_t>(blocks) *
+                              static_cast<std::size_t>(d));
+                mask_ids.reserve(masks.capacity());
+                for (int q = 0; q < blocks; ++q)
+                {
+                    const bool diagonal = q == query_block;
+                    for (int j = 0; j < d; ++j)
+                    {
+                        masks.push_back(
+                            table[static_cast<std::size_t>(diagonal ? j : d)]);
+                        mask_ids.push_back(
+                            seam.cache_masks ? causal_mask_id(query_block, q, j)
+                                             : -1);
+                    }
+                }
+            }
+
+            std::vector<Ciphertext<Scheme::CKKS>> probabilities;
+            {
+                Range _r("softmax_seam_blocked.softmax");
+                probabilities =
+                    arith_.softmax(slots, config, masks, mask_ids, galois_key,
+                                   relin_key, boot_key);
+            }
+            slots.clear();
+            masks.clear();
+            masks.shrink_to_fit();
+
+            Range _r("softmax_seam_blocked.from_slots");
+            std::vector<BatchActivation> out;
+            out.reserve(static_cast<std::size_t>(blocks));
+            for (int q = 0; q < blocks; ++q)
+            {
+                std::vector<Ciphertext<Scheme::CKKS>> part;
+                part.reserve(static_cast<std::size_t>(d));
+                for (int j = 0; j < d; ++j)
+                {
+                    part.push_back(std::move(
+                        probabilities[static_cast<std::size_t>(q * d + j)]));
+                }
+                out.push_back(from_slots(part, d, galois_key));
+            }
+            return out;
+        }
+
+        Llama3BatchOperator::SequenceProductCount
+        Llama3BatchOperator::sequence_product_count(
+            int blocks, const BatchAttentionConfig& config) const
+        {
+            if (blocks < 1)
+            {
+                throw std::invalid_argument(
+                    "A sequence has at least one token block");
+            }
+            const int d = layout_.d;
+            const int heads = config.heads < 1 ? 1 : config.heads;
+            const int kv_heads =
+                config.kv_heads > 0 ? config.kv_heads : heads;
+            const int per_head =
+                heads * d > 0 ? config.q_channels / (heads * d) : 0;
+
+            SequenceProductCount out;
+            // Causality is what makes this triangular. A bidirectional model
+            // would pay blocks^2 here.
+            const long long pairs =
+                static_cast<long long>(blocks) * (blocks + 1) / 2;
+            out.score = pairs * heads * per_head;
+            out.value = out.score;
+            // Every score block crosses down and every probability block
+            // crosses back, d columns apiece.
+            out.bridged_columns = 2LL * pairs * heads * d;
+            if (config.rope)
+            {
+                // Q and K, down and back, once per token block.
+                out.bridged_columns +=
+                    2LL * blocks *
+                    (static_cast<long long>(config.q_channels) +
+                     static_cast<long long>(config.kv_channels));
+            }
+            (void) kv_heads;
+            // The deepest query block holds its whole visible past in slot
+            // form at once, and the SoftMax squares it.
+            out.peak_slot_columns = static_cast<long long>(blocks) * d;
+            return out;
+        }
+
+        std::vector<BatchActivation> Llama3BatchOperator::attention_sequence(
+            std::vector<BatchActivation>& x,
+            const BatchAttentionWeights& weights,
+            const BatchAttentionConfig& config,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key, Galoiskey<Scheme::CKKS>* boot_key)
+        {
+            const int d = layout_.d;
+            const int heads = config.heads;
+            const int kv_heads =
+                config.kv_heads > 0 ? config.kv_heads : config.heads;
+            const int blocks = static_cast<int>(x.size());
+
+            if (blocks < 1)
+            {
+                throw std::invalid_argument(
+                    "A sequence has at least one token block");
+            }
+            if (heads < 1 || kv_heads < 1 || heads % kv_heads != 0)
+            {
+                throw std::invalid_argument(
+                    "Grouped-query attention needs kv_heads to divide heads");
+            }
+            if (config.q_channels % (heads * d) != 0 ||
+                config.kv_channels % (kv_heads * d) != 0)
+            {
+                throw std::invalid_argument(
+                    "Every head must own a whole number of layout.d channel "
+                    "blocks, because Algorithm 4's operands are square at d");
+            }
+            const int per_head = config.q_channels / (heads * d);
+            if (config.kv_channels / (kv_heads * d) != per_head)
+            {
+                throw std::invalid_argument(
+                    "The key and value heads must be as wide as the query "
+                    "heads; only their number may differ");
+            }
+            if (!config.causal && blocks > 1)
+            {
+                // Non-causal blocking would need the key blocks ABOVE the
+                // diagonal too, which is a different schedule and a different
+                // mask table. Refusing is the honest answer; silently running
+                // the causal schedule would return a plausible wrong model.
+                throw std::invalid_argument(
+                    "Token blocking here is causal: a bidirectional sequence "
+                    "needs the full blocks^2 schedule, which this does not "
+                    "implement");
+            }
+            for (int t = 0; t < blocks; ++t)
+            {
+                if (x[t].rows != d)
+                {
+                    throw std::invalid_argument(
+                        "Every token block has exactly layout.d rows");
+                }
+                if (x[t].columns() != config.in_channels)
+                {
+                    throw std::invalid_argument(
+                        "Every token block carries config.in_channels "
+                        "columns");
+                }
+                require_uniform(x[t], "attention_sequence");
+                if (x[t].column.front().depth() !=
+                        x[0].column.front().depth() ||
+                    x[t].column.front().scale() != x[0].column.front().scale())
+                {
+                    throw std::invalid_argument(
+                        "Every token block of a sequence must enter at one "
+                        "level and one scale");
+                }
+            }
+
+            Range _r_attention("attention_sequence");
+
+            const double head_scale =
+                config.head_scale != 0.0
+                    ? config.head_scale
+                    : 1.0 / std::sqrt(static_cast<double>(per_head * d));
+            const double exp_domain =
+                config.seam.scores_carry_exp_domain
+                    ? exp_domain_scale(config.softmax.bound)
+                    : 1.0;
+
+            std::vector<double> query_weight = weights.query;
+            for (auto& w : query_weight)
+            {
+                w *= head_scale * exp_domain;
+            }
+
+            const int group = heads / kv_heads;
+
+            // K and V for the WHOLE sequence have to be resident: query block
+            // p reads every one of them at or below itself, and there is no
+            // KV cache on this path to hold them anywhere else. Q is formed
+            // per query block instead, because Q_p is read by query block p
+            // and by nothing else -- that is a third of the projection working
+            // set for free.
+            std::vector<BatchActivation> k(static_cast<std::size_t>(blocks));
+            std::vector<BatchActivation> v(static_cast<std::size_t>(blocks));
+            {
+                Range _r_kv("attention_sequence.kv");
+                for (int t = 0; t < blocks; ++t)
+                {
+                    k[t] = project(x[t], weights.key, config.in_channels,
+                                   config.kv_channels, "attention_seq.k");
+                    v[t] = project(x[t], weights.value, config.in_channels,
+                                   config.kv_channels, "attention_seq.v");
+                    if (config.rope)
+                    {
+                        // The sequence is ONE sequence: block t starts at
+                        // t*d. Restarting the angle per block would give
+                        // blocks independent 128-token sequences that happen
+                        // to attend to each other.
+                        Range _r_rope("attention_seq.rope_k");
+                        std::vector<Ciphertext<Scheme::CKKS>> ks =
+                            to_slots(k[t], galois_key);
+                        rope_slots(ks, per_head * d, config.rope_theta,
+                                   config.rope_position_offset + t * d);
+                        k[t] = from_slots(ks, d, galois_key);
+                    }
+                }
+            }
+
+            // Whether each (token block, kv channel block) has already paid
+            // Algorithm 4's step-1 transpose. V is transposed once per
+            // distinct block and every head of every query block above it then
+            // reads the same row-wise copy -- so the m^2 schedule does NOT
+            // multiply the transposes.
+            std::vector<std::vector<bool>> value_is_row_wise(
+                static_cast<std::size_t>(blocks),
+                std::vector<bool>(
+                    static_cast<std::size_t>(std::max(config.kv_channels, 0)),
+                    false));
+
+            BatchSoftmaxSeamConfig seam = config.seam;
+            seam.causal = config.causal;
+            if (seam.score_shift == 0.0 && seam.score_shift_rows.empty() &&
+                seam.score_shift_slots.empty())
+            {
+                seam.score_shift = config.score_shift;
+            }
+
+            std::vector<BatchActivation> out;
+            out.reserve(static_cast<std::size_t>(blocks));
+
+            for (int p = 0; p < blocks; ++p)
+            {
+                Range _r_block("attention_sequence.query_block");
+
+                BatchActivation q =
+                    project(x[p], query_weight, config.in_channels,
+                            config.q_channels, "attention_seq.q");
+                if (config.rope)
+                {
+                    Range _r_rope("attention_seq.rope_q");
+                    std::vector<Ciphertext<Scheme::CKKS>> qs =
+                        to_slots(q, galois_key);
+                    rope_slots(qs, per_head * d, config.rope_theta,
+                               config.rope_position_offset + p * d);
+                    q = from_slots(qs, d, galois_key);
+                }
+
+                BatchActivation block_out;
+                block_out.rows = d;
+                block_out.column.reserve(
+                    static_cast<std::size_t>(config.q_channels));
+
+                for (int h = 0; h < heads; ++h)
+                {
+                    const int q_base = h * per_head * d;
+                    const int kv_base = (h / group) * per_head * d;
+
+                    // One square score block per visible key block.
+                    std::vector<BatchActivation> scores;
+                    scores.reserve(static_cast<std::size_t>(p + 1));
+                    {
+                        Range _r("attention_seq.scores");
+                        for (int qb = 0; qb <= p; ++qb)
+                        {
+                            std::vector<Ciphertext<Scheme::CKKS>> block;
+                            for (int t = 0; t < per_head; ++t)
+                            {
+                                std::vector<Ciphertext<Scheme::CKKS>*> lhs, rhs;
+                                for (int j = 0; j < d; ++j)
+                                {
+                                    lhs.push_back(
+                                        &q.column[q_base + t * d + j]);
+                                    rhs.push_back(
+                                        &k[qb].column[kv_base + t * d + j]);
+                                }
+                                // K's column-wise encryption IS the row-wise
+                                // encryption of K^T, so this is Q K_qb^T with
+                                // no transpose at all -- exactly as in the
+                                // single-block sublayer.
+                                std::vector<Ciphertext<Scheme::CKKS>> term =
+                                    product(lhs, rhs, "attention_seq.score",
+                                            galois_key, relin_key,
+                                            HEBatchMatrixOperator<Scheme::CKKS>::
+                                                RightOperandForm::row_wise);
+                                if (block.empty())
+                                {
+                                    block = std::move(term);
+                                }
+                                else
+                                {
+                                    for (int j = 0; j < d; ++j)
+                                    {
+                                        arith_.add_inplace(block[j], term[j]);
+                                    }
+                                }
+                            }
+                            BatchActivation s;
+                            s.rows = d;
+                            s.column = std::move(block);
+                            scores.push_back(std::move(s));
+                        }
+                    }
+
+                    // ONE SoftMax over the whole visible row, not p + 1 of
+                    // them. The denominator sums across every part of every
+                    // block, which is what makes this the SoftMax of a
+                    // (p+1)*d-long row rather than of p + 1 short ones.
+                    std::vector<BatchActivation> probability =
+                        softmax_seam_blocked(scores, p, config.softmax, seam,
+                                             galois_key, relin_key, boot_key);
+                    scores.clear();
+
+                    {
+                        Range _r("attention_seq.value_product");
+                        const int depth =
+                            probability.front().column.front().depth();
+                        for (int t = 0; t < per_head; ++t)
+                        {
+                            std::vector<Ciphertext<Scheme::CKKS>> acc;
+                            for (int qb = 0; qb <= p; ++qb)
+                            {
+                                const int base = kv_base + t * d;
+
+                                for (int j = 0; j < d; ++j)
+                                {
+                                    arith_.drop_to_depth(
+                                        v[qb].column[base + j], depth);
+                                }
+                                if (!value_is_row_wise[static_cast<std::size_t>(
+                                        qb)][static_cast<std::size_t>(base)])
+                                {
+                                    Range _r_t("attention_seq.transpose_value");
+                                    std::vector<Ciphertext<Scheme::CKKS>> vb;
+                                    vb.reserve(static_cast<std::size_t>(d));
+                                    for (int j = 0; j < d; ++j)
+                                    {
+                                        vb.push_back(
+                                            std::move(v[qb].column[base + j]));
+                                    }
+                                    matrix_.cmt(vb, galois_key, arith_);
+                                    for (int j = 0; j < d; ++j)
+                                    {
+                                        v[qb].column[base + j] =
+                                            std::move(vb[j]);
+                                    }
+                                    value_is_row_wise[static_cast<std::size_t>(
+                                        qb)][static_cast<std::size_t>(base)] =
+                                        true;
+                                }
+
+                                std::vector<Ciphertext<Scheme::CKKS>*> lhs, rhs;
+                                for (int j = 0; j < d; ++j)
+                                {
+                                    lhs.push_back(&probability[qb].column[j]);
+                                    rhs.push_back(&v[qb].column[base + j]);
+                                }
+                                std::vector<Ciphertext<Scheme::CKKS>> term =
+                                    product(lhs, rhs, "attention_seq.value",
+                                            galois_key, relin_key,
+                                            HEBatchMatrixOperator<Scheme::CKKS>::
+                                                RightOperandForm::row_wise);
+                                if (acc.empty())
+                                {
+                                    acc = std::move(term);
+                                }
+                                else
+                                {
+                                    // Attention over a blocked key axis is a
+                                    // sum over the blocks, and every term is
+                                    // at one level and one scale, so the
+                                    // accumulation costs no depth.
+                                    for (int j = 0; j < d; ++j)
+                                    {
+                                        arith_.add_inplace(acc[j], term[j]);
+                                    }
+                                }
+                            }
+                            for (auto& c : acc)
+                            {
+                                block_out.column.push_back(std::move(c));
+                            }
+                        }
+                    }
+                }
+
+                if (weights.output.empty())
+                {
+                    out.push_back(std::move(block_out));
+                }
+                else
+                {
+                    out.push_back(project(block_out, weights.output,
+                                          config.q_channels,
+                                          config.in_channels,
+                                          "attention_seq.o"));
+                }
+            }
+
+            return out;
         }
 
         // -------------------------------------------------------------------
