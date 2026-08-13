@@ -2053,3 +2053,196 @@ four limbs. Smaller primes cannot add limbs because the prime size IS the
 scale. A 2^14 island can, is secure, and does not fit an 80 GiB card by about
 16 GiB. **The blocker moved from modulus to key memory, and that is a
 different machine, not a different parameter.**
+
+---
+
+## 20. The batch-16 Algorithm-1 PCMM: the layout is forced, and the plaintext leaves the subring (2026-08-13)
+
+Branch `HEonGPU_LLama3_8B_batch16`. Sixteen independent inputs ride the batch
+axis that §5 and §6 spend on contracting **one** input, so the projection can go
+back to Algorithm 1 — no rotations, no key switching, no rotation keys.
+Established by a 13-agent workflow (6 readers, 3 designers, 3 adversarial
+verifiers, 1 synthesis) at `4c4ce17`; 8 of 23 claims were refuted and are
+recorded as corrections in §20.6 rather than repeated.
+
+### 20.1 There is exactly one legal configuration
+
+`batch = k/2` and `k = N/d` (`batchmatrix.cu:200-204`), so `batch = 16` forces
+`N = 32d`. Two more constraints close it:
+
+| constraint | source | gives |
+|---|---|---|
+| `q_channels % (heads*d) == 0`, equal q/kv quotients | `llama3_batch.cu:814-827` | `d` divides `head_dim = 128`, so `d <= 128` |
+| `MIN_POLY_DEGREE 4096` | `defines.h:15` | `N >= 4096`, so `d >= 128` |
+
+**`N = 4096`, `d = 128`, `k = 32`, `batch = 16`, `per_head = 1`.** logN 13 is
+*not* available at batch 16: `d = 256` would make a head smaller than one
+Algorithm-4 block and `attention()` throws.
+
+- **`d` is the sequence length: 128 tokens, and there is no KV cache on this
+  path.** `rows == layout.d` is enforced at `batchmatrix.cu:309-311`,
+  `llama3_batch.cu:535-540`, and by `causal_column_mask` running `u` over
+  `0..d-1`. Llama-3-8B's context is 8192, so this is 1/64 of it. This is the
+  structural price of `batch = 16` and it is not tunable.
+- **Model width is free.** Channels are ciphertexts; 4096 / 1024 / 14336 all
+  divide 128, so there is no padding. Slot occupancy is exactly 100%:
+  `d * batch = 2048 = N/2`.
+- **Security is `none` with nowhere to go.** The 128-bit cap at `N = 4096` is
+  109 bits of log PQ; an `L = 70` chain is 3240 — **29.7x over**. Unlike the
+  rect path this one cannot change ring without breaking `d | head_dim`.
+
+### 20.2 The encoding, in and out
+
+An activation is a `d x C` matrix over `R_k` held as **`C` ciphertexts, one per
+channel**, in the coefficient domain. For token `u`, channel `j`, instance `b`:
+ciphertext `j`, coefficients at ring index `u + 128t` for `t = 0..31`
+(`batchmatrix.cu:324`), with
+
+    coeff_{u+128t}(ct_j)
+        = round( scale * (2/k) * sum_{b<16} Re( X_b[u][j] * conj(zeta^{5^b t}) ) )
+
+and `zeta = exp(i*pi/32)`. **No single coefficient is a
+`(token, channel, instance)` value** — the instance index is an *evaluation
+point* of the `R_k` entry, spread over all 32 coefficients of the stride-128
+run.
+
+`pcmm`'s output is structurally identical to its input, so projections chain
+with no conversion. The reason is that `bm_gemm_kernel` is **pointwise in the
+subring index `s`** — `C[i][j][s] = sum_t A[i][t][s] * P[t][j][s]`
+(`kernel/batchmatrix.cu:379-395`) — and `s` is the batch axis, so the batch is a
+pure passthrough. This is the asymmetry Algorithm 5 has and Algorithm 1 does
+not: §5's `BlockAxis` exists precisely because the rectangular product consumes
+the batch axis and returns the Y axis.
+
+**Weights are stored transposed** (`in_channels x out_channels`, row-major) and
+encoded at `rescale_prime(x)`, not at the nominal scale. A wrong scale here
+fails **silently**: `add`/`add_plain` check depth, encoding and buffer size and
+**never `scale_`** (`operator.cu:284-318`).
+
+### 20.3 The seam to `Q K^T` — both CMTs on K are redundant
+
+`cmt` is the **identity on `R_k`**: the automorphisms are `X -> X^(2kt+1)` and
+`X^(d(2kt+1)) = X^(2Nt+d) = Y`, so `Y` is fixed pointwise and no batch slot can
+move; it is the per-slot index transpose, an involution. `ccmm`'s body after
+step 1 computes `A * Mat(bcmt)^T`, because the four step-2 GEMMs are launched
+with **operands swapped** and `b_row_stride=1, b_col_stride=d`
+(`batchmatrix.cu:1561-1572`), and `fold`'s trailing `cmt` transposes back.
+
+So the explicit `cmt(K)` at `llama3_batch.cu:855-869` and `ccmm`'s internal
+step-1 CMT at `:1493-1500` **compose to the identity**, and a `ccmm` variant
+that elides step 1 computes `Q K^T` with no CMT at all. Per sublayer that
+deletes 5,080 rotations and takes the score product from **17,304 to 12,224**
+key switches (-29.4%).
+
+**But it is at most 2.0% of the sublayer**, once `softmax()`'s own
+relinearisations are counted. Do it for the **4.375 GiB** of resident `key_t`,
+the **17.5 GiB** of `bcmt` deep-copy traffic, and for halving the CMT noise
+terms multiplied into the score. Two guards must come with it: `cmt` reaches
+`rotate_rows`, which is the **only** inspection of the right operand's
+`rescale_required_` / `relinearization_required_` in all of `ccmm`. **Keep plain
+`ccmm` for `P V`** — that product genuinely wants `V` column-wise as the
+projection left it.
+
+### 20.4 Ledger: X enters attention to SoftMax input ready
+
+Per head, `per_head = 1`:
+
+| step | encoding | levels | key switches |
+|---|---|---|---|
+| `project` q/k/v (Algorithm 1) | matrix -> matrix | 1 (shared) | **0** |
+| `S = Q K^T` (`ccmm`, step 1 elided) | matrix -> matrix | 1 | 382 |
+| `to_slots(S)` over `d = 128` columns | **matrix -> slot** | 1 | 2,816 |
+| `add_constant(-score_shift)` | slot | 0 | 0 |
+| **total** | | **3** | **3,198** |
+
+**Per sublayer 102,336 key switches, of which `to_slots` is 87.2%.** The
+crossing is the budget; the products are not. Crossing cost per column at
+`d = 128`: `baby_steps()` returns `n1 = 16, n2 = 8`, so **22 key switches**
+(not 127), 128 plaintext multiplies, 8 rescales, **1 level**, **0 new Galois
+keys**. The diagonal encode is paid **once per sublayer**, not 32 times —
+`bridge_plain_` is keyed on `(direction, depth)` and all 32 heads reach
+`to_slots` at one depth.
+
+**The SoftMax reduction is free.** `S` has the key on the ciphertext axis, so
+`count = 1` makes `sum_strided`'s `for (t = 1; t < count; t <<= 1)` run zero
+iterations and `strided_rotation_indices` return empty. The landing layout is
+
+> slot `b + 16u` of `to_slots` output ciphertext `j` holds entry `(u, j)` of
+> instance `b` — instance fast (stride 1, 16 wide), token slow (stride 16, 128
+> wide), key across ciphertexts. `16 * 128 = 2048 = N/2`.
+
+### 20.5 The plaintext does not belong in the subring at all
+
+**A weight that does not vary across the batch is a CONSTANT in `R_k`.**
+Definition 1 puts the batch index in the *evaluation* domain, and the constant
+polynomial is the unique preimage of a constant vector — so a Llama weight
+encodes to a **delta at `Y^0`**. Confirmed at `k = 8/16/32/64`: `r[0] = 1.0` to
+the bit, `max|r[t>0]| = 1.8e-16`.
+
+`encode_shared_plaintext_matrix` therefore takes the real matrix directly, and
+`pcmm` dispatches to a scalar route that drops the four subring transform passes
+with it. The two routes are the same arithmetic: the subring transform is
+`Z_p`-linear and the plaintext is a scalar, so
+`T^-1(sum_t T(a_t) v_t) = sum_t v_t a_t` holds **identically in `Z_p`**, which
+the test asserts on raw device words rather than through a tolerance.
+
+Arithmetic at `N=4096, L=70, C_in=4096, cols=128` (**not yet measured**):
+
+| | general | shared |
+|---|---|---|
+| host encode per block | 111.7 G | 7.0 G complex MACs |
+| H2D per column block | 128.0 MiB | **4.0 MiB** |
+| `plain_` | 8.750 GiB | **0.273 GiB** |
+| `A0`+`A1`, `C0`+`C1` | 18.047 GiB | **0** |
+| one-block peak | 44.84 GiB | **18.32 GiB** (-59.1%) |
+
+**It is NOT bit-identical to the general encoder, and the fast path is the more
+accurate side.** `BatchMatrixEncoder::encode` sums `k/2` double products per
+coefficient and leaves a ~1.8e-16 relative residue at powers that should be
+zero; `llround` kills it below `scale*|w| = 2^51.5` and not above — and
+`project` encodes at `rescale_prime`, a **40-to-60-bit prime**. So there is a
+regime where the general encoder puts hundreds of integer units of pure error on
+powers of `Y` carrying no information. An equality regression against it must
+not be written.
+
+The general path is untouched and every other `pcmm` caller still reaches it
+through `encode_plaintext_matrix`, so **the rect/nobatch baselines are
+unaffected**. `rectangular_pcmm` rejects the shared form outright: it reads
+`[limb][row][col][k]` where the shared buffer is `[limb][row][col]`, and
+Algorithm 5 contracts over exactly the axis a batch-invariant weight lacks.
+
+### 20.6 Corrections — claims that failed adversarial verification
+
+- **"`pcmm` costs zero levels."** True of the routine, false of the operation:
+  it marks a rescale that `project` spends. **A projection costs 1 level.** Zero
+  *key material* is exactly true.
+- **"`column_block` must be passed explicitly."** It already defaults to 128
+  (`llama3_batch.cu:578-581`). What is missing is *contraction* (row) blocking —
+  and after §20.5 that is much less urgent, because the peak it was sized
+  against was dominated by `A0/A1` and `plain_`.
+- **"The score product loses 254 of 636 key switches per head."** MHA-only. K is
+  transposed once per **KV block** (8 of them) and shared across
+  `heads/kv_heads = 4` query heads: the explicit CMT is **1,016** rotations, not
+  4,064.
+- **"At fixed `d`, per-instance crossing cost improves with `N`."** Only the
+  key-switch *count* falls (as `1/N`); per-rotation *work* scales with `N`, so
+  per-instance cost is **flat**.
+- **"`Llama3RectOperator::bootstrap(BatchActivation&, ...)` already exists."**
+  False — that overload takes a `Ciphertext` (`llama3_rect.cuh:464`).
+- Two stale comments in `llama3_batch`: `llama3_batch.cuh:212-213` still says
+  `to_slots` costs `d - 1` rotations (it is `n1+n2-2 = 22` since BSGS), and
+  `llama3_batch.cu:511` claims the rounding keeps `n1 <= n2` (at `d = 128` it
+  returns `n1 = 16, n2 = 8`).
+
+### 20.7 Open, with the experiment that closes each
+
+1. **Does bootstrapping carry a matrix encryption on the batch path?** Nothing
+   has measured it and there is no refresh in `llama3_batch.cu`
+   (`llama3_batch.cuh:511-516`). This gates any stack, not just this branch.
+2. **Does the step-1-elided `ccmm` produce `A B^T` on hardware?** Proved from
+   source, unexercised in the tree, and the failure mode is silent garbage.
+   Assert against host `Q K^T` **and** that it does *not* match `Q K`.
+3. **Does `k = 32` work at all?** The CMT and CCMM sweeps top out at `k = 64`;
+   `k = 32` is unexercised everywhere.
+4. **Every cost figure in §20.5 is arithmetic, not measurement.** No profile of
+   this branch exists yet.
