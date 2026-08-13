@@ -3256,3 +3256,246 @@ at 6.9e-01 absolute and is ordinary at 1.8e-02 relative: a fit's error grows
 with the range it is fitted over, and a wider model gives a wider range. A
 fixed absolute threshold reads a correct circuit as broken the moment the
 width moves.
+
+## 24. Batch 16 with security on: the batch size IS the ring, and a ring crossing costs 1/22 of an encoding crossing (2026-08-13)
+
+Worked out on `HEonGPU_LLama3_8B_batch16_ringswitch`, forked from
+`HEonGPU_LLama3_8B_batch16` @ `c9482fa`. Seven new tests, all green on Sicily
+GPU 2. Figures are marked **measured** (this branch, this GPU), **counted**
+(exact, read off the source) or **derived** (arithmetic, unvalidated).
+
+§19-§23 priced this path with `sec_level_type::none`. This prices it with the
+cap on.
+
+### 24.1 The batch axis is not a cost parameter. It is the security parameter.
+
+`d` is pinned to `head_dim = 128` by Algorithm 4 (`llama3_batch.cu:1211-1224`
+needs `q_channels % (heads*d) == 0`, so `d | 128`), and `k = N/d`,
+`batch = k/2`. Those three together say
+
+    N = 2 * batch * d = 256 * batch,    and d = N/k = 128 at every batch.
+
+So **choosing the batch size chooses the ring**, and the ring chooses the
+128-bit cap. There is no other knob: `MIN_POLY_DEGREE 4096` and
+`MAX_POLY_DEGREE 65536` (`kernel/defines.h:14-15`) make the batch axis a
+five-valued enum, and every value is a different security level.
+
+| batch | k | N | logN | `heongpu_128bit_std_parms(N)` | Q primes at `q0=41`, 33-bit steps, one 33-bit special | usable levels |
+|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 32 | 4096 | 12 | 109 | **2** | **1** |
+| 32 | 64 | 8192 | 13 | 218 | 5 | 4 |
+| 64 | 128 | 16384 | 14 | 438 | 12 | 11 |
+| 128 | 256 | 32768 | 15 | 881 | 25 | 24 |
+| 256 | 512 | 65536 | 16 | 1761 | 52 | 51 |
+
+(counted; `log QP = 33L + 41` against the cap. 33-bit primes and `q0 = 41` are
+forced from below by bootstrap v2 — §15.4 — and `MIN_USER_DEFINED_MOD_BIT_COUNT
+= 30` blocks anything smaller on the generated path.)
+
+**Batch 16 is the smallest batch this encoding admits at all**, and it is the
+only one with no room. Everything in §19-§23 — including "batch 16 is cheaper
+per input than the rect path" — was measured at `log QP ~ 2,500` against a cap
+of 109, i.e. **~23x outside 128-bit**.
+
+**Per-input cost is flat in the batch size, so the security is free.** A
+ciphertext is `16·L·N` bytes and holds `N/2` values, so it is **`32·L` bytes
+per value at every ring**; likewise every elementary operation on the residual
+stream is `O(values · L)` however those values are packed. Raising the batch
+therefore costs **working set**, not throughput:
+
+| batch | residual stream at 20 limbs | ciphertexts at the island | at a logN 16 big ring |
+|---:|---:|---:|---:|
+| 16 | 5.4 GB | 4096 | 256 |
+| 32 | 10.7 GB | 4096 | 512 |
+| 64 | 21.5 GB | 4096 | 1024 |
+| 128 | 43.0 GB | 4096 | 2048 |
+| 256 | 85.9 GB | 4096 | 4096 |
+
+So "is B = 16 cheaper than B = 1" is the wrong question. **B is free; take the
+largest B whose working set fits** — batch 64 on a 48 GiB A6000, batch 128 on
+an 80 GiB A100 — and batch 16 is the one setting with a reason not to pick it.
+
+### 24.2 The descent theorem, and why the crossing must be taken in matrix form
+
+**A matrix encryption at layout `(N, d, k)` descends under `switch_down(m)` to
+`m` matrix encryptions at `(N/m, d/m, k)` — the same `k`, hence the same batch
+— and small ciphertext `r` holds the rows `i = r (mod m)` at small row `i/m`.**
+
+Definition 2 puts entry `(i,j)` coordinate `t` at coefficient `i + d*t`, and
+`switch_down` sends coefficient `p` to position `p/m` of ciphertext `p mod m`.
+With `m | d` and `i = m*i' + r`,
+
+    p = i + d*t = m*(i' + (d/m)*t) + r
+
+so `p mod m = i mod m` and `p/m = i' + (d/m)*t`, which is Definition 2 again at
+`(N/m, d/m, k)`. **The subring index `t` is never touched, so the batch axis
+crosses the ring intact.**
+
+**Measured** (`test/test_ckks_batch_ringswitch.cpp`): worst error **2.69e-07**
+at the real island shape (`N` 8192 -> 4096, `d` 256 -> 128, `k` 32, batch 16),
+and **6.45e-07** at `m = 4`. Asserted against the ENCODER, not against a second
+crossing — two ring-switch paths sharing a convention error would cancel — and
+separately that the split is **interleaved, not contiguous**, which symmetric
+random data cannot distinguish.
+
+**A slot-form ciphertext does not descend.** `compose_up` of `m` slot-form
+ciphertexts gives big slot `s` equal to `sum_j zeta^{j*5^s} *` (small slot `s`
+of ciphertext `j`) — an `m`-point twiddled mixture. That mixture alone would be
+cheap to invert, `m` diagonals; but it couples the big slots
+`{s + (n_small/2)*c}` while the layout wants `{b + (k/2)(m*u' + r)}`, and those
+two index sets are a **digit transposition** of one another — a stride
+permutation, hence a dense linear map, not `2*sqrt(m)` rotations. **Crossing
+rings in slot form is dead.** The crossing is a matrix-form operation, and that
+is a placement constraint rather than a cost.
+
+### 24.3 What is actually pinned to the island
+
+Only **Algorithm 4**. Its operands are square at `d`, and `d = N/k = 128` only
+at the island ring; at a ring `m` times bigger with the same `k`, `d` is `128m`
+and `attention()` throws.
+
+Everything else may sit at either ring:
+
+* **Algorithm 1 is not pinned.** It contracts over CHANNELS, which are the
+  ciphertext axis, while the crossing decimates ROWS, which are the token axis
+  — disjoint axes, so they commute. **Measured: 6.57e-10** between "project at
+  the big ring then descend" and "descend then project at the island", and
+  3.44e-10 against a host reference. Checked both ways round, because a host
+  reference alone cannot tell "both right" from "both wrong alike".
+* **The bridge is not pinned.** `to_slots`/`from_slots` is built for any
+  `(N, d, k)`; at the big ring it is `d_big = 128m` diagonals instead of 128.
+* **The non-linear layers are not pinned.** They are slot-wise (§22).
+
+### 24.4 A ring crossing costs 1/22 of an encoding crossing
+
+Take one full crossing of the residual stream, `V` values wide.
+
+| crossing | ciphertexts | key switches each | ring | levels | total KS-work |
+|---|---:|---:|---|---:|---|
+| `to_slots`/`from_slots` at the island | `2V/N` | **22** (BSGS `n1+n2-2` at `d=128`) | `N` | 1 | `22 * 2V * L` |
+| `switch_down`/`compose_up` | `2V/(mN)` | **1** | `mN` | **0** | `2V * L` |
+
+The `m` cancels: a ring crossing moves `m` island ciphertexts with one key
+switch at a ring `m` times bigger. **The ring crossing is 22x cheaper than the
+encoding crossing, at every `m` this family admits**, plus the coefficient move
+(~20% of a switch, §13 measured), so call it 18x. It also costs **zero levels**
+and needs **no new Galois key** — two Switchkeys of the big context, for the
+whole model.
+
+**Measured, this branch:** the crossing costs zero levels in both directions,
+and a rescale taken inside the island lands the big ring exactly one level down
+(`CrossingIsLevelFreeAndTheIslandSpendsShared`, 3.30e-04). **Measured:** a whole
+Algorithm 4 run at the island composes back up into the big-ring matrix
+product, worst error **1.88e-03** at `d = 64`, operand scales 2^35/2^25.
+
+So: **yes, ring switching is cheap here — cheaper than on the rect path.** The
+batch encoding's Galois set is `d - 1 = 127` shifts however wide the model is
+(`llama3_batch.cu:147-161`) and Algorithm 1 needs none, so unlike §7bis the
+island is **not** a key-memory refuge. It is a pure level-budget device, and
+the crossing that gets you there is the cheapest boundary in the flow.
+
+### 24.5 The placement, and the level ledger that decides it
+
+The split point is **not** "non-linear up, products down". It is "**whatever
+does not fit in the island's level budget goes up**" — and the bootstrap is on
+that list at every batch in this family, because the island chain never reaches
+the ~39 limbs a refresh needs, not even at batch 128.
+
+    big ring, matrix form, full level
+      -> bridge to slots (1 big level) -> RMSNorm / SoftMax / SwiGLU -> bridge back
+      -> drop to the shared prefix -> switch_down
+      -> ISLAND: Algorithm 4                    (1 level)
+      -> compose_up -> refresh at the big ring
+
+**Both bridges sit at the big ring on purpose.** A bridge inside the island
+spends an island level, and island levels are the scarce resource; at the big
+ring it costs `sqrt(m)` more work (`2*sqrt(128m)` rotations on `C/m`
+ciphertexts of ring `mN`, against 22 on `C` of ring `N`) but spends a level the
+big ring has to spare.
+
+Which makes the island's EXIT the whole question, and it has an answer now:
+
+> **A regular bootstrap carries a batch matrix encryption.** Measured at the
+> real island shape (`N = 4096, d = 128, k = 32`, batch 16) on the library's
+> own bootstrapping chain: **worst error 3.23e-05, 14.9 bits**, six levels
+> restored, scale preserved at 2^50. `regular_bootstrapping` reads no encoding
+> tag and its net effect on the plaintext polynomial is the identity with the
+> modulus restored; what was NOT obvious is EvalMod, whose bound is on the
+> plaintext COEFFICIENTS while this encoding puts an inverse length-`k` DFT
+> there rather than the values. It holds. This closes the open question §20
+> recorded as "whether bootstrapping carries a matrix encryption at all".
+
+Because the refresh needs no bridge in front of it, the island may exit at one
+limb, and the minimum island chain is **two Q primes and a special**:
+`41 + 33 + 33 = 107 <= 109`. **Batch 16 has a legal 128-bit parameter set, with
+two bits to spare.** Had the refresh wanted slot form, the island would have
+needed three Q primes and a special — 140 bits against 109 — and batch 16 would
+have had no parameter set at all. One measurement decided that.
+
+**What batch 16 pays instead is forced refreshes.** One island level is exactly
+one Algorithm 4 call, so every island visit ends at one limb and must be
+refreshed. An attention sublayer has two Algorithm 4 stages (`QK^T` and `PV`)
+with the SoftMax between them, so batch 16 buys **two forced bootstrap rounds
+per attention sublayer**. Batch 32 (4 island levels) carries a product and a
+bridge in one visit and exits with limbs in hand.
+
+The refresh itself is batch-independent per input, and that is worth stating
+because it is the other half of "the batch is free": one refresh is `2V/(mN)`
+bootstraps at the big ring, which at `d_model = 4096`, 128 tokens and a logN 16
+big ring is **16 bootstraps per input at every batch size** (derived, from
+`32*L` bytes per value). What the batch buys is not fewer refreshes per input;
+it is fewer FORCED ones, by giving the island levels to work with.
+
+### 24.6 What the big ring's extra rows should hold
+
+`d_big = 128m` and the descent decimates that row axis, so the extra capacity
+has to hold something or the big ring runs `m`-fold empty. Two consistent
+choices, not equivalent:
+
+* **Rows = tokens.** The big ring holds a `128m`-token sequence and the descent
+  IS token blocking — which this path has never had (§20: "`d` IS the sequence
+  length: 128 tokens, permanently"). The non-linear layers are untouched: the
+  channel reduction is still a slot-wise add across ciphertexts. Attention
+  across the `m` blocks becomes `m^2` Algorithm 4 products, which is what a
+  longer sequence costs anywhere.
+* **Rows = (token, channel), channel fastest.** `C/m` ciphertexts at a
+  128-token sequence. RMSNorm's channel reduction stops being free — it becomes
+  a `log2(m)`-rotation strided reduction inside each ciphertext.
+
+Take the first if the sequence is long, the second if it is not. Either way the
+descent is the same index identity; only the labelling of `d_big` changes.
+
+### 24.7 Rejected
+
+**Cross in slot form and un-mix at the big ring.** The mixture is `m`-diagonal,
+which looks like `2*sqrt(m)` rotations; the index sets differ by a digit
+transposition, so the map is a stride permutation and dense. §24.2.
+
+**Use the island as a key-memory refuge, as the rect path does.** The batch
+bridge needs `d - 1 = 127` shifts however wide the model is, and Algorithm 1
+needs none. There is no key wall to escape here.
+
+**Get a third Q prime into the batch-16 island.** `3*33 + 41 + 33 = 140 > 109`;
+smaller primes are blocked by `MIN_USER_DEFINED_MOD_BIT_COUNT = 30` on the
+generated path and by bootstrap v2's `q0 = 41` on the shared-prefix path, which
+the small chain must copy verbatim.
+
+**Batch 256 on one card.** The residual stream alone is 86 GB at 20 limbs.
+
+### 24.8 Open
+
+1. **Nothing here is timed.** The seven tests establish algebra, levels and
+   precision; every millisecond in §24.4-§24.5 is arithmetic over one measured
+   ring-switch datapoint (§13). One `nsys` capture of a crossing at the batch
+   shape would settle it.
+2. **The `m^2` attention blocking is not written.** Rows-as-tokens gives token
+   blocking free at the encoding level, but the causal mask over interleaved
+   token classes and the `m^2` product schedule are new code.
+3. **Composite security is the MIN of the two rings** and the secrets are tied
+   (`s_low(X) = s_high(X^k)`), so the island's 109-bit budget caps the system
+   however big the big ring is. And the library's check covers the modulus
+   budget only — every driver here uses a SPARSE secret, which
+   `heongpu_128bit_std_parms` does not model. Say both together.
+4. **14.9 bits is the refresh's ceiling on this chain, not this encoding's.**
+   Whether the matrix encoding costs precision relative to a slot encoding at
+   the same parameters is one A/B run away and was not made.
