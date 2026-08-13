@@ -3214,7 +3214,34 @@ slot form from the coefficient encoding. Under a slot-resident stream Q and K
 are already in slot form when they are formed and RoPE costs its one level
 and nothing else.
 
-### 23.6 Two things the driver had to learn
+### 23.6 The whole block through one call, and the chain it needs
+
+`Llama3Batch16Operator::transformer_block` against the same host reference,
+degree 31, 62 limbs:
+
+| | ms | levels | relative error |
+|---|---:|---:|---:|
+| staged, stage by stage | 20,734 | 59 | 1.887e-02 |
+| `transformer_block` | 20,435 | 59 | 1.887e-02 |
+| `transformer_block`, slot-resident SwiGLU | **19,106** | 59 | 1.887e-02 |
+
+The wrapper reproduces the staged composition to every digit, which is what
+it had to do. Slot residency is **-6.5% on the whole block** — smaller than
+the 2.13x on the sublayer, because the SwiGLU is only part of a block.
+
+**The chain is the binding constraint on turning anything on.** A block at
+degree 31 spends 59 of 61, and RoPE costs three more, so degree 31 + RoPE
+wants a longer chain than 62 limbs and does not run. It does not fail
+politely: `evaluate_poly` derives a kernel grid extent from the levels
+remaining, so an exhausted chain surfaces as **"CUDA Error ... invalid
+configuration argument"** from inside GPU-NTT rather than as anything
+mentioning levels. `llama3.cu` warns about exactly this in
+`evaluate_chebyshev` and its own guard catches the common case; this path
+reaches a different kernel first. Anyone enabling a feature here should raise
+`HEONGPU_B16_LIMBS` first, and read that message as "out of chain".
+
+### 23.7 Two things the driver had to learn
+
 
 **Calibrate the model, not just the fit.** Random weights at this width put
 raw attention scores across a span of hundreds, so the SoftMax was asked to
