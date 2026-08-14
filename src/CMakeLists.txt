@@ -174,6 +174,7 @@ set_target_properties(heongpu_host_bfv PROPERTIES
 )
 
 set(HEONGPU_HOST_CKKS_SOURCES
+    lib/host/ckks/bae_lowring.cu
     lib/host/ckks/baepcmm.cu
     lib/host/ckks/batchmatrix.cu
     lib/host/ckks/chebyshev_interpolation.cu

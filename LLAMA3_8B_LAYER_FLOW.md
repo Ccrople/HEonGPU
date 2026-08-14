@@ -2633,3 +2633,286 @@ block then pays **2 crossings instead of 8**, both inside the attention
 sublayer, and the feed-forward half stays free. What that crossing costs is
 **not measured and not modelled here**: it is a gather across ciphertexts and
 slots (the transpose §25.3 named), and pricing it needs it built.
+
+## 26. Sylph's low ring: the a-part GEMM's width is the lattice dimension (2026-08-14)
+
+§25 built the Bae product and found it good at `k = 1` and bad at 128 tokens.
+This section is the other half of the answer, and it is Sylph's: **do not run
+the product on the pipeline's ring at all.**
+
+### 26.1 What Sylph actually does, from Table IV
+
+arXiv 2601.18511v2, Table IV, read verbatim off the arXiv HTML:
+
+| Operator | Method | Ring Degree | Encoding | Packing Layout |
+|---|---|---:|---|---|
+| **PCMM** | **[27]** | **256** | **Coeff** | **Row-split** |
+| PCMV | [29] | 4096 | Coeff | Row |
+| Batch PCMM | Section IV-B | 65536 | Slot | Diagonal |
+| Batch CCMM | [28] | 4096 | SinC | Row |
+| Batch CCMV | [30] | 65536 | Slot | Diagonal |
+| Non-linear Ops | Section III-D | 65536 | Slot | — |
+
+and the sentence that connects the rows:
+
+> "To connect different ring degrees, we utilize the ring-switching technique
+> [41] mostly with coefficient encoding" … "ring-switching to the ring
+> `R_{N'}`, where `N'|N`, operation decomposes a ciphertext"
+
+**Two corrections to how §25 read this paper.** First, the plain **PCMM** is a
+*citation*, `[27]`, whose row reads Coeff + Row-split — which is Bae's
+encoding, named. Their own new algorithm is the **Batch PCMM** on the row
+below, Section IV-B, at 65536/Slot/Diagonal with `O(sqrt(d))` rotations and one
+level; that is the PC-attention operator and it is JKLS-derived, not Bae. They
+are two different operators and only one of them is ours. Second, the number
+that matters is not in the algorithm at all: **the PCMM is run 256 times
+smaller than everything around it.**
+
+`256` is not an arbitrary choice either. It is exactly `sqrt(65536)`, which is
+Bae's own `d >= sqrt(N)` floor (`baepcmm.cuh`, `BaeLayout`) applied to the
+pipeline's ring. Sylph sits *on* the constraint, not near it.
+
+### 26.2 The cost law, and it has exactly two levers
+
+`baepcmm.cuh` already derives, for `U (d1 x d2)` times encrypted `M (d2 x d3)`:
+
+    b-part GEMM   d1 * d2 * d3
+    a-part GEMM   d1 * d2 * N        <- the ring degree, always
+
+Say it once more with the right name on `N`. The a-part is the ciphertexts'
+a-vectors, and **an a-vector is exactly as long as the secret it pairs with**.
+So that `N` is the *lattice dimension*, and the whole cost model is
+
+    MACs per (in-channel, out-channel, token) per RNS limb  =  (D + d3) / T
+
+with `D` the lattice dimension, `d3` the encoded column count and `T` the
+tokens actually carried. **`D` and `T` are the only two levers there are.**
+Nothing about the packing, the encoding, the MLWE rank or the ModPack schedule
+appears in that expression, and none of them can.
+
+That is why the branch's two ways of seeing a degree-`N` ciphertext as
+degree-`n` objects are not variants of one thing:
+
+| | cost | what it does to the a-part | lattice dimension |
+|---|---|---|---|
+| **ModDecomp** (Bae App. A; `pcmm_mlwe`/`pcmm_packed`) | free — no key, no noise, no level | **nothing.** `k` components of `n` coefficients is still `N` coefficients | **unchanged at `N`** |
+| **ring switching** (Sylph §3.3; `HERingSwitchOperator`) | one key switch per ciphertext, zero levels | **divides it by `k`** | **drops to `n`** |
+
+Ring switching key-switches to the embedded secret `s'(X^k)` *first* and only
+then splits, so each piece is rank-1 under a genuine degree-`n` secret. That
+is the whole difference, and it is the reason §25.6's remark — that Bae's
+`k > 1` "is **not** the security downgrade that a ring switch down to degree
+128 would be" — cuts both ways: what makes ModDecomp safe is exactly what makes
+it free of any arithmetic benefit.
+
+### 26.3 So how bad is B = 1 today, and how good could it be
+
+The a-part does not care that the ring is empty, and at `B = 1` it is very
+empty: 128 tokens in a ring of 65536. At the 8B width (`d1 = d2 = 4096`), per
+RNS limb:
+
+| path | dimension | MACs per (in, out, token) | a-part | b-part | key switches |
+|---|---:|---:|---:|---:|---:|
+| **today** — big ring, `cols = 256` | 65536 | **514.0** | 1.10e12 | 4.29e9 | **4096** (ModPack) |
+| ring 8192 | 8192 | 128.0 | 1.37e11 | 1.37e11 | 1024 |
+| ring 4096 | 4096 | **64.0** | 6.87e10 | 6.87e10 | **512** |
+| Sylph's ring 256 | 256 | 4.0 | 4.29e9 | 4.29e9 | 32 |
+
+Two things to read off it. The a-part is **256x the b-part** today — the
+product is almost entirely the part that carries no data. And the key switches
+fall too: ModPack owes one per output *row*, the descent and ascent owe one per
+big-ring *ciphertext*, and a ciphertext is `k` rows.
+
+### 26.4 The parameters, and the security, which are the same question
+
+Because the dimension really drops, `n` is not free. Two constraints bound it
+and neither is in the paper:
+
+**The library's own 128-bit table.** `heongpu_128bit_std_parms` caps
+`log(P*Q)` at 109 for `N = 4096`, 54 for 2048, 218 for 8192, 1761 for 65536,
+and the bound is checked on the *product*, so the special primes come out of
+the same budget.
+
+**The shared-prefix rule.** `HERingSwitchOperator` requires the small `Q` to be
+a value-identical bottom prefix of the big one, so the small ring inherits
+**the pipeline's own primes and cannot choose its own**. §17.2 lays the logN 16
+chain out as `q0 = 41`, then 33-bit primes, and the prefix therefore starts at
+`q0 = 41` whether the product wants it there or not. With `|P| = 1` the
+validator additionally needs `log P >= 41`, so 41 bits are spent before a
+single level is bought.
+
+**And a third that fires before either.** `defines.h` sets
+`MIN_POLY_DEGREE = 4096`. Every context below that is rejected outright —
+`"Poly modulus degree is not supported"` — at every security level. **Sylph's
+256 is not a parameter choice in this library; it is not representable.**
+`MIN_USER_DEFINED_MOD_BIT_COUNT` is 30, so there is no smaller prime to buy
+room with either.
+
+`benchmark/profile_bae_ring_security` asks the library the other two — it
+builds real contexts at `sec_level_type::sec128` and reports which
+`generate()`. Measured, Sicily GPU 2:
+
+Largest Q prime count accepted, with one special prime of the same size:
+
+| ring | 2^60 | 2^50 | 2^40 | 2^30 | verdict |
+|---:|---:|---:|---:|---:|---|
+| 4096 | 0 | 1 | 1 | **2** | hosts the product at 30-bit primes, 1 usable level, log PQ ≤ 90 |
+| 8192 | 2 | 3 | 4 | 6 | hosts it at any prime size |
+| 16384 | 6 | 7 | 8 | 8 | 5 usable levels at 2^60 |
+| 32768 | 8 | 8 | 8 | 8 | |
+| 65536 | 8 | 8 | 8 | 8 | |
+
+(2^25 and 2^20 are 0 everywhere: below `MIN_USER_DEFINED_MOD_BIT_COUNT`.)
+
+And with **the pipeline's own prefix** — `q0 = 41`, then 33-bit primes, special
+prime 41:
+
+| ring | prefix primes accepted | usable levels | |
+|---:|---:|---:|---|
+| **4096** | **1** | **0** | **cannot host the product** |
+| 8192 | 5 | 4 | ← the floor |
+| 16384 | 8 | 7 | |
+| 65536 | 8 | 7 | |
+
+**So the ring is 8192, not 4096 and not 256, and the reason is `q0`.** Swept
+directly: ring 4096 hosts the product at `q0 = 38` and does not at `q0 = 41` —
+`38 + 33 + 38 = 109` is the cap exactly. HEonGPU's CKKS bootstrap is built
+around `q0 / scale ~ 2^10`, so at a 33-bit scale it wants `q0 >= 43`. **The
+PCMM's floor ring is set by the bootstrap's bottom prime**, three subsystems
+away, and no amount of work on the product will move it.
+
+**Sylph's 256 is not reachable at 128-bit, and the paper does not claim it
+is.** The arXiv HTML contains no security analysis, no bit-security claim and
+no lattice-estimator citation; at degree 256 the cap is under one prime. Two
+readings are possible and they have different costs:
+
+* the degree-256 objects keep the module rank (MLWE, dimension preserved) —
+  secure, but then it is ModDecomp, and by §26.2 the a-part never shrank, so
+  the 256 would be buying packing rather than arithmetic;
+* they are rank-1 RLWE at degree 256, which is what "ring-switching" reads as
+  and what makes the arithmetic claim work — and then the dimension is 256.
+
+**This branch implements the second and stops the ring where the library says
+to stop it.** The win survives the correction; it is just smaller than 128x.
+
+### 26.5 What was built
+
+`src/include/heongpu/host/ckks/bae_lowring.cuh` + `src/lib/host/ckks/bae_lowring.cu`,
+`test/test_ckks_bae_lowring.cpp`, `benchmark/profile_bae_ring_security.cpp`,
+`benchmark/profile_bae_lowring.cpp`.
+
+`HEBaeLowRingPcmm` is short because **the two layouts already agree.** Sylph's
+"Row-split" is `BaeLayout` with `cols = n`:
+
+    row r = k*i + u of M lands in ciphertext i, column t at coefficient t*k + u
+
+and the ring switch's DOWN split is `m_j[i] = m[i*k + j]`. Substituting, piece
+`u` of big ciphertext `i` is the polynomial whose `t`-th coefficient is row
+`k*i + u`, column `t` — **exactly one matrix row, whole**. So the descent needs
+no glue: `k` rows in, `k` rank-1 small ciphertexts out, one per row.
+
+    descend   d2/k key switches, 0 levels   ->  one small ciphertext per row
+    project   k == 1 at the small ring, transform-free, 1 level, NO KEY AT ALL
+    ascend    d1/k key switches, 0 levels
+
+Three consequences worth naming:
+
+* **A chain of projections stays down.** Q, K, V, O and the three FFN matrices
+  are all row -> row, so a block descends once and ascends once, not once per
+  product.
+* **The ModPack key ceremony disappears.** At the small ring `k = 1`, so no
+  sub-secret switching keys exist and `modpack_keys_generated()` stays false —
+  asserted in the test. §25.7's "key-ceremony change the paper warns about" is
+  a cost of the *big-ring* path only.
+* **The transform-free path applies.** The descent hands back NTT-domain
+  ciphertexts and the ascent wants them back the same way, so the INTT/NTT
+  round trip `run_gemms` would otherwise perform is pure loss on both ends.
+
+### 26.6 Measured
+
+**7 of 7 green, Sicily GPU 2** (GPUs 0 and 1 were at 91–99% with other users'
+jobs throughout; GPU 2 was idle at launch). `test_ckks_bae_lowring.cpp`, logN
+14 over logN 12:
+
+* `TheDescentHandsBackOneMatrixRowPerCiphertext` — the index claim, decrypted
+  under the SMALL secret in the SMALL context, against a matrix whose entries
+  carry their own row *and* column above tolerance, so neither a row shift nor
+  a column phase can pass by symmetry;
+* `AProjectionAtTheSmallRingMatchesTheHost` — descend, project, ascend,
+  decrypt, one level spent, `modpack_keys_generated()` asserted **false**;
+* `ProjectionsChainWithoutReturningToTheBigRing` — two products with no ascent
+  between them;
+* `TheLowRingComputesTheSameProductAsTheBigRingPath` — the same `M` and the
+  same weight through today's `pcmm_packed` (ModDecomp + GEMMs + ModPack, 4
+  ModPack keys) and through the descent. Both land on the host, they agree with
+  each other more tightly than either agrees with the host, and they finish at
+  **equal depth**;
+* two count-model tests, including `ModDecompDoesNotShrinkTheAPart`, which
+  asserts §26.2's central claim as a test rather than a comment.
+
+**Wall clock**, `profile_bae_lowring`, width 512, A6000, GPU 2 idle. Both paths
+are checked against the host before either is timed — worst error `9.3e-10` on
+each at the 65536 rows, so this is a timing of two correct answers.
+
+| pipeline → product | k | big-ring projection | descend | low-ring projection | ascend | 1 proj | **7 proj** | counted |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16384 → 4096 | 4 | 201.7 ms | 20.7 | **79.0 ms** | 22.1 | 1.66× | **2.37×** | 2.50× |
+| **65536 → 8192** | **8** | **620.0 ms** | 32.3 | **119.7 ms** | 26.2 | 3.48× | **4.84×** | 4.50× |
+| 65536 → 4096 | 16 | 600.2 ms | 16.0 | **84.6 ms** | 13.9 | 5.24× | **6.75×** | 8.50× |
+
+Read three things off it.
+
+**The count model is right.** Product against product, 16384 → 4096 is
+201.7/79.0 = 2.55× against a counted 2.50×, and 65536 → 8192 is 620.0/119.7 =
+5.18× against a counted 4.50× — the measured lead is the *larger* one because
+the count does not price the 512 ModPack key switches the big-ring path also
+owes.
+
+**The unit is the block, not the product.** A single projection is 3.48×
+because it pays a descent and an ascent it does not amortise; seven of them —
+which is what a block takes, since every projection is row → row — is
+**4.84×**. The middle row is the deployable one: 8192 is the floor §26.4
+measured for the chain as it stands.
+
+**The bottom row is what `q0` costs.** 65536 → 4096 would be 6.75×, and it is
+not available: the shared prefix starts at `q0 = 41` and 4096 needs 38.
+
+### 26.6bis What this does NOT say
+
+No block ran. This is one projection's worth of arithmetic, at width 512 rather
+than 4096, timed in isolation; the 7-projection row is 7 × the measured single
+product plus one measured descent and ascent, and it is labelled as such rather
+than measured end to end. The 8B-shape numbers in §26.3 are the count model.
+
+### 26.7 What it costs elsewhere, and it is not nothing
+
+**The low ring is a coefficient-domain construction, and §25.9's block is not.**
+`switch_down` splits on *coefficient* residue classes, so the small
+ciphertext's slots are not a sub-vector of the big one's slots and a
+slot-resident stream cannot descend and stay slot-resident. The zero-crossing
+property §25.9 measured — RMSNorm as an addition across ciphertexts, the gain
+folded into the next weight, no Galois key anywhere — belongs to the slot
+layout, and this product does not run in it. **The two cannot be had at once.**
+
+The arithmetic says which one to want anyway. A feed-forward half at the real
+8B shape (`d = 4096`, `hidden = 14336`) is `1.16e13` MACs per limb of
+projection at the big ring against `2.9e12` at ring 4096 — and the crossings it
+would cost back are 8 levels, i.e. about half a bootstrap per half-block. The
+products are three orders of magnitude the larger number. **What is not
+priced** is the repacking itself: going from 4096 one-channel slot ciphertexts
+to 256 row-split coefficient ciphertexts is a gather across ciphertexts *and*
+slots, and nothing here measures it.
+
+**The level constraint is the sharper cost.** The small ring holds two primes,
+so the product runs at the bottom of the chain and must be followed by a
+bootstrap. In a block with seven projections that is a scheduling problem, not
+an arithmetic one — and §14 already records that 5 of the 12 bootstraps in the
+two-ring block discard 10 of the 13 levels they restore, which is exactly the
+slack a bottom-of-chain projection wants.
+
+**So the next step is MaMBo, and now for a second reason.** §25.3 wanted it
+because the crossing to the non-linear layers is CoeffToSlot and a bootstrap
+already does one. §26 wants it because the low ring puts the product at the
+bottom of the chain, which is where a bootstrap already starts. Both point at
+holding the stream in **coefficients**, row-split, and letting the bootstrap's
+own DFT be the only crossing there is.

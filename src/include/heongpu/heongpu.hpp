@@ -39,6 +39,7 @@
 #include <heongpu/host/ckks/llama3_rect.cuh>
 #include <heongpu/host/ckks/llama3_bae.cuh>
 #include <heongpu/host/ckks/ringswitch.cuh>
+#include <heongpu/host/ckks/bae_lowring.cuh>
 
 #include <heongpu/host/tfhe/context.cuh>
 #include <heongpu/host/tfhe/secretkey.cuh>
