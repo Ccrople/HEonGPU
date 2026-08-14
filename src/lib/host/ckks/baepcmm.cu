@@ -495,16 +495,16 @@ namespace heongpu
                     "stored, so every input must be in the same domain: "
                     "mixing an NTT-domain ciphertext with a coefficient-domain "
                     "one sums two different polynomials and reports no error");
-            if (c->cipher_size_ != 2 && !c->relinearization_required_)
-            {
-                // A size-3 ciphertext has a second a-part and the identity of
-                // Lemma 3 does not cover it. relinearization_required_ is the
-                // library's authority on the real size, and it was checked
-                // above, so reaching here means an unrelinearised product
-                // slipped through with the flag already cleared.
-                throw std::invalid_argument(
-                    "the Bae product needs a size-2 ciphertext");
-            }
+            // A size-3 ciphertext has a second a-part and Lemma 3 does not
+            // cover it -- but cipher_size_ CANNOT be used to detect one.
+            // relinearize_inplace clears relinearization_required_ and never
+            // writes cipher_size_ back to 2, so every ciphertext that has been
+            // through a product reports three for the rest of its life. The
+            // library treats the flag as the authority and derives the size
+            // from it (operator.cuh), and the flag is checked above, so there
+            // is nothing left to check here. Reading the field instead
+            // rejected every activation that had met a multiplication, which
+            // is every activation a real block hands to a projection.
         }
 
         limbs = q_size_ - depth;
@@ -645,6 +645,12 @@ namespace heongpu
             c.scale_ = scale * plain_scale_;
             c.rescale_required_ = rescale;
             c.in_ntt_domain_ = ntt_domain;
+            // Stamped, not inherited. The emit kernel wrote exactly two
+            // components, so the result IS size two whatever the input's
+            // stale field said; copying that field forward would propagate
+            // the library's lie about relinearised ciphertexts.
+            c.cipher_size_ = 2;
+            c.relinearization_required_ = false;
         }
     }
 
@@ -864,6 +870,10 @@ namespace heongpu
             acc.scale_ = scale * plain_scale_;
             acc.rescale_required_ = rescale;
             acc.in_ntt_domain_ = true;
+            // As in pcmm(): stamped rather than inherited, because
+            // cipher_size_ is stale on anything that has met a product.
+            acc.cipher_size_ = 2;
+            acc.relinearization_required_ = false;
             out.push_back(std::move(acc));
         }
         HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());

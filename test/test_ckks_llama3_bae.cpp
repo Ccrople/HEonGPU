@@ -313,8 +313,13 @@ TEST(HEonGPU, CKKS_Llama3Bae_TheTransformFreePathAgreesWithTheTransformingOne)
     const auto x = random_matrix(fx.tokens, d2, 51);
     const auto w = random_matrix(d2, d1, 52);
 
-    auto plain_ct = fx.op->encrypt(x, fx.tokens, d2, *fx.encryptor);
-    auto free_ct = fx.op->encrypt(x, fx.tokens, d2, *fx.encryptor);
+    // ONE encryption, copied. Two calls to encrypt() would draw two different
+    // encryption noises and the two paths could then only be compared to the
+    // noise floor -- which is what an earlier version of this test did, and
+    // it reported 3.4e-09 where the truth is zero.
+    auto ct = fx.op->encrypt(x, fx.tokens, d2, *fx.encryptor);
+    auto plain_ct = ct;
+    auto free_ct = ct;
 
     // U as the operator wants it: out_channels x in_channels.
     std::vector<double> U(static_cast<size_t>(d1) * d2);
@@ -350,9 +355,11 @@ TEST(HEonGPU, CKKS_Llama3Bae_TheTransformFreePathAgreesWithTheTransformingOne)
 
     EXPECT_LT(relative_error(staged, want), 1e-5);
     EXPECT_LT(relative_error(direct, want), 1e-5);
-    // The two run identical modular arithmetic on identical inputs, so they
-    // should agree far more closely than either agrees with the host.
-    EXPECT_LT(relative_error(direct, staged), 1e-9);
+    // INTT then NTT is the identity in RNS, exactly, and everything after it
+    // is integer arithmetic on identical inputs. So the two paths do not
+    // merely agree to the noise floor: they agree BIT FOR BIT, and asserting
+    // anything weaker would let a real divergence hide under the noise.
+    EXPECT_EQ(worst_diff(direct, staged), 0.0);
 }
 
 TEST(HEonGPU, CKKS_Llama3Bae_TheTransformFreePathIsRejectedAboveKOne)
