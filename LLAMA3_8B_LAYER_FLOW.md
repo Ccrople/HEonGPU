@@ -3443,6 +3443,17 @@ two bits to spare.** Had the refresh wanted slot form, the island would have
 needed three Q primes and a special — 140 bits against 109 — and batch 16 would
 have had no parameter set at all. One measurement decided that.
 
+> ⚠ **CORRECTED BY §26 (2026-08-14): that set does not build.**
+> `coefficient_validator` runs BEFORE the security check and, at one special
+> prime, requires every individual `q_i <= P`; `41 > 33`. Raising `P` to 41
+> costs exactly the two bits of margin (115 > 109). What survives is the
+> structural claim — the island exits at one limb and needs only two Q primes.
+> What does not is the PRIME SIZES. The largest set N = 4096 admits is
+> `{36, 36}` over `{36}` = 108, still one usable level, at a 36-bit ceiling —
+> which the shared prefix then imposes on the big ring's `q0`, putting
+> bootstrap v2's `q0 = 41` out of reach. **Read §26 before quoting any
+> parameter set from this section.**
+
 **What batch 16 pays instead is forced refreshes.** One island level is exactly
 one Algorithm 4 call, so every island visit ends at one limb and must be
 refreshed. An attention sublayer has two Algorithm 4 stages (`QK^T` and `PV`)
