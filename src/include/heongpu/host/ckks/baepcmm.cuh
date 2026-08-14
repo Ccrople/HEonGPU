@@ -361,6 +361,30 @@ namespace heongpu
                      int out_channels,
                      HEArithmeticOperator<Scheme::CKKS>& ops);
 
+        /**
+         * @brief Run the product on the stored representation, no INTT/NTT.
+         *
+         * At k == 1 ModDecomp and ModPack are both the identity and the whole
+         * product is out_i = sum_j U[i][j] * ct_j -- a linear combination of
+         * WHOLE ciphertexts. The NTT is linear, so that combination gives the
+         * same answer whichever domain the limbs are stored in, and the
+         * round trip run_gemms otherwise performs is pure loss. Two
+         * transforms per ciphertext per projection, removed.
+         *
+         * It also removes the only reason the operator cared what the
+         * ciphertexts MEAN. At k > 1 the product mixes decimation phases
+         * within a ciphertext, which is a statement about coefficients and so
+         * needs the coefficient domain and the coefficient reading. At k == 1
+         * nothing inside a ciphertext is touched, so the product commutes with
+         * every encoding and every domain -- see Llama3BaeOperator, which is
+         * built on exactly that.
+         *
+         * Rejected at k > 1 rather than ignored: silently running the wrong
+         * algebra is the failure mode this whole module has already had once.
+         */
+        void set_transform_free(bool on);
+        bool transform_free() const noexcept { return transform_free_; }
+
         /** @brief The prime a rescale at this depth divides by. */
         double rescale_prime(int depth) const;
 
@@ -397,6 +421,9 @@ namespace heongpu
         /// One switching key per sub-secret s_j, empty until
         /// generate_modpack_keys runs. Never needed at k == 1.
         std::vector<std::unique_ptr<Switchkey<Scheme::CKKS>>> modpack_keys_;
+
+        /// k == 1 only; see set_transform_free.
+        bool transform_free_ = false;
     };
 
 } // namespace heongpu

@@ -489,6 +489,12 @@ namespace heongpu
                     "spend any pending rescale or relinearisation before the "
                     "Bae product: it reads raw coefficients and a pending "
                     "flag means the buffer is not what its scale says");
+            if (transform_free_ && c->in_ntt_domain_ != in[0]->in_ntt_domain_)
+                throw std::invalid_argument(
+                    "the transform-free path combines the limbs as they are "
+                    "stored, so every input must be in the same domain: "
+                    "mixing an NTT-domain ciphertext with a coefficient-domain "
+                    "one sums two different polynomials and reports no error");
             if (c->cipher_size_ != 2 && !c->relinearization_required_)
             {
                 // A size-3 ciphertext has a second a-part and the identity of
@@ -523,6 +529,7 @@ namespace heongpu
         }
         HEONGPU_CUDA_CHECK(cudaGetLastError());
 
+        if (!transform_free_)
         {
             BaeRange _rr("BaePCMM.intt");
             gpuntt::GPU_INTT_Inplace(
@@ -611,7 +618,9 @@ namespace heongpu
         }
 
         // Back to the NTT domain: everything downstream of this operator in
-        // the library assumes it, and the identity is finished with.
+        // the library assumes it, and the identity is finished with. The
+        // transform-free path never left it, so it has nothing to undo.
+        if (!transform_free_)
         {
             BaeRange _rr("BaePCMM.ntt");
             for (int r = 0; r < d1_; ++r)
@@ -629,12 +638,25 @@ namespace heongpu
         // plaintext scaling factor and the caller's rescale removes exactly
         // that. Only MARKED here, as the Kang path also does, so that a
         // caller can inspect the unscaled product.
+        const bool ntt_domain =
+            transform_free_ ? in[0]->in_ntt_domain_ : true;
         for (auto& c : out)
         {
             c.scale_ = scale * plain_scale_;
             c.rescale_required_ = rescale;
-            c.in_ntt_domain_ = true;
+            c.in_ntt_domain_ = ntt_domain;
         }
+    }
+
+    void HEBaePcmmOperator<Scheme::CKKS>::set_transform_free(bool on)
+    {
+        if (on && layout_.k != 1)
+            throw std::invalid_argument(
+                "the transform-free path is k == 1 only: above that the "
+                "product mixes decimation phases inside a ciphertext, which is "
+                "a statement about COEFFICIENTS, and running it on NTT-domain "
+                "limbs computes a different matrix without saying so");
+        transform_free_ = on;
     }
 
     BaeMlweStack HEBaePcmmOperator<Scheme::CKKS>::pcmm_mlwe(
