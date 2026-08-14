@@ -2317,17 +2317,8 @@ re-run on a clean card before believing any of it.
 
 ### 19.5 What is left, priced
 
-1. **The constant-plaintext encode in `evaluate_poly`, ~4-6%.**
-   `quick_ckks_encoder_constant_complex` (`operator.cu:2733`) encodes a single
-   constant by building a 32768-entry host vector, doing a **synchronous**
-   512 KB `cudaMemcpy`, and running a full 32768-point inverse FFT — on
-   `stream = 0`, ignoring the caller's stream — and it runs ~48 times per boot,
-   once per polynomial coefficient over both EvalMod chains. The analytic path
-   already exists for real constants (`quick_ckks_encoder_constant_double`,
-   `:2778`, one kernel, no FFT, because the NTT of a constant polynomial is
-   that constant everywhere) and the Chebyshev coefficients of a cosine are
-   real. Not bit-identical — the fast path is exactly rounded where the current
-   one rounds an IFFT output — so it needs a precision check, not just a diff.
+1. ~~**The constant-plaintext encode in `evaluate_poly`, ~4-6%.**~~ **Done —
+   6.2% at L = 29 and 10.8% at L = 17.** See §19.6.
 2. **Batching the 16 ciphertexts of a refresh call.** `TwoRing::refresh` is a
    literal serial loop on the default stream. Boot phases are 90.5% GPU-busy,
    so stream overlap alone is bounded at ~5% of a block; real sharing of the
@@ -2341,3 +2332,68 @@ EvalMod once, on the theory that the upper coefficient half is an encryption of
 zero. It is not. After ModRaise the plaintext is `m + q0*I(s)` and **`I(s)` is
 dense over all N coefficients whatever the message is**, so the imaginary
 CoeffToSlot output is never zero and dropping it returns noise.
+
+### 19.6 The constant encoder: a 2^15 FFT to write down a constant (2026-08-14)
+
+`evaluate_poly` encodes every polynomial coefficient from scratch on every
+call, ~48 times per bootstrap across the two EvalMod chains, and
+`quick_ckks_encoder_constant_complex` (`operator.cu:2733`) did it the long way
+each time: build a 32768-entry host `std::vector` by `push_back`, a **blocking**
+512 KB `cudaMemcpy`, a 2^15 inverse FFT, the conversion kernel, then `Q_size`
+forward NTTs of 2^16 — all on `stream = 0`, ignoring the caller's stream.
+
+**None of that is needed for a real constant, and the reason is exact rather
+than approximate.** The inverse FFT of a vector holding `c` in all
+`slot_count_` slots puts `slot_count_ * c` at DC and zero elsewhere; times the
+`fix = scale / slot_count_` the code already applies, that is `c * scale` in the
+constant term and nothing else — the constant POLYNOMIAL. The NTT of a constant
+polynomial is that same constant at every evaluation point. So the whole
+transform chain evaluates to "write `round(c * scale) mod q_i` everywhere",
+which is precisely what `quick_ckks_encoder_constant_double` (`:2778`) already
+did for the real-valued API, with one kernel and no FFT.
+
+The encoder now dispatches on `input.imag() == 0.0`. Chebyshev coefficients of
+a real function are real, so the bootstrap and every Llama-3 non-linear fit take
+the closed form; the two genuinely imaginary constants the encoding transforms
+need (`-i/2` and `i`) still go the long way and are encoded once per context.
+The call site also passes the operand's live limb count, so limbs above the
+level are no longer written at all.
+
+**Measured, five independent processes on an idle A6000 (GPU 2, 4.3 GB used):**
+
+| chain | before | after | gain |
+|---|---|---|---|
+| L = 29, 14 levels returned | 256.8 ms | **240.9 ms** | **6.2%** |
+| L = 17, 2 levels returned | 117.0 ms | **104.3 ms** | **10.8%** |
+
+Run-to-run spread is 0.45 ms, so both are far outside the noise. The gain is
+larger on the short chain because the boot's own depth dominates there; in the
+linear law of §19.2 the **intercept falls from ~104 ms to ~92 ms** while the
+12.5 ms per returned level is untouched, which is exactly the shape expected
+from removing a fixed per-coefficient cost.
+
+**It is not bit-identical, and that is the right outcome.** The two routes are
+the same number by different arithmetic — one multiply against 2^15 butterflies
+— and the closed form is the more accurate of the pair. `HEONGPU_CONSTENC_CHECK=1`
+encodes every real constant BOTH ways and compares them limb by limb, bounding
+the *signed* distance modulo `q_i` (a one-ULP disagreement about a negative
+residue appears as a gap of `q_i - 1`, so a naive absolute difference would
+false-positive on every negative coefficient). Clean at logN 16 deg 30, logN 13
+deg 30, and logN 13 deg 62 / dangle 2. Measured precision is unchanged:
+16.746-16.760 bits against 16.748-16.765 before.
+
+Suites on the idle card: `ckks_llama3_rect` 38/38, `ckks_llama3` 53/53,
+`ckks_llama3_bootv2` 4/4, plus batch, ringswitch, tworing_bridge, encoding,
+multiplication, relinearization.
+
+**Where this lands the whole section.** Against the v1 model the module was
+using before §19.4, the Llama-3 refresh is now:
+
+| levels returned | v1 (was) | v2 + closed-form encoder (now) | total |
+|---:|---:|---:|---:|
+| 2 | 328.3 ms | **104.3 ms** | **3.15x** |
+| 14 | 682.6 ms | **240.9 ms** | **2.83x** |
+
+and `evaluate_poly` is the general polynomial evaluator, so the same 6-11%
+applies to every Llama-3 non-linear fit — the SiLU, the SoftMax exponential and
+reciprocal, the RMSNorm inverse square root — not only to the bootstrap.

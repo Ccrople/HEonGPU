@@ -2046,13 +2046,36 @@ namespace heongpu
                                                      const double scale,
                                                      int rns_count);
 
+        /**
+         * @brief Encode one constant, repeated across every slot.
+         *
+         * @p limb_count is how many RNS limbs the consumer will actually read;
+         * -1 means the whole chain. Limbs above it are left untouched, so pass
+         * the operand's live limb count rather than Q_size whenever it sits
+         * below the top of the chain.
+         *
+         * A REAL constant takes a closed-form path that never touches the FFT:
+         * a constant across every slot encodes to the constant POLYNOMIAL, and
+         * the NTT of a constant polynomial is that same constant at every
+         * evaluation point, so there is nothing to transform. See the note on
+         * the definition for why that is also the more accurate route.
+         */
         __host__ void quick_ckks_encoder_constant_complex(Complex64 input,
                                                           Data64* output,
-                                                          const double scale);
+                                                          const double scale,
+                                                          int limb_count = -1);
+
+        /// The transform route on its own: host vector, blocking copy, inverse
+        /// FFT, conversion, forward NTT. Kept separate so the closed form can
+        /// be checked against it under HEONGPU_CONSTENC_CHECK, and because a
+        /// genuinely complex constant still needs it.
+        __host__ void quick_ckks_encoder_constant_complex_fft(
+            Complex64 input, Data64* output, const double scale);
 
         __host__ void quick_ckks_encoder_constant_double(double input,
                                                          Data64* output,
-                                                         const double scale);
+                                                         const double scale,
+                                                         int limb_count = -1);
 
         __host__ void quick_ckks_encoder_constant_integer(std::int64_t input,
                                                           Data64* output,

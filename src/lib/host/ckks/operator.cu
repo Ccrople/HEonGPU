@@ -10,6 +10,7 @@
 
 #include <nvtx3/nvToolsExt.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -49,6 +50,87 @@ namespace heongpu
           private:
             bool open_ = true;
         };
+
+        /// Debug switch for the closed-form real-constant encoder: when set,
+        /// every real constant is ALSO encoded the long way through the FFT
+        /// and the two are compared limb by limb.
+        ///
+        /// Unlike the mod-down check this one is deliberately NOT a
+        /// word-for-word test. The two routes are the same number by different
+        /// arithmetic -- one multiply against 2^15 butterflies -- so they are
+        /// expected to differ in the last place or two, and the closed form is
+        /// the more accurate of the pair. What the check enforces is that they
+        /// agree to within a few units in the last place of the encoded
+        /// integer, which catches a wrong scale, a wrong sign or a wrong limb
+        /// while tolerating the rounding that is supposed to be there.
+        bool constant_encode_check_enabled()
+        {
+            static const bool enabled = [] {
+                const char* env = std::getenv("HEONGPU_CONSTENC_CHECK");
+                return (env != nullptr) && (std::atoi(env) != 0);
+            }();
+            return enabled;
+        }
+
+        /// Compare a closed-form constant encoding against the FFT one.
+        ///
+        /// Both are residues mod q_i, so a difference has to be read modulo
+        /// q_i: a one-ULP disagreement about a negative value shows up as a
+        /// gap of q_i - 1, not 1. The signed distance is what is bounded.
+        void compare_constant_encode(const char* tag, const Data64* closed,
+                                     const Data64* fft, size_t count,
+                                     const Modulus64* modulus, int n_power,
+                                     int limbs)
+        {
+            std::vector<Data64> host_closed(count);
+            std::vector<Data64> host_fft(count);
+            std::vector<Modulus64> host_mod(limbs);
+            HEONGPU_CUDA_CHECK(cudaMemcpy(host_closed.data(), closed,
+                                          count * sizeof(Data64),
+                                          cudaMemcpyDeviceToHost));
+            HEONGPU_CUDA_CHECK(cudaMemcpy(host_fft.data(), fft,
+                                          count * sizeof(Data64),
+                                          cudaMemcpyDeviceToHost));
+            HEONGPU_CUDA_CHECK(cudaMemcpy(host_mod.data(), modulus,
+                                          limbs * sizeof(Modulus64),
+                                          cudaMemcpyDeviceToHost));
+
+            // A few ULP of the encoded integer. The FFT route's error grows
+            // with the transform size, so this is a sanity bound, not a
+            // precision claim; anything structurally wrong (scale, sign, limb)
+            // is off by orders of magnitude and trips it immediately.
+            const Data64 tolerance = 64;
+            for (int l = 0; l < limbs; l++)
+            {
+                const Data64 q = host_mod[l].value;
+                for (size_t i = 0; i < (size_t(1) << n_power); i++)
+                {
+                    const size_t at = (static_cast<size_t>(l) << n_power) + i;
+                    const Data64 a = host_closed[at];
+                    const Data64 b = host_fft[at];
+                    Data64 diff = (a > b) ? (a - b) : (b - a);
+                    if (diff > q - diff)
+                    {
+                        diff = q - diff; // the difference wrapped
+                    }
+                    if (diff > tolerance)
+                    {
+                        std::fprintf(
+                            stderr,
+                            "HEONGPU_CONSTENC_CHECK: %s limb %d word %zu: "
+                            "closed %llu fft %llu (distance %llu mod %llu)\n",
+                            tag, l, i,
+                            static_cast<unsigned long long>(a),
+                            static_cast<unsigned long long>(b),
+                            static_cast<unsigned long long>(diff),
+                            static_cast<unsigned long long>(q));
+                        throw std::runtime_error(
+                            "closed-form constant encoding diverged from the "
+                            "FFT encoding");
+                    }
+                }
+            }
+        }
 
         /// Debug switch for the staged mod-down rewrite: when set, every
         /// staged launch also runs the legacy kernel and compares the two
@@ -2731,6 +2813,60 @@ namespace heongpu
     }
 
     __host__ void HEOperator<Scheme::CKKS>::quick_ckks_encoder_constant_complex(
+        Complex64 input, Data64* output, const double scale, int limb_count)
+    {
+        // A REAL constant needs none of what follows. The inverse FFT of a
+        // vector that is `c` in every one of `slot_count_` slots puts
+        // `slot_count_ * c` at DC and zero everywhere else; multiplied by the
+        // `fix = scale / slot_count_` below that is exactly `c * scale` in the
+        // constant term and nothing elsewhere -- the constant polynomial. Its
+        // NTT is `c * scale` at every evaluation point, which is what the real
+        // path writes directly.
+        //
+        // So this is not an approximation of the transform path, it is the
+        // closed form of it, and it is the more accurate of the two: the FFT
+        // route accumulates 2^15 butterflies of rounding to arrive at a number
+        // one multiply produces exactly.
+        //
+        // It matters because evaluate_poly calls this once per polynomial
+        // coefficient, ~48 times per bootstrap over the two EvalMod chains,
+        // and the transform path costs a 32768-entry host vector, a BLOCKING
+        // 512 KB host-to-device copy, a 2^15 inverse FFT and Q_size forward
+        // NTTs of 2^16 every single time. Chebyshev coefficients of a real
+        // function are real, so the bootstrap takes this path throughout; the
+        // two purely-imaginary constants the encoding transforms need
+        // (-i/2 and i) still go the long way, and are encoded once per context.
+        if (input.imag() == 0.0)
+        {
+            quick_ckks_encoder_constant_double(input.real(), output, scale,
+                                               limb_count);
+
+            if (constant_encode_check_enabled())
+            {
+                const int limbs = (limb_count < 0)
+                                      ? context_->Q_size
+                                      : std::min(limb_count, context_->Q_size);
+                const size_t words = static_cast<size_t>(limbs)
+                                     << context_->n_power;
+                DeviceVector<Data64> reference(context_->Q_size
+                                               << context_->n_power);
+                quick_ckks_encoder_constant_complex_fft(input, reference.data(),
+                                                        scale);
+                compare_constant_encode("real-constant", output,
+                                        reference.data(), words,
+                                        context_->modulus_->data(),
+                                        context_->n_power, limbs);
+            }
+            return;
+        }
+
+        quick_ckks_encoder_constant_complex_fft(input, output, scale);
+    }
+
+    // The transform route, kept whole so the closed form above can be checked
+    // against it rather than merely asserted to match.
+    __host__ void
+    HEOperator<Scheme::CKKS>::quick_ckks_encoder_constant_complex_fft(
         Complex64 input, Data64* output, const double scale)
     {
         // std::vector<Complex64> in = {input};
@@ -2776,14 +2912,22 @@ namespace heongpu
     }
 
     __host__ void HEOperator<Scheme::CKKS>::quick_ckks_encoder_constant_double(
-        double input, Data64* output, const double scale)
+        double input, Data64* output, const double scale, int limb_count)
     {
         double value = input * scale;
 
+        // Limbs the caller will not read are not worth writing. The active
+        // primes of a leveled ciphertext are the LEADING ones, so the first
+        // limb_count limbs are exactly the ones a consumer at that level
+        // indexes, and the tail is left as it was.
+        const int limbs = (limb_count < 0)
+                              ? context_->Q_size
+                              : std::min(limb_count, context_->Q_size);
+
         encode_kernel_double_ckks_conversion<<<dim3((context_->n >> 8), 1, 1),
                                                256>>>(
-            output, value, context_->modulus_->data(), context_->Q_size,
-            two_pow_64_, context_->n_power);
+            output, value, context_->modulus_->data(), limbs, two_pow_64_,
+            context_->n_power);
         HEONGPU_CUDA_CHECK(cudaGetLastError());
     }
 
@@ -4615,14 +4759,17 @@ namespace heongpu
         {
             Ciphertext<Scheme::CKKS> xi_term = powered_ciphers[i];
 
+            int current_decomp_count = context_->Q_size - xi_term.depth_;
+
             DeviceVector<Data64> encoded_coeff_i(context_->Q_size
                                                  << context_->n_power);
-            quick_ckks_encoder_constant_complex(pol.coeffs_[i],
-                                                encoded_coeff_i.data(),
-                                                target_scale / xi_term.scale_);
+            // Only the live limbs are read by the multiply below, so only
+            // those are encoded.
+            quick_ckks_encoder_constant_complex(
+                pol.coeffs_[i], encoded_coeff_i.data(),
+                target_scale / xi_term.scale_, current_decomp_count);
             HEONGPU_CUDA_CHECK(cudaGetLastError());
 
-            int current_decomp_count = context_->Q_size - xi_term.depth_;
             cipherplain_multiplication_kernel<<<dim3((context_->n >> 8),
                                                      current_decomp_count, 2),
                                                 256, 0, options.stream_>>>(
