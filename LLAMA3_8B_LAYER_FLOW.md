@@ -4052,6 +4052,31 @@ At the measured cheap-fit map, chain 43:
 one that makes it a fixed point. `plan_refresh` also reports **infeasible**
 rather than letting a too-short chain throw halfway through a block.
 
+**`RMSNormConfig::refresh_sum` was hard-coded false** at the boundary between
+this module and the slot core (`llama3_batch16.cu:332`), so the core's own
+narrow-track implementation was unreachable from here — and this is the
+encoding where it is cheapest, because the channel axis IS the ciphertext index
+and the reduction lands in exactly ONE ciphertext however wide the model is.
+Now plumbed. **Measured, and it does not say what it was expected to say:**
+
+| from depth 30 of a 40-limb chain | wide track | auxiliary track |
+|---|---:|---:|
+| output depth | 39 | **33** |
+| worst error vs a host RMSNorm | 6.4e-04 | 9.1e-03 / 1.5e-02 (two runs) |
+
+**Six levels back, for about a decimal digit** — 15-25x, varying because a
+bootstrap is randomised. The expectation was that moving the fit off the
+exhausted end of the chain would *help* precision; it does not. Running a
+degree-15 Chebyshev on the last limb costs almost nothing, and a v1 refresh
+costs more than that by running at all. So `refresh_sum` is a
+levels-for-precision trade and nothing else, and it stays default-off.
+
+**And the saving is conditional in the direction opposite to the intuition.** A
+bootstrap returns its ciphertext to `refresh_levels` whatever depth it went in
+at, so refreshing at depth `D` buys `D - refresh_levels`: a gain on a deep
+stream and a **loss** on a fresh one. Same shape, from a fresh stream: depth 9
+without, **31 with**. A norm at the top of a chain must leave it off.
+
 ### 26.8 Open
 
 1. **Nothing here is timed.** This section is parameter arithmetic and host-side

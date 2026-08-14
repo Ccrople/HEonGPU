@@ -458,10 +458,13 @@ namespace heongpu
                 /// OFF by default, and not only for reproducibility: it is a
                 /// LEVELS-for-PRECISION trade, measured. At a 40-limb chain
                 /// with the norm entering at depth 30 it hands back **six
-                /// levels** and costs about **14x** in worst-slot error
-                /// (6.4e-04 -> 9.1e-03 against a host reference), which is
-                /// the v1 bootstrap's own precision and not the fit's. Take
-                /// it where levels bind and not otherwise.
+                /// levels** and costs **15-25x in worst-slot error, run to
+                /// run** -- 6.4e-04 for the wide track against 9.1e-03 and
+                /// 1.5e-02 on two runs, against a host reference. That is
+                /// roughly a decimal digit, it is the v1 bootstrap's own
+                /// precision rather than the fit's, and it varies because a
+                /// bootstrap is randomised. Take it where levels bind and not
+                /// otherwise.
                 ///
                 /// The saving is also CONDITIONAL, in the direction opposite
                 /// to the intuition. A bootstrap returns its ciphertext to

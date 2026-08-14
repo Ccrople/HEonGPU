@@ -1434,10 +1434,11 @@ TEST(HEonGPU, CKKS_Llama3Batch16Block_RefreshSumMovesTheFitOffTheWideTrack)
     //
     // MEASURED, and it refutes the reason one might reach for this: the
     // auxiliary track is NOT more accurate. 6.4e-04 for the wide track
-    // against 9.1e-03 for the auxiliary one at this shape -- about 14x, near
-    // enough a decimal digit, and it is the bootstrap's own precision that
-    // pays for it. The fit does not lose accuracy by running on the last limb
-    // of the chain; a v1 refresh loses more than that by running at all.
+    // against 9.1e-03 and 1.5e-02 on two runs of the auxiliary one -- 15-25x,
+    // near enough a decimal digit, varying because a bootstrap is randomised.
+    // It is the bootstrap's own precision that pays. The fit does not lose
+    // accuracy by running on the last limb of the chain; a v1 refresh loses
+    // more than that by running at all.
     //
     // So refresh_sum is a LEVELS-for-PRECISION trade and nothing else. Worth
     // it where levels are the binding constraint, which on this path is the
