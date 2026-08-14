@@ -16,6 +16,7 @@ set(EXECUTABLES
     llama3_baepcmm_profile profile_baepcmm.cpp
     bae_ring_security_profile profile_bae_ring_security.cpp
     bae_lowring_profile profile_bae_lowring.cpp
+    bae_rowsplit_slots_profile profile_bae_rowsplit_slots.cpp
     llama3_rect_profile profile_llama3_rect.cpp
     llama3_rect_boot_profile profile_llama3_rect_boot.cpp
     llama3_levels_profile profile_llama3_levels.cpp

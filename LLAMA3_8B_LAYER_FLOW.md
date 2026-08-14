@@ -2916,3 +2916,89 @@ already does one. §26 wants it because the low ring puts the product at the
 bottom of the chain, which is where a bootstrap already starts. Both point at
 holding the stream in **coefficients**, row-split, and letting the bootstrap's
 own DFT be the only crossing there is.
+
+### 26.8 Can the block live in the row-split layout? The two facts that decide it (2026-08-14)
+
+§26.7 left the block move open on an unpriced repacking. The repacking is the
+wrong thing to price, because the answer is not to convert §25.9's
+slot-resident stream into row-split — it is to **hold the stream row-split all
+along**. What that costs is two things the non-linear layers need, and
+`benchmark/profile_bae_rowsplit_slots` measures both.
+
+#### The slot law, and the assumption that cost a run
+
+The crossing is not the identity on indices. `profile_boot_to_slots` measured
+the reading and `Llama3RectOperator::slot_reading_permutation` names it:
+**coefficient `c` lands in slot `bitrev(c)`**, bit reversal on `log2(N/2)`
+bits, which is what a decimation-in-time factorisation leaves behind.
+Composing with the row-split index map:
+
+    slot bitrev(t*k + u) of ciphertext i  =  channel (k*i + u), token t
+
+**Measured, all four ciphertexts:** best-fit scalar `1.000001`, residual
+`7.0e-06` — against `0.026` and `4.1e-01` under the identity, which is noise.
+A control step in the same harness re-establishes the plain claim (`slot
+bitrev(c) = coefficient c`, gain `1.000001`, residual `7.0e-06`) before the
+layout question is asked, so a failure lands on the right side of the seam. It
+had to: the first run asserted the identity, and the control is what said the
+harness was wrong rather than the layout.
+
+#### The RMSNorm reduction: log2(k) rotations, and the broadcast is free
+
+`u` occupies the LOW `log2(k)` bits of the coefficient index, so after reversal
+it occupies the HIGH `log2(k)` bits of the slot index. The `k` slots of one
+channel group are therefore separated by `(N/2)/k`, not by 1. The reduction is
+
+    square, add across the d/k ciphertexts        no rotation, no mask
+    log2(k) rotate-and-adds by half/k .. half/2   the channel groups
+
+and the group sum lands **already replicated across the group**, which is
+exactly the broadcast the normaliser wants — so there is no second pass to
+spread it. **Measured:** gain `1.000002`, residual `1.1e-05` against a host
+reference, 3 rotate-and-adds at `k = 8` costing `2.33 ms`, on top of `0.45 ms`
+of squares and cross-ciphertext addition.
+
+The structural claim is robust to the convention: `u` is `log2(k)` bits of the
+index wherever the DFT puts them, so it is `log2(k)` rotations either way. Only
+the shift amounts moved, and only those had to be measured.
+
+#### Why the B = 1 emptiness helps here
+
+`solo_coeff_to_slot` carries only coefficients `0..N/2-1`. In general that
+loses half a row-split ciphertext. It does not here: at `B = 1` the tokens
+occupy `t < 128`, so the highest live coefficient is `127*k + (k-1) = 1023` at
+`k = 8`, far inside the lower half. **The shape that makes the product
+expensive is what makes this crossing free of a packing constraint.**
+
+#### Every axis moves by exactly k, and for one reason
+
+The slot-resident layout puts one channel in a ciphertext; the row-split layout
+puts `k`. At the 8B width (`d = 4096`, `N = 65536`, `k = 8`, 128 tokens):
+
+| | slot-resident (§25.9) | row-split + low ring | |
+|---|---:|---:|---|
+| MACs per (in, out, token) per limb | 1024 | **128** | 8x |
+| ciphertexts holding the activation | 4096 | **512** | 8x |
+| crossings / bootstraps per refresh | 4096 | **512** | 8x |
+| key switches per projection chain | **0** | (d1+d2)/k, once per block | new cost |
+| RMSNorm channel reduction | **0 rotations** | log2(k) = 3 rotations | new cost |
+
+The first three are the same factor for the same reason, and the two new costs
+are small: at the measured per-key-switch rate (`0.50 ms` down, `0.41 ms` up at
+`N = 65536`) a block's single descent and ascent at the 8B width is about
+`0.47 s` against `4.3 s` of projections, and the three rotations are noise.
+
+`1024 -> 128` is worth restating, because it is the answer to the question §26
+opened with. §25.9's slot-resident block costs `2N/T` MACs per useful token,
+which at 128 tokens is **1024** — worse than the row-split big-ring path's 514,
+not better. The zero-crossing property was bought with the ring, and at `B = 1`
+the ring is what there is too much of.
+
+#### What is still not measured
+
+The **return** crossing. `Llama3Operator::slots_to_coeff` is the exact inverse
+and is public, but this target does not run it, and its `align_drop` parameter
+"returns noise rather than an error" when wrong — so the round trip is an
+expectation here, not a result. Nothing in this section runs a projection, a
+SiLU, a residual or a block, and the 8B rows above are counts scaled from
+measured per-unit costs, not a measured sublayer.
