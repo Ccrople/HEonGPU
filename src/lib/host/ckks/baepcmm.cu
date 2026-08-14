@@ -668,6 +668,13 @@ namespace heongpu
     BaeMlweStack HEBaePcmmOperator<Scheme::CKKS>::pcmm_mlwe(
         const std::vector<Ciphertext<Scheme::CKKS>*>& in)
     {
+        if (transform_free_)
+            throw std::invalid_argument(
+                "an MLWE stack is a COEFFICIENT-domain object by definition, "
+                "and the transform-free path never leaves the NTT domain: it "
+                "would hand back evaluation-point values labelled as "
+                "coefficients. Turn it off for this entry point");
+
         DeviceVector<Data64> A, B;
         int limbs = 0, depth = 0;
         double scale = 0.0;
