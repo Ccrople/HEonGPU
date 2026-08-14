@@ -441,6 +441,29 @@ namespace heongpu
                 /// fold away by itself, and this is how a caller who owns the
                 /// upstream weight folds it away anyway.
                 bool sum_pre_scaled = false;
+                /// Refresh the summed square before fitting 1/sqrt over it --
+                /// the narrow auxiliary track, and on THIS encoding it is a
+                /// better trade than anywhere else in the project.
+                ///
+                /// The channel axis here is the ciphertext index, so the
+                /// reduction is a slot-wise addition of `channels`
+                /// ciphertexts into exactly ONE. So the refresh is a single
+                /// bootstrap, whatever the model's width, and it moves the
+                /// whole fit -- the domain map, the ceil(log2(degree+1))
+                /// levels of Chebyshev, and the rescale -- off the
+                /// `d_model`-wide residual track and onto that one
+                /// ciphertext. What the wide track keeps is the final
+                /// product.
+                ///
+                /// OFF by default, because it needs the boot Galois key at
+                /// the call and every measurement taken before it existed
+                /// must reproduce.
+                ///
+                /// Needs @c newton_iterations = 0 (a Newton step refines
+                /// against the unmapped argument, and a refreshed sum arrives
+                /// mapped) and is refused together with @c sum_pre_scaled,
+                /// which runs its own circuit and would ignore this silently.
+                bool refresh_sum = false;
             };
 
             /**
@@ -474,11 +497,15 @@ namespace heongpu
              * At degree 15 that is 7; Llama3BatchOperator's defaults spend 15
              * for the same answer.
              */
+            /// @param boot_key Needed only by RMSNormConfig::refresh_sum, and
+            ///        required when it is set -- checked before any work.
             BatchActivation rms_norm(BatchActivation& x,
                                      const std::vector<double>& gain,
                                      const RMSNormConfig& config,
                                      Galoiskey<Scheme::CKKS>& galois_key,
-                                     Relinkey<Scheme::CKKS>& relin_key);
+                                     Relinkey<Scheme::CKKS>& relin_key,
+                                     Galoiskey<Scheme::CKKS>* boot_key
+                                     = nullptr);
 
             /**
              * @brief The same norm on a stream that is ALREADY in slot form.
@@ -499,7 +526,8 @@ namespace heongpu
                            const std::vector<double>& gain,
                            const RMSNormConfig& config,
                            Galoiskey<Scheme::CKKS>& galois_key,
-                           Relinkey<Scheme::CKKS>& relin_key);
+                           Relinkey<Scheme::CKKS>& relin_key,
+                           Galoiskey<Scheme::CKKS>* boot_key = nullptr);
 
             /**
              * @brief Fold a per-channel scale into a projection weight, on the
@@ -1308,7 +1336,8 @@ namespace heongpu
                       const RMSNormConfig& config,
                       const Llama3Operator::RMSNormConfig& slot_config,
                       Galoiskey<Scheme::CKKS>& galois_key,
-                      Relinkey<Scheme::CKKS>& relin_key);
+                      Relinkey<Scheme::CKKS>& relin_key,
+                      Galoiskey<Scheme::CKKS>* boot_key);
 
             /// The norm's slot core written out, so that the 1/sqrt fit can be
             /// told its argument arrives already mapped. @see

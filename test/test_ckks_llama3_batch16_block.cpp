@@ -1292,7 +1292,151 @@ namespace
 // The sequence driver at one block has to BE the single-block driver. If this
 // drifts, the two entry points are two models.
 // ======================================================================
-// 8. The hoisting lever, which this path had no way to pull
+// 8. The narrow auxiliary track, which fill_slot_config had nailed shut
+// ======================================================================
+
+// RMSNormConfig::refresh_sum was hard-coded false at the boundary between this
+// module and the slot core, so the slot core's own implementation was
+// unreachable from here. This is the encoding where it is cheapest: the
+// channel axis IS the ciphertext index, so the reduction lands in exactly ONE
+// ciphertext however wide the model is, and refreshing it is a single
+// bootstrap that moves the entire 1/sqrt fit off the d_model-wide residual
+// track.
+//
+// The saving is CONDITIONAL and the condition is worth stating, because it is
+// the opposite of the intuition. A bootstrap always returns its ciphertext to
+// depth refresh_levels, so refreshing the sum at depth D buys D - refresh_levels
+// levels: it is a GAIN on a stream that is already deep and a LOSS on a fresh
+// one. A norm at the top of a chain should leave this off. This test therefore
+// runs the norm where a block actually runs it -- deep -- and asserts both
+// directions, so neither is mistaken for the other.
+TEST(HEonGPU, CKKS_Llama3Batch16Block_RefreshSumMovesTheFitOffTheWideTrack)
+{
+    llama::Batch16Shape shape = SmallShape();
+    shape.d_model = 8;
+    shape.hidden = 16;
+
+    const heongpu::BootstrappingConfig boot(3, 3, 11);
+    const int refresh = llama::Llama3Batch16Operator::refresh_levels(boot);
+    const int limbs = 40;
+    BootFixture f(shape, limbs);
+
+    const int d = BootFixture::d;
+    const auto x = f.random_batch(d, shape.d_model, 606u, 0.5);
+    const std::vector<double> no_gain;
+
+    llama::Llama3Batch16Operator::RMSNormConfig plain_cfg;
+    plain_cfg.degree = 15;
+    plain_cfg.newton_iterations = 0;
+    plain_cfg.sum_lo = 1e-3;
+    plain_cfg.sum_hi = 6.0e1;
+
+    llama::Llama3Batch16Operator::RMSNormConfig aux_cfg = plain_cfg;
+    aux_cfg.refresh_sum = true;
+
+    // Where a block's second norm actually sits: deep enough that the fit's
+    // levels are the scarce thing. Five above the refresh floor, so the
+    // bootstrap has something to give back.
+    const int deep = refresh + 5;
+
+    auto run = [&](const llama::Llama3Batch16Operator::RMSNormConfig& cfg,
+                   uint64_t seed, bool with_key, int start_depth)
+    {
+        llama::BatchActivation a =
+            f.op->encrypt(x, d, shape.d_model, *f.encryptor, f.scale);
+        for (auto& c : a.column)
+        {
+            f.op->arith().drop_to_depth(c, start_depth);
+        }
+        (void) seed;
+        return f.nl->rms_norm(a, no_gain, cfg, *f.boot_key, *f.relin,
+                              with_key ? f.boot_key.get() : nullptr);
+    };
+
+    llama::BatchActivation wide = run(plain_cfg, 1u, false, deep);
+    const int wide_depth = wide.column[0].depth();
+    const auto wide_out = f.op->decrypt(wide, *f.decryptor, f.scale);
+
+    llama::BatchActivation aux = run(aux_cfg, 2u, true, deep);
+    const int aux_depth = aux.column[0].depth();
+    const auto aux_out = f.op->decrypt(aux, *f.decryptor, f.scale);
+
+    std::cout << "rms_norm from depth " << deep << " of " << limbs
+              << ": wide track ends at " << wide_depth
+              << ", auxiliary track at " << aux_depth << " -- "
+              << wide_depth - aux_depth << " levels back" << std::endl;
+
+    // The saving, which is the whole reason to pay a bootstrap.
+    EXPECT_LT(aux_depth, wide_depth)
+        << "refresh_sum did not move the fit off the wide track";
+
+    const double worst = worst_abs(wide_out, aux_out);
+    const double magnitude = mean_abs(wide_out);
+    std::cout << "wide vs auxiliary track: worst " << worst
+              << " on a mean magnitude of " << magnitude << std::endl;
+    ASSERT_FALSE(std::isnan(worst));
+    // A bootstrap sits between the two, so this is bootstrap precision and
+    // not reassociation. Judged on the ratio, as everything here is.
+    EXPECT_LT(worst, 1e-4 + 5e-2 * magnitude);
+
+    // And the other direction, which is why this is a flag and not a default:
+    // on a FRESH stream the refresh costs levels instead of returning them,
+    // because a bootstrap lands at refresh_levels however shallow its input.
+    llama::BatchActivation fresh_wide = run(plain_cfg, 3u, false, 0);
+    llama::BatchActivation fresh_aux = run(aux_cfg, 4u, true, 0);
+    std::cout << "from a FRESH stream: wide " << fresh_wide.column[0].depth()
+              << ", auxiliary " << fresh_aux.column[0].depth() << std::endl;
+    EXPECT_GT(fresh_aux.column[0].depth(), fresh_wide.column[0].depth())
+        << "if a refresh were free on a fresh stream it should be the default";
+}
+
+// The two ways to get refresh_sum silently wrong, both refused.
+TEST(HEonGPU, CKKS_Llama3Batch16Block_RefreshSumRefusesItsBadCombinations)
+{
+    llama::Batch16Shape shape = SmallShape();
+    shape.d_model = 4;
+    shape.hidden = 8;
+    Fixture f(shape, 12);
+
+    const int d = Fixture::d;
+    const auto x = f.random_batch(d, shape.d_model, 707u, 0.5);
+    const std::vector<double> no_gain;
+
+    llama::Llama3Batch16Operator::RMSNormConfig cfg;
+    cfg.degree = 15;
+    cfg.newton_iterations = 0;
+    cfg.sum_lo = 1e-3;
+    cfg.sum_hi = 6.0e1;
+    cfg.refresh_sum = true;
+
+    // No boot key: the slot core throws rather than quietly not refreshing.
+    llama::BatchActivation a =
+        f.op->encrypt(x, d, shape.d_model, *f.encryptor, f.scale);
+    EXPECT_THROW(f.nl->rms_norm(a, no_gain, cfg, *f.galois, *f.relin),
+                 std::invalid_argument);
+
+    // sum_pre_scaled runs its own circuit and never reaches the slot core, so
+    // refresh_sum there would be accepted and do nothing. Refused up front.
+    llama::Llama3Batch16Operator::RMSNormConfig both = cfg;
+    both.sum_pre_scaled = true;
+    llama::BatchActivation b =
+        f.op->encrypt(x, d, shape.d_model, *f.encryptor, f.scale);
+    EXPECT_THROW(f.nl->rms_norm(b, no_gain, both, *f.galois, *f.relin,
+                                f.galois.get()),
+                 std::invalid_argument);
+
+    // A Newton step refines against the unmapped argument.
+    llama::Llama3Batch16Operator::RMSNormConfig newton = cfg;
+    newton.newton_iterations = 1;
+    llama::BatchActivation c =
+        f.op->encrypt(x, d, shape.d_model, *f.encryptor, f.scale);
+    EXPECT_THROW(f.nl->rms_norm(c, no_gain, newton, *f.galois, *f.relin,
+                                f.galois.get()),
+                 std::invalid_argument);
+}
+
+// ======================================================================
+// 9. The hoisting lever, which this path had no way to pull
 // ======================================================================
 
 // set_hoisted_crossings shares one key-switch decomposition across the 15

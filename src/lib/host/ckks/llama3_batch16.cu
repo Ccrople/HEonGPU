@@ -294,6 +294,24 @@ namespace heongpu
                     "and forming the mean would multiply that by 1/channels: "
                     "the fit has to carry the division instead");
             }
+            if (config.refresh_sum && config.sum_pre_scaled)
+            {
+                // pre_scaled_norm runs its own circuit and never reaches the
+                // slot core, so refresh_sum would be accepted and silently do
+                // nothing. Refused rather than ignored.
+                throw std::invalid_argument(
+                    "sum_pre_scaled runs the norm's circuit here rather than "
+                    "in the slot core, so it cannot also refresh the sum: "
+                    "choose one");
+            }
+            if (config.refresh_sum && config.newton_iterations > 0)
+            {
+                throw std::invalid_argument(
+                    "A Newton step refines against the unmapped summed "
+                    "square, and a refreshed sum arrives mapped: raise the "
+                    "fit degree instead, which the auxiliary track makes "
+                    "free");
+            }
             if (!(config.sum_hi > config.sum_lo) || !(config.sum_lo > 0.0))
             {
                 throw std::invalid_argument(
@@ -329,7 +347,12 @@ namespace heongpu
             // plaintext instead; see RMSNormConfig::sum_pre_scaled.
             slot_config.fold_affine_into_mask = false;
             slot_config.output_scale = config.output_scale;
-            slot_config.refresh_sum = false;
+            // The narrow auxiliary track. Was hard-coded false here, which
+            // made the slot core's own implementation unreachable from this
+            // path -- and this is the encoding where it is cheapest, because
+            // the channel reduction lands in exactly one ciphertext however
+            // wide the model is.
+            slot_config.refresh_sum = config.refresh_sum;
         }
 
         std::vector<Ciphertext<Scheme::CKKS>>
@@ -408,7 +431,8 @@ namespace heongpu
                                         const std::vector<double>& gain,
                                         const RMSNormConfig& config,
                                         Galoiskey<Scheme::CKKS>& galois_key,
-                                        Relinkey<Scheme::CKKS>& relin_key)
+                                        Relinkey<Scheme::CKKS>& relin_key,
+                                        Galoiskey<Scheme::CKKS>* boot_key)
         {
             const int channels = x.columns();
             validate(x, channels, "rms_norm");
@@ -437,7 +461,7 @@ namespace heongpu
 
             std::vector<Ciphertext<Scheme::CKKS>> normalised =
                 norm_core(slots, gain, config, slot_config, galois_key,
-                          relin_key);
+                          relin_key, boot_key);
             // Released before the return crossing, which
             // Llama3BatchOperator::rms_norm does not do: 4096 ciphertexts and
             // 17.5 GiB at the 8B shape, and the difference between its frame
@@ -456,7 +480,8 @@ namespace heongpu
             std::vector<Ciphertext<Scheme::CKKS>>& slots,
             const std::vector<double>& gain, const RMSNormConfig& config,
             Galoiskey<Scheme::CKKS>& galois_key,
-            Relinkey<Scheme::CKKS>& relin_key)
+            Relinkey<Scheme::CKKS>& relin_key,
+            Galoiskey<Scheme::CKKS>* boot_key)
         {
             if (slots.empty())
             {
@@ -485,8 +510,9 @@ namespace heongpu
 
             Llama3Operator::RMSNormConfig slot_config;
             fill_slot_config(slot_config, config, channels);
-            std::vector<Ciphertext<Scheme::CKKS>> out = norm_core(
-                slots, gain, config, slot_config, galois_key, relin_key);
+            std::vector<Ciphertext<Scheme::CKKS>> out =
+                norm_core(slots, gain, config, slot_config, galois_key,
+                          relin_key, boot_key);
             note_depth("rms_norm_slots.out", out);
             return out;
         }
@@ -497,7 +523,8 @@ namespace heongpu
             const std::vector<double>& gain, const RMSNormConfig& config,
             const Llama3Operator::RMSNormConfig& slot_config,
             Galoiskey<Scheme::CKKS>& galois_key,
-            Relinkey<Scheme::CKKS>& relin_key)
+            Relinkey<Scheme::CKKS>& relin_key,
+            Galoiskey<Scheme::CKKS>* boot_key)
         {
             const int channels = static_cast<int>(slots.size());
 
@@ -513,7 +540,7 @@ namespace heongpu
                 // -- only the config it is handed.
                 std::vector<Plaintext<Scheme::CKKS>> no_weights;
                 normalised = arith().rms_norm(slots, no_weights, slot_config,
-                                              galois_key, relin_key);
+                                              galois_key, relin_key, boot_key);
             }
             note_depth("rms_norm.normalised", normalised);
 
@@ -1303,6 +1330,17 @@ namespace heongpu
             const TransformerBlockConfig& config,
             Galoiskey<Scheme::CKKS>* boot_key) const
         {
+            // The narrow auxiliary track needs the key whether or not the
+            // block refreshes at a seam, and it is a different config object,
+            // so it is checked first and separately.
+            if (boot_key == nullptr &&
+                (config.attention_norm.refresh_sum ||
+                 config.feed_forward_norm.refresh_sum))
+            {
+                throw std::invalid_argument(
+                    "RMSNormConfig::refresh_sum needs the boot Galois key, "
+                    "built from boot_rotation_indices()");
+            }
             if (!config.refresh.enabled)
             {
                 return;
@@ -1362,8 +1400,9 @@ namespace heongpu
                     gain.clear();
                 }
 
-                BatchActivation normed = rms_norm(
-                    stream, gain, config.attention_norm, galois_key, relin_key);
+                BatchActivation normed =
+                    rms_norm(stream, gain, config.attention_norm, galois_key,
+                             relin_key, boot_key);
                 seam("block.after_attention_norm", normed,
                      config.refresh.enabled && config.refresh.after_attention_norm,
                      boot_key, relin_key);
@@ -1404,7 +1443,7 @@ namespace heongpu
 
                 BatchActivation normed =
                     rms_norm(stream, gain, config.feed_forward_norm,
-                             galois_key, relin_key);
+                             galois_key, relin_key, boot_key);
                 seam("block.after_feed_forward_norm", normed,
                      config.refresh.enabled &&
                          config.refresh.after_feed_forward_norm,
@@ -1513,7 +1552,8 @@ namespace heongpu
                 {
                     normed.block.push_back(rms_norm(
                         stream.block[static_cast<std::size_t>(t)], gain,
-                        config.attention_norm, galois_key, relin_key));
+                        config.attention_norm, galois_key, relin_key,
+                        boot_key));
                 }
                 seam("block.after_attention_norm", normed,
                      config.refresh.enabled &&
@@ -1563,7 +1603,8 @@ namespace heongpu
                 {
                     normed.block.push_back(rms_norm(
                         stream.block[static_cast<std::size_t>(t)], gain,
-                        config.feed_forward_norm, galois_key, relin_key));
+                        config.feed_forward_norm, galois_key, relin_key,
+                        boot_key));
                 }
                 seam("block.after_feed_forward_norm", normed,
                      config.refresh.enabled &&
