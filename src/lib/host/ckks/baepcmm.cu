@@ -799,7 +799,9 @@ namespace heongpu
                 Ciphertext<Scheme::CKKS> term(*in[0]);
                 cudaMemsetAsync(term.data(), 0, 2 * poly * sizeof(Data64),
                                 cudaStreamDefault);
-                cudaMemcpyAsync(term.data(),
+                // Atilde_j is the part that gets multiplied by the secret,
+                // so it goes in component 1; component 0 stays zero.
+                cudaMemcpyAsync(term.data() + poly,
                                 a_stage.data() + static_cast<size_t>(j) * poly,
                                 poly * sizeof(Data64), cudaMemcpyDeviceToDevice,
                                 cudaStreamDefault);
@@ -826,7 +828,8 @@ namespace heongpu
             Ciphertext<Scheme::CKKS> btilde(*in[0]);
             cudaMemsetAsync(btilde.data(), 0, 2 * poly * sizeof(Data64),
                             cudaStreamDefault);
-            cudaMemcpyAsync(btilde.data() + poly, b_stage.data(),
+            // Btilde is added straight in, so it is component 0.
+            cudaMemcpyAsync(btilde.data(), b_stage.data(),
                             poly * sizeof(Data64), cudaMemcpyDeviceToDevice,
                             cudaStreamDefault);
             HEONGPU_CUDA_CHECK(cudaGetLastError());

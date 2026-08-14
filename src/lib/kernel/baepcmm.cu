@@ -20,10 +20,14 @@ namespace heongpu
         const int i = r / k;
         const int u = r - i * k;
 
-        // in[i] is the a-part; the b-part starts one component later, and a
-        // component is limbs * n words.
-        const Data64* beta = in[i] + static_cast<size_t>(limbs) * n +
-                             static_cast<size_t>(limb) * n;
+        // COMPONENT ORDER. sk_multiplication_ckks computes
+        // plaintext = ct_0 + ct_1 * sk (src/lib/kernel/decryption.cu:359-364),
+        // so component 0 is the b-part and component 1 is the a-part. That is
+        // the reverse of the paper's (a, b) naming, and it is invisible at
+        // k = 1 -- U hits both components alike, so a consistent swap cancels
+        // -- but it is fatal in ModPack, which multiplies exactly one of them
+        // by the secret.
+        const Data64* beta = in[i] + static_cast<size_t>(limb) * n;
 
         out[(static_cast<size_t>(limb) * gridDim.y + r) * cols + t] =
             beta[static_cast<size_t>(t) * k + u];
@@ -47,7 +51,9 @@ namespace heongpu
         const int j = idx / cols; // which MLWE a-component
         const int t = idx - j * cols; // coefficient inside it
 
-        const Data64* alpha = in[i] + static_cast<size_t>(limb) * n;
+        // Component 1 is the a-part; see the note in bae_gather_b_kernel.
+        const Data64* alpha = in[i] + static_cast<size_t>(limbs) * n +
+                              static_cast<size_t>(limb) * n;
 
         Data64 v;
         if (j <= u)
@@ -174,10 +180,11 @@ namespace heongpu
         const int r = blockIdx.y;
         const int limb = blockIdx.z;
 
+        // b-part into component 0, a-part into component 1.
         Data64* dst = outs[r] + static_cast<size_t>(limb) * n;
-        dst[t] = A[(static_cast<size_t>(limb) * d1 + r) * n + t];
+        dst[t] = B[(static_cast<size_t>(limb) * d1 + r) * n + t];
         dst[static_cast<size_t>(limbs) * n + t] =
-            B[(static_cast<size_t>(limb) * d1 + r) * n + t];
+            A[(static_cast<size_t>(limb) * d1 + r) * n + t];
     }
 
 
