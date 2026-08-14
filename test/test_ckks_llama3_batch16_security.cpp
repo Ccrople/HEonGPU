@@ -675,6 +675,178 @@ TEST(Batch16Security, APrefixThatIsNotAPrefixIsRejected)
 }
 
 // =====================================================================
+// 5bis. The parameter frontier: what a cheaper refresh is worth
+// =====================================================================
+
+// Every parameter set in this project was written down rather than solved
+// for, and the axis nobody had searched is PRIME WIDTH. At a fixed cap the
+// choice is between a long chain of narrow primes and a short chain of wide
+// ones, and width is precision -- so the right question is not "how long a
+// chain fits" but "what is the widest prime that still carries the schedule".
+//
+// The lever that moves the whole frontier is the refresh cost, because it is
+// the bigger term: 25 levels of bootstrap against 17 of block.
+TEST(Batch16Frontier, EveryLevelSavedOnTheRefreshBuysPrecision)
+{
+    // The block's measured stretch at the tests' cheap fit degrees.
+    const int work = 17;
+
+    struct Row
+    {
+        int refresh;
+        int prime_bits; // the widest that carries it at logN 16
+    };
+    // Read this table as the answer to "what is a cheaper bootstrap worth":
+    // not speed, which is the obvious answer, but PRECISION, because the
+    // limbs it frees can be spent on width instead of length.
+    const std::vector<Row> rows{
+        {25, 40}, // regular_bootstrapping, the library's v1 default
+        {22, 42}, {19, 46}, {15, 51}, {10, 60}, // 60 is the library's ceiling
+    };
+
+    for (const Row& r : rows)
+    {
+        const llama::Frontier f = llama::best_plan(
+            65536, kHeadDim, r.refresh, work, 1, sec_level_type::sec128);
+        ASSERT_TRUE(f.feasible()) << "refresh " << r.refresh;
+        EXPECT_EQ(f.prime_bits, r.prime_bits) << "refresh " << r.refresh;
+        EXPECT_GE(f.levels_for_work, work) << "refresh " << r.refresh;
+        EXPECT_EQ(f.batch, 256);
+
+        // And the set it names really is admissible, by the library's rules.
+        const llama::ModulusPlan plan = llama::make_plan(
+            65536, f.limbs, f.prime_bits, f.prime_bits, 1, f.prime_bits);
+        EXPECT_TRUE(llama::inspect(plan, sec_level_type::sec128).admissible())
+            << "refresh " << r.refresh;
+        EXPECT_EQ(library_verdict(plan, sec_level_type::sec128), Build::Ok)
+            << "refresh " << r.refresh;
+    }
+}
+
+TEST(Batch16Frontier, AtTheLibraryDefaultRefreshOnlyOneRingIsReachable)
+{
+    const heongpu::BootstrappingConfig boot;
+    const int refresh = llama::Llama3Batch16Operator::refresh_levels(boot);
+    ASSERT_EQ(refresh, 25);
+
+    const std::vector<llama::Frontier> ladder = llama::parameter_frontier(
+        kHeadDim, refresh, 17, 1, sec_level_type::sec128);
+    ASSERT_EQ(ladder.size(), 5u);
+
+    for (const llama::Frontier& f : ladder)
+    {
+        if (f.n == 65536)
+        {
+            EXPECT_TRUE(f.feasible());
+            EXPECT_EQ(f.batch, 256);
+            EXPECT_EQ(f.prime_bits, 40);
+            EXPECT_EQ(f.limbs, 43);
+            EXPECT_EQ(f.levels_for_work, 17);
+        }
+        else
+        {
+            EXPECT_FALSE(f.feasible())
+                << "N = " << f.n << " became reachable at a 25-level refresh";
+        }
+    }
+}
+
+TEST(Batch16Frontier, ACheapEnoughRefreshUnlocksARingAndHalvesTheWorkingSet)
+{
+    // The result that matters for cost rather than for legality. Batch 128 is
+    // half the resident ciphertexts of batch 256, and it is unreachable at 25
+    // levels and reachable at 10 -- so the bootstrap's level cost decides the
+    // WORKING SET, not just the chain.
+    EXPECT_FALSE(llama::best_plan(32768, kHeadDim, 25, 17, 1,
+                                  sec_level_type::sec128)
+                     .feasible());
+    EXPECT_FALSE(llama::best_plan(32768, kHeadDim, 15, 17, 1,
+                                  sec_level_type::sec128)
+                     .feasible());
+
+    const llama::Frontier cheap =
+        llama::best_plan(32768, kHeadDim, 10, 17, 1, sec_level_type::sec128);
+    EXPECT_TRUE(cheap.feasible());
+    EXPECT_EQ(cheap.batch, 128);
+    EXPECT_EQ(cheap.prime_bits, 30);
+
+    // affordable_refresh states the same boundary from the other side, which
+    // is the form a bootstrap choice actually needs: not "does this fit" but
+    // "how cheap would it have to be".
+    EXPECT_EQ(llama::affordable_refresh(32768, 17, 30, 1,
+                                        sec_level_type::sec128),
+              10);
+    EXPECT_EQ(llama::affordable_refresh(65536, 17, 40, 1,
+                                        sec_level_type::sec128),
+              25);
+    EXPECT_EQ(llama::affordable_refresh(65536, 17, 60, 1,
+                                        sec_level_type::sec128),
+              10);
+}
+
+TEST(Batch16Frontier, BelowLogNFifteenAFreeBootstrapWouldNotBeEnough)
+{
+    // The strongest form of the batch-16 result, and it removes any hope that
+    // a better bootstrap rescues the small rings: at a 17-level stretch, logN
+    // 14 and below cannot carry the block even if the refresh cost NOTHING.
+    // The stretch alone is more than the ring holds.
+    for (int n : {4096, 8192, 16384})
+    {
+        EXPECT_FALSE(
+            llama::best_plan(n, kHeadDim, 0, 17, 1, sec_level_type::sec128)
+                .feasible())
+            << "N = " << n;
+        EXPECT_EQ(llama::affordable_refresh(n, 17, MIN_USER_DEFINED_MOD_BIT_COUNT,
+                                            1, sec_level_type::sec128),
+                  -1)
+            << "N = " << n;
+    }
+
+    // And logN 15 can, but only just, and only with a free bootstrap at the
+    // widest primes -- which is what makes 10 the interesting threshold.
+    EXPECT_TRUE(
+        llama::best_plan(32768, kHeadDim, 0, 17, 1, sec_level_type::sec128)
+            .feasible());
+}
+
+TEST(Batch16Frontier, TheFrontierAgreesWithMaxLimbsAtEveryWidth)
+{
+    // best_plan searches; max_limbs solves. They must not disagree, and the
+    // closed form (cap/w - specials) is the third opinion.
+    for (int n : {4096, 8192, 16384, 32768, 65536})
+    {
+        const int cap = llama::security_cap(n, sec_level_type::sec128);
+        for (int w = MIN_USER_DEFINED_MOD_BIT_COUNT;
+             w <= MAX_USER_DEFINED_MOD_BIT_COUNT; ++w)
+        {
+            for (int specials : {1, 2})
+            {
+                const int limbs =
+                    llama::max_limbs(n, w, w, specials, w,
+                                     sec_level_type::sec128);
+                const int closed = std::max(0, cap / w - specials);
+                EXPECT_EQ(limbs, closed)
+                    << "N = " << n << ", w = " << w << ", specials = "
+                    << specials;
+            }
+        }
+    }
+}
+
+TEST(Batch16Frontier, TheFrontierRefusesToAnswerWithoutACap)
+{
+    EXPECT_THROW(llama::best_plan(65536, kHeadDim, 25, 17, 1,
+                                  sec_level_type::none),
+                 std::invalid_argument);
+    EXPECT_THROW(llama::best_plan(65536, kHeadDim, -1, 17, 1,
+                                  sec_level_type::sec128),
+                 std::invalid_argument);
+    EXPECT_THROW(llama::affordable_refresh(65536, -1, 40, 1,
+                                           sec_level_type::sec128),
+                 std::invalid_argument);
+}
+
+// =====================================================================
 // 6. The module's own contracts
 // =====================================================================
 

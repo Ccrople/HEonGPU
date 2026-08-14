@@ -324,6 +324,111 @@ namespace heongpu
                                        int big_special_bits = 0);
 
         // -------------------------------------------------------------------
+        // The parameter frontier
+        // -------------------------------------------------------------------
+        //
+        // max_limbs answers "how long a chain fits at THIS prime size". The
+        // more useful question is the other way round, and it is the one a
+        // parameter search should be asking: given a schedule that needs a
+        // certain number of levels, WHAT IS THE WIDEST PRIME THAT STILL FITS?
+        //
+        // Width is precision. A CKKS scale of 2^p carries about p bits, and
+        // every level of the chain is one prime, so at a fixed cap the choice
+        // is between a long chain of narrow primes and a short chain of wide
+        // ones. The library's floor of 30 bits is the narrow end; 60 is the
+        // wide end. Nothing in this project had ever searched that axis --
+        // every parameter set in the tree was written down, not solved for.
+        //
+        // The lever that moves the whole frontier is THE REFRESH COST. A chain
+        // must hold `refresh + work + 1` limbs, and the refresh is the bigger
+        // term: 25 levels at the library's default v1 configuration against a
+        // block that spends 17. So halving the refresh does not halve the
+        // chain -- it very nearly halves it, and each limb it frees can be
+        // spent on WIDTH instead of length. That is why a cheaper bootstrap is
+        // a precision result and a security result at once, and it is what
+        // best_plan is for.
+
+        /**
+         * @brief The best admissible parameter set at one ring.
+         *
+         * "Best" means the widest primes that still carry the schedule, which
+         * is the same as the most accurate set that is legal -- not the
+         * longest chain, which is what a search would find if it optimised the
+         * obvious quantity.
+         */
+        struct Frontier
+        {
+            int n = 0;
+            /// Instances the Kang encoding carries at this ring, N/(2*d).
+            int batch = 0;
+            int cap = 0;
+            /// The widest uniform prime that still carries the schedule; 0 if
+            /// none does.
+            int prime_bits = 0;
+            int specials = 0;
+            /// Limbs the chain has at that prime size.
+            int limbs = 0;
+            /// Levels left over for the schedule after the refresh takes its
+            /// share and one prime is left for the next bootstrap.
+            int levels_for_work = 0;
+            /// The longest chain this ring admits at ANY prime size, which is
+            /// the narrow-prime end of the same frontier.
+            int max_limbs_at_floor = 0;
+
+            bool feasible() const noexcept { return prime_bits > 0; }
+        };
+
+        /**
+         * @brief The widest primes at @p n that still carry the schedule.
+         *
+         * Searches prime widths downward from MAX_USER_DEFINED_MOD_BIT_COUNT
+         * and stops at the first that admits `refresh_levels + work + 1`
+         * limbs, so the result is the most precise legal set rather than the
+         * longest one.
+         *
+         * @param refresh_levels Levels a refresh spends on itself. Pass 0 for
+         *        a schedule that never bootstraps.
+         * @param work Levels the schedule spends between two refreshes -- the
+         *        worst stretch.
+         *
+         * @throws std::invalid_argument for a negative refresh or work count,
+         *         or for sec_level_type::none, which imposes no cap and so has
+         *         no frontier.
+         */
+        Frontier best_plan(int n, int head_dim, int refresh_levels, int work,
+                           int specials, sec_level_type level);
+
+        /**
+         * @brief best_plan at every ring the library supports, smallest first.
+         *
+         * This is the table to read when choosing a batch size, because on
+         * this encoding the batch size IS the ring. Entries that cannot carry
+         * the schedule are returned with feasible() false rather than dropped,
+         * so the ladder shows where the boundary is.
+         */
+        std::vector<Frontier> parameter_frontier(int head_dim,
+                                                 int refresh_levels, int work,
+                                                 int specials,
+                                                 sec_level_type level);
+
+        /**
+         * @brief The cheapest refresh that makes @p n carry the schedule.
+         *
+         * Inverts best_plan on its most important argument: rather than "does
+         * this bootstrap fit", it answers "how cheap would a bootstrap have to
+         * be". A concrete target for choosing between the library's four
+         * bootstrap entry points, and the number that decides whether a ring
+         * is reachable at all.
+         *
+         * @return The largest refresh cost at which @p n admits the schedule
+         *         at @p prime_bits, or -1 if no refresh cost works -- which
+         *         means the ring cannot carry `work` levels even with a free
+         *         bootstrap.
+         */
+        int affordable_refresh(int n, int work, int prime_bits, int specials,
+                               sec_level_type level);
+
+        // -------------------------------------------------------------------
         // The block-shaped question
         // -------------------------------------------------------------------
 

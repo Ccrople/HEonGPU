@@ -280,6 +280,84 @@ namespace heongpu
             return 0;
         }
 
+        Frontier best_plan(int n, int head_dim, int refresh_levels, int work,
+                           int specials, sec_level_type level)
+        {
+            if (refresh_levels < 0 || work < 0)
+            {
+                throw std::invalid_argument(
+                    "A refresh and a stretch spend a non-negative number of "
+                    "levels");
+            }
+            if (level == sec_level_type::none)
+            {
+                throw std::invalid_argument(
+                    "sec_level_type::none imposes no cap, so there is no "
+                    "frontier to report");
+            }
+
+            Frontier f;
+            f.n = n;
+            f.specials = specials;
+            f.cap = security_cap(n, level);
+            f.batch = (n % (2 * head_dim) == 0) ? n / (2 * head_dim) : 0;
+
+            // A chain must hold the refresh, the stretch, and one prime for
+            // the next bootstrap to be handed.
+            const int wanted = refresh_levels + work + 1;
+
+            // Widest first: width is precision, and the point of the search is
+            // the most accurate legal set rather than the longest one.
+            for (int w = MAX_USER_DEFINED_MOD_BIT_COUNT;
+                 w >= MIN_USER_DEFINED_MOD_BIT_COUNT; --w)
+            {
+                const int limbs = max_limbs(n, w, w, specials, w, level);
+                if (limbs > f.max_limbs_at_floor)
+                {
+                    f.max_limbs_at_floor = limbs;
+                }
+                if (f.prime_bits == 0 && limbs >= wanted)
+                {
+                    f.prime_bits = w;
+                    f.limbs = limbs;
+                    f.levels_for_work = limbs - refresh_levels - 1;
+                }
+            }
+            return f;
+        }
+
+        std::vector<Frontier> parameter_frontier(int head_dim,
+                                                 int refresh_levels, int work,
+                                                 int specials,
+                                                 sec_level_type level)
+        {
+            std::vector<Frontier> out;
+            for (int n : legal_rings())
+            {
+                out.push_back(best_plan(n, head_dim, refresh_levels, work,
+                                        specials, level));
+            }
+            return out;
+        }
+
+        int affordable_refresh(int n, int work, int prime_bits, int specials,
+                               sec_level_type level)
+        {
+            if (work < 0)
+            {
+                throw std::invalid_argument(
+                    "A stretch spends a non-negative number of levels");
+            }
+            const int limbs =
+                max_limbs(n, prime_bits, prime_bits, specials, prime_bits,
+                          level);
+            // limbs >= refresh + work + 1, so refresh <= limbs - work - 1. A
+            // negative answer means the ring cannot hold the stretch even with
+            // a refresh that costs nothing.
+            const int budget = limbs - work - 1;
+            return budget < 0 ? -1 : budget;
+        }
+
         bool TwoRingPlan::shares_prefix() const
         {
             if (island.log_q.empty() || big.log_q.empty())
