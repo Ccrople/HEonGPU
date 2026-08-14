@@ -3731,7 +3731,7 @@ Sicily, `N = 4096, d = 128, k = 32, batch = 16`. Model widths cut down —
 `d_model` 4-8, `hidden` 8-16 — because what is under test is the SCHEDULE and
 the CAUSALITY, which are properties of the circuit and not of the width.
 
-**19 of 19 green.**
+**20 of 20 green.**
 
 | what | measured |
 |---|---|
@@ -3781,27 +3781,27 @@ returned `chain - 25` limbs to the digit. The feed-forward half then spent
 `44 - 25 = 19` levels, which is `9 + 9 + 1` from the table above, again to the
 digit.
 
-**Regressions: 64 green, and three that could not be run.** Green:
-`llama3_batch16` (17), `llama3_batch` (13), `llama3_batch_softmax` (9),
-`batchmatrix_shared` (6), `batchmatrix_gpu` (12), `batch_ringswitch` (7), and
-35 of 38 in `llama3_rect`.
+**Regressions: 102 green, none failing.** `llama3_batch16` (17),
+`llama3_batch` (13), `llama3_batch_softmax` (9), `batchmatrix_shared` (6),
+`batchmatrix_gpu` (12), `batch_ringswitch` (7), and **`llama3_rect` 38 of 38**.
 
-The three that failed are `llama3_rect`'s attention tests, and they failed the
-same way each time: **an RMM pool ceiling at 21.88 GiB**, `current/max =
-21.882/21.884` — the `max == cap` signature that says the pool was sized small
-at context generate, not that the circuit grew. The tests print their score
-range and then die allocating 2.6 MiB. No card on the box had room to rerun
-them (three sessions were sharing it; the most free memory anywhere was 24 GB),
-so **they are unverified rather than green, and that is stated rather than
-rounded off.**
+That last one took two runs and the difference is worth recording, because the
+first one looked exactly like a regression and was not. Three `llama3_rect`
+attention tests failed with **an RMM pool ceiling at 21.88 GiB** —
+`current/max = 21.882/21.884`, the `max == cap` signature that says the pool
+was sized small at context generate rather than that the circuit grew. They
+print their score range and then die allocating 2.6 MiB. Three sessions were
+sharing the box at the time. Rerun on a card with 44 GB free, **the identical
+binary passes all three** (`AttentionMatchesHostReference` in 30.7 s, where the
+failing run gave up after 6.9 s).
 
-What can be said without a card: the only behaviour this work exposes to the
-rectangular path is `causal_column_mask(key)`, which now delegates to
-`causal_column_mask(0, 0, key)` — and that delegation is asserted bit-identical
-by `ASSERT_DOUBLE_EQ` over **every** key in `[0, d)` and every slot, not a
-sample, precisely because `Llama3RectOperator::attention` calls it for every
-`j` and one ulp on one key would move that path's SoftMax silently. `cmt`,
-`ccmm` and every other shared entry point are untouched.
+So the rectangular path is untouched, and it is worth saying why it could have
+been: `Llama3RectOperator::attention` calls `batch_.causal_column_mask(j)` for
+every `j` (`llama3_rect.cu:2485`), and that function now delegates to the
+blocked one. The delegation is asserted bit-identical by `ASSERT_DOUBLE_EQ`
+over **every** key in `[0, d)` and every slot — not a sample — precisely
+because one ulp on one key would move that path's SoftMax and nothing else
+would notice. `cmt`, `ccmm` and every other shared entry point are unchanged.
 
 **One thing this run established that is not about either gap.** The first
 attempt failed all twelve GPU tests at once with an RMM pool ceiling of 3.72
@@ -3810,7 +3810,50 @@ run. That is the failure mode `rmm-pool-ceiling-not-working-set` describes:
 `max == cap` in the error means the pool was sized small at context generate,
 not that the circuit is too big. Moving to a card with room ran the identical
 binary green.
-### 25.6 Open
+### 25.6 Which seams are load-bearing: three of five, and the widest one is not
+
+The schedule shipped with six named seams and no evidence about which of them a
+batch-16 block needs. Measuring it is cheap and the method is the only honest
+one: run the block ONCE with the refresh **off**, record the depth at every
+seam point in execution order, and read the stretches off. That is valid
+because a stage's level spend is a property of its operations and not of the
+depth it starts at — which is the same fact that lets a bootstrap be moved at
+all. The search over the 32 subsets is then host arithmetic.
+
+Measured seam depths (cheap fits, so a 13-level seam):
+
+```
+entry 0 | after_attention_norm 9 | after_attention 26 | mid 27
+        | after_feed_forward_norm 36 | feed_forward.hidden 43 | out 46
+```
+
+| schedule | seams | worst stretch | chain |
+|---|---:|---:|---:|
+| all five optional seams on | 5 | 17 | 43 limbs |
+| **`after_attention_norm`, `after_attention`, `after_feed_forward_norm`** | **3** | **17** | **43 limbs** |
+
+**`block.mid` and the SwiGLU's hidden seam are redundant.** They split
+stretches that are already shorter than the attention sublayer's, so they buy
+no chain and cost a bootstrap per column. And counting seams understates it,
+because the seams are not the same width: at the 8B shape the four residual-
+width seams are 4,096 columns each and the hidden one is **14,336**, so the
+five-seam schedule is 30,720 bootstraps a block and the three-seam schedule is
+**12,288 — a 60% cut at an identical chain.**
+
+**The binding stretch is the attention sublayer, at 17 of the block's 46
+levels**, and that is where any further saving has to come from. Nothing
+outside it matters: a seam anywhere else is splitting something the chain
+already accommodates. The one lever that reaches inside it already exists and
+is off — `BatchSoftmaxSeamConfig::refresh_denominator`, the paper's narrow
+auxiliary track, which refreshes the denominator alone (one ciphertext however
+many parts the key axis has) rather than the wide track.
+
+This was measured at the cheap fit degrees. At the production degrees the seam
+is 23 rather than 13, so the attention stretch grows to 27 while every other
+stretch is unchanged — the dominance is *stronger* and the two redundant seams
+stay redundant.
+
+### 25.7 Open
 
 1. **Nothing here is timed.** The tests establish algebra, causality, levels and
    precision. Every figure in §25.3 is arithmetic over the shape.
@@ -3821,7 +3864,11 @@ binary green.
    and their mask table are not written; running the causal schedule for a
    non-causal request would be a different model that still returns numbers, so
    it throws.
-4. **The refresh schedule is not tuned.** Six seams are named and any of them
-   can be switched off, but which set minimises the chain at this shape is a
-   `depth_trace` run that has not been made — and at 8B widths that run is the
-   OOM this session was told not to attempt.
+4. **The attention sublayer's 17 levels are now the only thing setting the
+   chain**, and the lever that reaches inside it —
+   `BatchSoftmaxSeamConfig::refresh_denominator` — is off and unmeasured on
+   this path. §25.6 says what it would be worth if it works: the stretch is 17
+   of 46 and everything else is already slack.
+5. **Nothing is measured at 8B width**, which is the OOM this session was told
+   not to attempt. Every count in §25.3 is arithmetic over the shape, and the
+   seam schedule in §25.6 was measured at `d_model` 4.
