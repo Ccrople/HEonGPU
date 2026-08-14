@@ -2563,12 +2563,16 @@ residual" 4):
 | **feed-forward half** | **26** | **18** |
 | of which crossings | **8** | **0** |
 
-The decomposition checks: rect's norm is crossing 2 + square 1 + masked
-reduction 1 + degree-15 fit 5 + apply 1 + return crossing 2 = 12; this one is
-square 1 + degree-31 fit 6 + apply 1 = 8. The two non-crossing differences —
-rect's masked reduction (+1) and its lower fit degree (−1) — cancel, which is
-why the 8 levels saved are exactly the 8 crossing levels and not approximately
-them.
+**Read the totals as measured and the breakdowns as sourced.** Both totals are
+measured — 18 from the depth trace above, 26 from `llama3_rect.cuh`'s own
+table. The Bae breakdown is exact (square 1 + degree-31 fit 6 + apply 1 = 8).
+The rect SwiGLU breakdown is that file's own words, "projection 1 + crossing 2
++ SiLU 5 + gate product 1"; its *norm* breakdown — crossing 2 + square 1 +
+masked reduction 1 + degree-15 fit 5 + apply 1 + return crossing 2 = 12 — is my
+reconstruction of a measured total, and it is the one line here to re-derive
+before quoting. On that reading the two non-crossing differences (rect's masked
+reduction +1, its lower fit degree −1) cancel, which is why the 8 levels saved
+are exactly the 8 crossing levels rather than approximately them.
 
 **Other results:**
 
