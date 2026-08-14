@@ -37,6 +37,7 @@
 #include <heongpu/host/ckks/llama3_batch.cuh>
 #include <heongpu/host/ckks/llama3_batch16.cuh>
 #include <heongpu/host/ckks/llama3_rect.cuh>
+#include <heongpu/host/ckks/llama3_security.cuh>
 #include <heongpu/host/ckks/ringswitch.cuh>
 
 #include <heongpu/host/tfhe/context.cuh>

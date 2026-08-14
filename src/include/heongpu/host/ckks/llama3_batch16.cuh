@@ -846,7 +846,130 @@ namespace heongpu
 
                 /// Refreshes one block takes with these flags.
                 int count() const;
+
+                /// The flag at seam position @p position, in the order of
+                /// @c seam_position. Indexing rather than naming is what lets
+                /// plan_refresh search the subsets without restating six
+                /// field names, and what keeps the two in step if a seventh
+                /// seam is ever added.
+                bool at(int position) const;
+                void set(int position, bool take);
             };
+
+            /**
+             * @brief The six positions a block can refresh at, in order.
+             *
+             * @c seam_feed_forward_hidden sits INSIDE the stretch that follows
+             * @c seam_after_feed_forward_norm rather than after it, which is
+             * why it is last in this list rather than fifth: the order here is
+             * the order the stream reaches them, and that order is what
+             * plan_refresh walks.
+             */
+            enum seam_position
+            {
+                seam_entry = 0,
+                seam_after_attention_norm,
+                seam_after_attention,
+                seam_mid,
+                seam_after_feed_forward_norm,
+                seam_feed_forward_hidden,
+                seam_count
+            };
+
+            /** @brief The trace name of a seam position. */
+            static const char* seam_name(int position);
+
+            /**
+             * @brief What a refresh schedule has to fit inside.
+             *
+             * The stretches are a MEASUREMENT -- @c depth_trace produces them
+             * and the fit degrees move them -- so they are an input here
+             * rather than a table. That is the point: the subset that is
+             * minimal at one set of degrees is not minimal at another, and
+             * hard-coding an answer measured once is how a default becomes
+             * wrong silently.
+             */
+            struct RefreshPlanInput
+            {
+                /// Levels spent in the stretch FOLLOWING each seam position,
+                /// in seam_position order. Must have seam_count entries.
+                std::vector<int> stretch;
+                /// Ciphertexts refreshed at each position -- the residual
+                /// width at five of them and the SwiGLU hidden width at
+                /// seam_feed_forward_hidden. Empty counts seams instead of
+                /// bootstraps, which understates the hidden seam by 3.5x at
+                /// the 8B shape and is why the widths are here at all.
+                std::vector<long long> width;
+                /// The chain the schedule runs on, in limbs.
+                int chain_limbs = 0;
+                /// Levels a refresh spends on itself; refresh_levels().
+                int refresh_levels = 0;
+                /// Limbs the stream arrives with. 0 means chain_limbs, i.e.
+                /// the first block of a stack, whose input is already fresh.
+                /// Ignored when @c steady_state is set.
+                int entry_limbs = 0;
+                /// Plan a REPEATING block rather than the first one.
+                ///
+                /// This is the distinction that decides the answer, and it is
+                /// easy to miss: a block handed a fresh chain has the whole of
+                /// it to spend before its first refresh, while a block in the
+                /// middle of a stack is handed whatever the previous block
+                /// left. So the cheapest schedule for block 0 is not a legal
+                /// schedule for block 1, and a plan measured on one block and
+                /// applied to a stack fails at the second one -- with a
+                /// level underflow deep inside a sublayer rather than at a
+                /// seam.
+                ///
+                /// Under this flag the plan must have a FIXED POINT: the limbs
+                /// it hands on must be at least the limbs it needs on the way
+                /// in. That is what makes @c seam_entry earn its place.
+                bool steady_state = false;
+            };
+
+            /** @brief The cheapest schedule that fits, and what it costs. */
+            struct RefreshPlan
+            {
+                Batch16RefreshConfig config;
+                /// False when NO subset fits -- which means the chain is too
+                /// short for this schedule and no arrangement of seams will
+                /// save it. Lengthening the chain or shortening a stretch are
+                /// then the only moves, and a caller that ignores this flag
+                /// discovers it by throwing at a seam instead.
+                bool feasible = false;
+                /// Seams taken.
+                int refreshes = 0;
+                /// Ciphertexts bootstrapped -- the weighted cost that was
+                /// actually minimised.
+                long long bootstraps = 0;
+                /// The longest run of stretches between two refreshes under
+                /// this plan; what chain_limbs_for() should be given.
+                int worst_run = 0;
+                /// Limbs the block hands on. Under @c steady_state this is
+                /// also the number it may be handed, which is the fixed point.
+                int exit_limbs = 0;
+            };
+
+            /**
+             * @brief The cheapest set of seams that keeps every stretch inside
+             *        the chain.
+             *
+             * Exhaustive over the 64 subsets, because six positions is small
+             * enough that exact is cheaper than clever, and minimised on
+             * BOOTSTRAPS rather than on seams: five of the positions are
+             * d_model ciphertexts each and the sixth is @c hidden, so at the
+             * 8B shape counting seams gets the answer wrong by 3.5x on the one
+             * that matters most.
+             *
+             * This is host arithmetic over a measurement -- no GPU, no
+             * context, no key -- which is what makes it usable BEFORE a run
+             * rather than after one.
+             *
+             * @throws std::invalid_argument if @c stretch is not seam_count
+             *         long, if @c width is neither empty nor seam_count long,
+             *         if a stretch or width is negative, or if the chain or
+             *         refresh cost is negative.
+             */
+            static RefreshPlan plan_refresh(const RefreshPlanInput& input);
 
             /**
              * @brief Levels one regular bootstrap spends on itself.
@@ -1082,6 +1205,39 @@ namespace heongpu
              */
             void use_fast_bridge(int baby_steps = 0,
                                  std::size_t cache_sets = 4);
+
+            /**
+             * @brief Hoist the bridge's rotation trains, and nothing else.
+             *
+             * @c use_fast_bridge takes three levers at once, two of which are
+             * already at their right values, so a caller who wants only the
+             * one that is off has to accept a cache resize and a restatement
+             * of the BSGS split as well. Llama3RectOperator has had the
+             * single-lever form all along (llama3_rect.cuh:923) and this path
+             * did not, which is a large part of why every batch-16
+             * measurement to date ran UNHOISTED: the seam turns hoisting on
+             * for itself through BatchSoftmaxSeamConfig and back off after,
+             * so the attention crossings were hoisted and the norm and SwiGLU
+             * bridges -- the other 88% of the block's bridged columns -- were
+             * not.
+             *
+             * Needs KEYSWITCHING_METHOD_II. Under method I the decomposition
+             * is rebuilt inside the shift loop and there is nothing to share,
+             * so this is a no-op there rather than a gain -- which matters
+             * here, because the only 128-bit-admissible island parameter set
+             * at N = 4096 has one special prime and is therefore method I.
+             * Hoisting is a BIG-ring lever on this path, necessarily.
+             *
+             * Changes no answer beyond floating-point reassociation.
+             */
+            void set_hoisted_crossings(bool on)
+            {
+                batch_.set_hoisted_crossings(on);
+            }
+            bool hoisted_crossings() const
+            {
+                return batch_.hoisted_crossings();
+            }
 
             /**
              * @brief Columns this module bridges for one whole block, at the

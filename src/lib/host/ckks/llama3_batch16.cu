@@ -907,6 +907,240 @@ namespace heongpu
                    static_cast<int>(feed_forward_hidden);
         }
 
+        bool Llama3Batch16Operator::Batch16RefreshConfig::at(int position) const
+        {
+            switch (position)
+            {
+                case seam_entry:
+                    return entry;
+                case seam_after_attention_norm:
+                    return after_attention_norm;
+                case seam_after_attention:
+                    return after_attention;
+                case seam_mid:
+                    return mid;
+                case seam_after_feed_forward_norm:
+                    return after_feed_forward_norm;
+                case seam_feed_forward_hidden:
+                    return feed_forward_hidden;
+                default:
+                    throw std::out_of_range(
+                        "There is no such seam position on this block");
+            }
+        }
+
+        void Llama3Batch16Operator::Batch16RefreshConfig::set(int position,
+                                                              bool take)
+        {
+            switch (position)
+            {
+                case seam_entry:
+                    entry = take;
+                    break;
+                case seam_after_attention_norm:
+                    after_attention_norm = take;
+                    break;
+                case seam_after_attention:
+                    after_attention = take;
+                    break;
+                case seam_mid:
+                    mid = take;
+                    break;
+                case seam_after_feed_forward_norm:
+                    after_feed_forward_norm = take;
+                    break;
+                case seam_feed_forward_hidden:
+                    feed_forward_hidden = take;
+                    break;
+                default:
+                    throw std::out_of_range(
+                        "There is no such seam position on this block");
+            }
+        }
+
+        const char* Llama3Batch16Operator::seam_name(int position)
+        {
+            switch (position)
+            {
+                case seam_entry:
+                    return "block.entry";
+                case seam_after_attention_norm:
+                    return "block.after_attention_norm";
+                case seam_after_attention:
+                    return "block.after_attention";
+                case seam_mid:
+                    return "block.mid";
+                case seam_after_feed_forward_norm:
+                    return "block.after_feed_forward_norm";
+                case seam_feed_forward_hidden:
+                    return "feed_forward.hidden";
+                default:
+                    throw std::out_of_range(
+                        "There is no such seam position on this block");
+            }
+        }
+
+        Llama3Batch16Operator::RefreshPlan
+        Llama3Batch16Operator::plan_refresh(const RefreshPlanInput& input)
+        {
+            if (static_cast<int>(input.stretch.size()) != seam_count)
+            {
+                throw std::invalid_argument(
+                    "A refresh plan needs one stretch per seam position");
+            }
+            if (!input.width.empty() &&
+                static_cast<int>(input.width.size()) != seam_count)
+            {
+                throw std::invalid_argument(
+                    "The widths are either absent or one per seam position");
+            }
+            if (input.chain_limbs < 0 || input.refresh_levels < 0 ||
+                input.entry_limbs < 0)
+            {
+                throw std::invalid_argument(
+                    "A chain, a refresh and an entry are non-negative");
+            }
+            for (int s : input.stretch)
+            {
+                if (s < 0)
+                {
+                    throw std::invalid_argument(
+                        "A stretch spends a non-negative number of levels");
+                }
+            }
+            for (long long w : input.width)
+            {
+                if (w < 0)
+                {
+                    throw std::invalid_argument(
+                        "A seam refreshes a non-negative number of "
+                        "ciphertexts");
+                }
+            }
+
+            const int declared_entry =
+                input.entry_limbs > 0 ? input.entry_limbs : input.chain_limbs;
+            // Limbs a refresh hands back. The run after it may therefore spend
+            // one fewer than that, because the last prime is not spendable.
+            const int after_refresh = input.chain_limbs - input.refresh_levels;
+
+            RefreshPlan best;
+            best.feasible = false;
+
+            for (int mask = 0; mask < (1 << seam_count); ++mask)
+            {
+                // A plan is a partition of the six stretches into runs: the
+                // PREFIX run, spent out of whatever the block was handed, and
+                // one run after each refresh, spent out of what a refresh
+                // hands back. Writing it that way rather than as a walk is
+                // what makes the steady-state fixed point readable.
+                int prefix = 0;
+                int i = 0;
+                for (; i < seam_count && !((mask >> i) & 1); ++i)
+                {
+                    prefix += input.stretch[i];
+                }
+
+                bool ok = true;
+                int worst = prefix;
+                int last_run = -1; // -1 while no refresh has been seen
+                while (i < seam_count && ok)
+                {
+                    // A refresh must hand back something to spend, or the run
+                    // after it cannot move at all.
+                    if (after_refresh < 2)
+                    {
+                        ok = false;
+                        break;
+                    }
+                    int run = input.stretch[i];
+                    ++i;
+                    for (; i < seam_count && !((mask >> i) & 1); ++i)
+                    {
+                        run += input.stretch[i];
+                    }
+                    if (run > after_refresh - 1)
+                    {
+                        ok = false;
+                        break;
+                    }
+                    worst = std::max(worst, run);
+                    last_run = run;
+                }
+                if (!ok)
+                {
+                    continue;
+                }
+
+                int entry_limbs = declared_entry;
+                int exit_limbs = 0;
+                if (last_run < 0)
+                {
+                    // No refresh anywhere: everything comes out of the entry.
+                    exit_limbs = entry_limbs - prefix;
+                }
+                else
+                {
+                    exit_limbs = after_refresh - last_run;
+                }
+
+                if (input.steady_state)
+                {
+                    if (last_run < 0)
+                    {
+                        // A block that never refreshes strictly loses limbs
+                        // unless it spends nothing, so it has no fixed point
+                        // above zero.
+                        if (prefix != 0)
+                        {
+                            continue;
+                        }
+                    }
+                    // The block may be handed at most what it hands on, and it
+                    // must be handed enough for the prefix run. When the entry
+                    // seam is taken the prefix is empty and this is free,
+                    // which is exactly what that seam buys.
+                    entry_limbs = exit_limbs;
+                }
+
+                if (prefix > entry_limbs - 1)
+                {
+                    continue;
+                }
+
+                RefreshPlan candidate;
+                candidate.feasible = true;
+                candidate.worst_run = worst;
+                candidate.exit_limbs = exit_limbs;
+                candidate.config = Batch16RefreshConfig();
+                candidate.config.enabled = mask != 0;
+                for (int j = 0; j < seam_count; ++j)
+                {
+                    const bool take = ((mask >> j) & 1) != 0;
+                    candidate.config.set(j, take);
+                    if (take)
+                    {
+                        ++candidate.refreshes;
+                        candidate.bootstraps +=
+                            input.width.empty() ? 1 : input.width[j];
+                    }
+                }
+
+                // Bootstraps first, seams second. The two disagree exactly
+                // when one wide seam could be traded for two narrow ones,
+                // which at the 8B shape is the trade worth making: the hidden
+                // seam is 14,336 columns against 4,096 for every other.
+                if (!best.feasible || candidate.bootstraps < best.bootstraps ||
+                    (candidate.bootstraps == best.bootstraps &&
+                     candidate.refreshes < best.refreshes))
+                {
+                    best = candidate;
+                }
+            }
+
+            return best;
+        }
+
         int Llama3Batch16Operator::refresh_levels(
             const BootstrappingConfig& config)
         {
