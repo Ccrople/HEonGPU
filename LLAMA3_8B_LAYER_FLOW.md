@@ -2199,7 +2199,15 @@ removes work (one `match_scale` per ciphertext) and adds none.
 S1, `shared = 5` and `P <= 45` are still needed together. The next step is E2,
 which is a host-side weight fold and needs no library change at all.
 
-## 19. The bootstrap itself: the parameter surface is flat, and the module was on the wrong model (2026-08-13)
+## 26. The bootstrap itself: the parameter surface is flat, and the module was on the wrong model (2026-08-13)
+
+**This section applies to BOTH paths, which is why it lives on
+`HEonGPU_LLama3_8B_bootfast` rather than under either branch's name.** The
+constant encoder of §26.6 is in `operator.{cu,cuh}`, which is byte-identical
+on `nobatch` and `batch16`, so it is the same win on both. The v2 routing of
+§26.4 is on `Llama3Operator`, which the rect, batch and batch-16 operators all
+sit on top of — batch 16 has no reachable refresh of its own yet, so it inherits
+the v2 entry point the moment it gets one.
 
 Task: the block is bootstrap-bound (53.7% of a two-ring block, §14.4), so make
 a bootstrap cheaper — by parameter, by method, or by both.
@@ -2213,7 +2221,7 @@ locks after generation), 3 reps with the first discarded.
 
 **Baseline: 255.0 ms, 16.76 bits, L = 29, 14 levels returned, 48 Galois keys.**
 
-### 19.1 Every knob is already at its optimum. The surface is worth ~4%.
+### 26.1 Every knob is already at its optimum. The surface is worth ~4%.
 
 | lever | swept | best | vs baseline |
 |---|---|---|---|
@@ -2228,7 +2236,7 @@ un-hoisted `multiply_matrix` path. The pieces trade **key memory**, not time:
 5/5 needs **28** Galois keys against 4/3's 48, for +7.7% time — useful wherever
 the key ceiling binds, which is most of this project.
 
-### 19.2 Cost is linear in the chain, and precision is flat along it
+### 26.2 Cost is linear in the chain, and precision is flat along it
 
 `boot_ms ~= 104 + 12.5 x (levels returned)`: 116.6 ms at 2 levels, 256.6 at 14,
 341.1 at 20, all at 16.75 bits. `depth_after` is **constant at 15** — the
@@ -2241,7 +2249,7 @@ discard 10 are paying **256.6 ms for what a right-sized chain delivers at
 138.6** — 1.85x on those calls, ~10% of a block, at the cost of a second
 bootstrapping context and a second 48-key set.
 
-### 19.3 The EvalMod cliff is real, and it is `h -> K -> degree`
+### 26.3 The EvalMod cliff is real, and it is `h -> K -> degree`
 
 §14.5 recorded (sine_deg 30, dangle 3) as a cliff and closed the 43% bucket.
 That verdict holds, and the reason is now measured rather than observed: **K
@@ -2262,7 +2270,7 @@ redrawn per process and the message is not (fixed seed), so a bootstrap
 parameter must be tested across many SECRETS, not many reps. Three reps of one
 secret will happily bless a config that fails 1 in 16.
 
-### 19.4 The module was on v1, and v2 is 2.6-2.8x faster AND more secure
+### 26.4 The module was on v1, and v2 is 2.6-2.8x faster AND more secure
 
 `Llama3Operator::bootstrap` (`llama3.cu:3199`) called `regular_bootstrapping`,
 the **v1 Taylor** model, and it is the only boot call in the entire Llama-3
@@ -2315,10 +2323,10 @@ like a real regression. A suite can also come back **rc=143 (SIGTERM) with no
 output at all**, which is not a failure either. Read the verbatim error and
 re-run on a clean card before believing any of it.
 
-### 19.5 What is left, priced
+### 26.5 What is left, priced
 
 1. ~~**The constant-plaintext encode in `evaluate_poly`, ~4-6%.**~~ **Done —
-   6.2% at L = 29 and 10.8% at L = 17.** See §19.6.
+   6.2% at L = 29 and 10.8% at L = 17.** See §26.6.
 2. **Batching the 16 ciphertexts of a refresh call.** `TwoRing::refresh` is a
    literal serial loop on the default stream. Boot phases are 90.5% GPU-busy,
    so stream overlap alone is bounded at ~5% of a block; real sharing of the
@@ -2333,7 +2341,7 @@ zero. It is not. After ModRaise the plaintext is `m + q0*I(s)` and **`I(s)` is
 dense over all N coefficients whatever the message is**, so the imaginary
 CoeffToSlot output is never zero and dropping it returns noise.
 
-### 19.6 The constant encoder: a 2^15 FFT to write down a constant (2026-08-14)
+### 26.6 The constant encoder: a 2^15 FFT to write down a constant (2026-08-14)
 
 `evaluate_poly` encodes every polynomial coefficient from scratch on every
 call, ~48 times per bootstrap across the two EvalMod chains, and
@@ -2368,7 +2376,7 @@ level are no longer written at all.
 
 Run-to-run spread is 0.45 ms, so both are far outside the noise. The gain is
 larger on the short chain because the boot's own depth dominates there; in the
-linear law of §19.2 the **intercept falls from ~104 ms to ~92 ms** while the
+linear law of §26.2 the **intercept falls from ~104 ms to ~92 ms** while the
 12.5 ms per returned level is untouched, which is exactly the shape expected
 from removing a fixed per-coefficient cost.
 
@@ -2387,7 +2395,7 @@ Suites on the idle card: `ckks_llama3_rect` 38/38, `ckks_llama3` 53/53,
 multiplication, relinearization.
 
 **Where this lands the whole section.** Against the v1 model the module was
-using before §19.4, the Llama-3 refresh is now:
+using before §26.4, the Llama-3 refresh is now:
 
 | levels returned | v1 (was) | v2 + closed-form encoder (now) | total |
 |---:|---:|---:|---:|
