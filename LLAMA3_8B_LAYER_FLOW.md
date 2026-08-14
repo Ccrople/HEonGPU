@@ -2362,17 +2362,16 @@ algorithm and the paper's own thesis is a CPU-with-OpenBLAS one.
 
 **Not implemented, stated rather than implied:**
 
-* **ModPack** (`k > 1` back to degree-`N` RLWE). It needs `k` switching keys
-  carrying the sub-secrets `s_j` — the `X^j` components of `sk` — and this
-  library has no entry point that hands those out. Cost if built: `k` key
-  switches per output ciphertext, `d1` per projection; that is the 43,008 in
-  §25.2's table and it is *already counted there*. At `k = 1` it is the
-  identity and the 0 is real.
+* ~~**ModPack**~~ — **BUILT, see §25.7.** It cost a key-ceremony change and
+  `k` key switches per output ciphertext, `d1` per projection, which is the
+  43,008 §25.2 already charged.
 * **MaMBo**, the bootstrap fusion (§25.3). The big one.
-* **wiring into `Llama3RectOperator`**. `project()` still calls Algorithm 5.
-  The two operators are not interchangeable yet because they do not agree on
-  the activation layout (§25.3), and making them agree is that transpose and
-  regrouping, not a signature change.
+* **wiring into the BLOCK.** `HEBaePcmmOperator::project()` is a drop-in for
+  a projection and all seven of a block's run on it (§25.7), but
+  `Llama3RectOperator` itself still calls Algorithm 5: the two do not agree on
+  the activation layout (§25.3), so switching the *block* over means moving
+  every crossing, not changing a call. The products are done; the seams are
+  not.
 * Algorithms 3 and 4 (precomputation), which delete the a-part GEMM entirely
   at the price of switching keys that depend on `U`. **This is the fix for
   §25.2's `k = 32` blowup** and is the obvious next step if the token axis
@@ -2392,3 +2391,71 @@ and §24 apply verbatim. But Bae's MLWE rank `k` is chosen so that
 security of MLWE is determined by `d*k`" — so the `k > 1` path is **not** the
 security downgrade that a ring switch down to degree 128 would be. That is a
 point in its favour which this branch does not yet cash.
+
+### 25.7 ModPack built: every projection now runs on the Bae product (2026-08-14)
+
+§25.5 listed ModPack as the thing standing between the Bae product and being
+a drop-in for a projection. **It is built, and it is.** 15/15 tests green,
+Sicily.
+
+**What ModPack has to do, and why it is not free.** After the two GEMMs the
+`k` output a-vectors no longer share the "shifted decimation of one `alpha`"
+structure that ModDecomp gave the input, so they cannot simply be
+re-interleaved. Each component polynomial has to be *multiplied by the
+sub-secret it pairs with*:
+
+    mu' = Btilde + sum_j Atilde_j * s_j
+
+where `s_j` is the `X^j` component of `sk`, embedded back into `R_N` as
+`s_j(X^k)` — coefficients on multiples of `k`, exactly the embedded-secret
+shape `HERingSwitchOperator` already uses, and **ternary because `sk` is**, so
+it is a legal `Secretkey`. A key switch preserves `a*old + b`, so
+key-switching `(Atilde_j, 0)` against a key generated as
+`generate_switch_key(swk, sk, s_j)` hands back an encryption of
+`Atilde_j * s_j` under `sk`. Sum the `k` of them, add `Btilde`, done.
+
+**`k` key switches per output ciphertext, `d1` per projection** — exactly the
+43,008 per block that §25.2's count model already charged. At `k = 1` no key
+is generated at all and `modpack_keys_generated()` stays false, so that path
+cannot quietly acquire a dependency it does not have.
+
+**It is a key-ceremony change**, and the caller must supply `sk`'s
+coefficients: `Secretkey` stores NTT-domain RNS residues and cannot be read
+back, so `s_j` is not derivable from an already-generated key. Build the
+master secret with `Secretkey(coefficients, context)` and keep the vector.
+The paper warns about exactly this ("a change to the ciphertext format and
+the key schedule").
+
+**The drop-in.** `HEBaePcmmOperator::project()` now takes the weight in the
+same transposed row-major form `Llama3RectOperator::project` takes,
+transposes it for free on the host, encodes it at the prime the following
+rescale divides by, runs the product and spends the rescale. There is nothing
+else to prepare — no diagonals, no plaintext cache, no Galois indices.
+
+**Measured, `EverySeventhBlockProjectionRunsOnTheBaeProduct`:** all seven of a
+block's PCMMs — Q, K, V, O, gate, up, down — at the real **128-token** shape,
+so `k = 32` and every one of them goes through ModPack. Each **spends exactly
+one level**, each is decrypted against a host reference, and `ffn.down` is fed
+by `ffn.up`'s own output rather than the residual stream, which pins that **a
+Bae product consumes a Bae product with no conversion between them**. Widths
+are Llama-3-8B's ratios divided by 32 so the seven fit beside another user's
+job on a shared A6000.
+
+### 25.8 The bug that eleven passing tests could not see
+
+The gather and emit kernels assumed the paper's `(a, b)` component order.
+HEonGPU's is the reverse: `sk_multiplication_ckks` computes
+`plaintext = ct_0 + ct_1 * sk` (`kernel/decryption.cu:359-364`), so
+**component 0 is the b-part and component 1 is the a-part**.
+
+This is invisible at `k = 1` — `U` hits both components alike, so a consistent
+swap cancels end to end — and eleven tests, including a decrypting
+host-reference comparison and a two-projection chain, passed straight over it.
+It is fatal in ModPack, which multiplies *exactly one* component by the
+secret and was multiplying the wrong one. The symptom was not drift: it was a
+decrypted coefficient the width of the whole modulus, i.e. uniform garbage,
+which is what "wrong secret" looks like and what "too much noise" does not.
+
+**Read this as a warning about the `k = 1` tests, not as reassurance.** Any
+property that is symmetric in the two ciphertext components is untestable at
+`k = 1`, and `k = 1` is the configuration everything else in §25 recommends.
