@@ -214,6 +214,60 @@ namespace
         return worst;
     }
 
+    /// RMSNorm on the host: x_j / sqrt(mean_j(x_j^2) + eps), with the channel
+    /// axis running fastest, which is this encoding's ciphertext axis.
+    std::vector<std::vector<double>>
+    rms_norm_host(const std::vector<std::vector<double>>& x, int rows,
+                  int cols, double eps)
+    {
+        std::vector<std::vector<double>> out(x.size());
+        for (size_t b = 0; b < x.size(); ++b)
+        {
+            out[b].assign(x[b].size(), 0.0);
+            for (int u = 0; u < rows; ++u)
+            {
+                double acc = 0.0;
+                for (int j = 0; j < cols; ++j)
+                {
+                    const double v = x[b][static_cast<size_t>(u) * cols + j];
+                    acc += v * v;
+                }
+                const double r = std::sqrt(acc / cols + eps);
+                for (int j = 0; j < cols; ++j)
+                {
+                    const size_t at = static_cast<size_t>(u) * cols + j;
+                    out[b][at] = x[b][at] / r;
+                }
+            }
+        }
+        return out;
+    }
+
+    /// The interval the summed square actually visits, widened a little. A
+    /// range is a measurement of the data, not a property of the algorithm,
+    /// and fitting 1/sqrt over a worst-case bound instead is what made the
+    /// SoftMax reciprocal wrong by 98.6% on the rectangular path.
+    void bracket_sum(const std::vector<std::vector<double>>& x, int rows,
+                     int cols, double& lo, double& hi)
+    {
+        lo = 1e300;
+        hi = 0.0;
+        for (const auto& m : x)
+            for (int u = 0; u < rows; ++u)
+            {
+                double acc = 0.0;
+                for (int j = 0; j < cols; ++j)
+                {
+                    const double v = m[static_cast<size_t>(u) * cols + j];
+                    acc += v * v;
+                }
+                lo = std::min(lo, acc);
+                hi = std::max(hi, acc);
+            }
+        lo *= 0.8;
+        hi *= 1.2;
+    }
+
     /// Mean magnitude, to turn an absolute error into a relative one. An
     /// absolute error means nothing across shapes: a wider model gives a wider
     /// range and the same circuit looks worse.
@@ -1328,11 +1382,15 @@ TEST(HEonGPU, CKKS_Llama3Batch16Block_RefreshSumMovesTheFitOffTheWideTrack)
     llama::Llama3Batch16Operator::RMSNormConfig plain_cfg;
     plain_cfg.degree = 15;
     plain_cfg.newton_iterations = 0;
-    plain_cfg.sum_lo = 1e-3;
-    plain_cfg.sum_hi = 6.0e1;
+    // Calibrated, not bounded. A fit over a range the data does not visit is
+    // wrong by more than any level saving is worth, and it would be charged
+    // to the auxiliary track here because that is what this test varies.
+    bracket_sum(x, d, shape.d_model, plain_cfg.sum_lo, plain_cfg.sum_hi);
 
     llama::Llama3Batch16Operator::RMSNormConfig aux_cfg = plain_cfg;
     aux_cfg.refresh_sum = true;
+
+    const auto want = rms_norm_host(x, d, shape.d_model, plain_cfg.eps);
 
     // Where a block's second norm actually sits: deep enough that the fit's
     // levels are the scarce thing. Five above the refresh floor, so the
@@ -1370,14 +1428,27 @@ TEST(HEonGPU, CKKS_Llama3Batch16Block_RefreshSumMovesTheFitOffTheWideTrack)
     EXPECT_LT(aux_depth, wide_depth)
         << "refresh_sum did not move the fit off the wide track";
 
-    const double worst = worst_abs(wide_out, aux_out);
-    const double magnitude = mean_abs(wide_out);
-    std::cout << "wide vs auxiliary track: worst " << worst
-              << " on a mean magnitude of " << magnitude << std::endl;
-    ASSERT_FALSE(std::isnan(worst));
-    // A bootstrap sits between the two, so this is bootstrap precision and
-    // not reassociation. Judged on the ratio, as everything here is.
-    EXPECT_LT(worst, 1e-4 + 5e-2 * magnitude);
+    // Both are judged against the HOST, not against each other. Comparing the
+    // two circuits directly would charge the auxiliary track for the wide
+    // track's own noise -- and at depth 39 of 40 the wide one is running its
+    // Chebyshev fit on the last limb it has, which is exactly where a CKKS
+    // circuit is least accurate. That is the effect being removed, so it must
+    // not be the yardstick.
+    const double magnitude = mean_abs(want);
+    const double wide_err = worst_abs(want, wide_out);
+    const double aux_err = worst_abs(want, aux_out);
+    std::cout << "against the host: wide track " << wide_err
+              << ", auxiliary track " << aux_err << " on a mean magnitude of "
+              << magnitude << std::endl;
+    ASSERT_FALSE(std::isnan(aux_err));
+
+    EXPECT_LT(aux_err, 1e-4 + 2e-2 * magnitude);
+    // And the point: moving the fit off the exhausted end of the chain does
+    // not cost accuracy. A little slack, because a bootstrap is not free of
+    // noise either.
+    EXPECT_LE(aux_err, wide_err + 1e-3 * magnitude)
+        << "the auxiliary track is meant to be at least as accurate as the "
+           "wide one, not merely shallower";
 
     // And the other direction, which is why this is a flag and not a default:
     // on a FRESH stream the refresh costs levels instead of returning them,
