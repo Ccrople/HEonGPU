@@ -58,6 +58,7 @@ namespace
 
         int n = 0;
         int q_size = 0;
+        std::vector<int> sk_coefficients;
 
         BaeFixture(int logn, int cols, std::vector<int> q_bits)
             : context(heongpu::GenHEContext<S>(heongpu::sec_level_type::none))
@@ -69,8 +70,20 @@ namespace
             context->generate();
 
             keygen = std::make_unique<heongpu::HEKeyGenerator<S>>(context);
-            secret = std::make_unique<heongpu::Secretkey<S>>(context);
-            keygen->generate_secret_key(*secret);
+            // The secret is built from coefficients we keep, not sampled
+            // inside the library: ModPack needs the X^j components of sk and
+            // Secretkey stores NTT-domain residues that cannot be read back.
+            // This is the key-ceremony change the paper warns about.
+            {
+                std::mt19937 rng(20260814u);
+                std::uniform_int_distribution<int> pick(0, 2);
+                sk_coefficients.assign(n, 0);
+                for (int i = 0; i < n; ++i)
+                    sk_coefficients[i] = pick(rng) - 1;
+            }
+            secret =
+                std::make_unique<heongpu::Secretkey<S>>(sk_coefficients,
+                                                        context);
             pub = std::make_unique<heongpu::Publickey<S>>(context);
             keygen->generate_public_key(*pub, *secret);
 
@@ -488,6 +501,93 @@ TEST(BaePcmm, NarrowColumnsRejectTheRlweEntryPoint)
 
     std::vector<heongpu::Ciphertext<S>> out;
     EXPECT_THROW(f.bae->pcmm(out, in, true), std::invalid_argument);
+}
+
+
+// ---------------------------------------------------------------------------
+// ModPack: what makes k > 1 usable at all
+// ---------------------------------------------------------------------------
+
+TEST(BaePcmm, ModPackClosesTheLoopAtKGreaterThanOne)
+{
+    // The whole of Algorithm 2 at the shape the rect path actually runs:
+    // 128 tokens at N = 4096, so k = 32 and ModPack is mandatory. This is the
+    // test that makes the Bae product a drop-in for a projection rather than
+    // a component -- RLWE in, RLWE out, decrypted against a host reference.
+    BaeFixture f(12, 128, {60, 40, 40});
+    const int d1 = 64, d2 = 64, d3 = 128; // 2 in-ciphertexts, 2 out
+    const double ct_scale = std::pow(2.0, 40);
+
+    auto M = random_matrix(d2, d3, 81);
+    auto U = random_matrix(d1, d2, 82);
+
+    auto ct = f.encrypt_matrix(M, d2, ct_scale);
+    ASSERT_EQ(ct.size(), 2u);
+    std::vector<heongpu::Ciphertext<S>*> in;
+    for (auto& c : ct)
+        in.push_back(&c);
+
+    const double plain_scale =
+        static_cast<double>(f.context->get_key_modulus()[f.q_size - 1].value);
+    f.bae->upload_plaintext(U, d1, d2, 0, plain_scale);
+
+    ASSERT_FALSE(f.bae->modpack_keys_generated());
+    f.bae->generate_modpack_keys(*f.keygen, *f.secret, f.sk_coefficients);
+    ASSERT_TRUE(f.bae->modpack_keys_generated());
+
+    std::vector<heongpu::Ciphertext<S>> out;
+    f.bae->pcmm_packed(out, in, *f.ops, /*rescale=*/true);
+    ASSERT_EQ(out.size(), static_cast<size_t>(d1 / f.bae->k()));
+
+    for (auto& c : out)
+        f.ops->rescale_inplace(c);
+
+    auto got = f.decrypt_matrix(out, d1, ct_scale);
+    auto want = host_product(U, M, d1, d2, d3);
+
+    const double err = max_abs_error(got, want);
+    EXPECT_LT(err, 5e-2) << "worst absolute error " << err;
+}
+
+TEST(BaePcmm, ModPackRefusesToRunWithoutItsKeys)
+{
+    BaeFixture f(12, 128, {60, 40});
+    const int rows = 32;
+    auto M = random_matrix(rows, 128, 91);
+    auto ct = f.encrypt_matrix(M, rows, std::pow(2.0, 40));
+    std::vector<heongpu::Ciphertext<S>*> in{&ct[0]};
+    std::vector<double> U(static_cast<size_t>(rows) * rows, 0.25);
+    f.bae->upload_plaintext(U, rows, rows, 0, 1024.0);
+
+    std::vector<heongpu::Ciphertext<S>> out;
+    EXPECT_THROW(f.bae->pcmm_packed(out, in, *f.ops, true), std::logic_error);
+}
+
+TEST(BaePcmm, ModPackKeysAreNotGeneratedAtKOne)
+{
+    // At k = 1 ModPack is the identity, so generating a key would be a lie
+    // about what that path depends on. pcmm_packed must still work.
+    BaeFixture f(12, 4096, {60, 40, 40});
+    f.bae->generate_modpack_keys(*f.keygen, *f.secret, f.sk_coefficients);
+    EXPECT_FALSE(f.bae->modpack_keys_generated());
+
+    const int d1 = 4, d2 = 4, d3 = 4096;
+    auto M = random_matrix(d2, d3, 101);
+    auto U = random_matrix(d1, d2, 102);
+    auto ct = f.encrypt_matrix(M, d2, std::pow(2.0, 40));
+    std::vector<heongpu::Ciphertext<S>*> in;
+    for (auto& c : ct)
+        in.push_back(&c);
+    const double plain_scale =
+        static_cast<double>(f.context->get_key_modulus()[f.q_size - 1].value);
+    f.bae->upload_plaintext(U, d1, d2, 0, plain_scale);
+
+    std::vector<heongpu::Ciphertext<S>> out;
+    f.bae->pcmm_packed(out, in, *f.ops, true);
+    for (auto& c : out)
+        f.ops->rescale_inplace(c);
+    auto got = f.decrypt_matrix(out, d1, std::pow(2.0, 40));
+    EXPECT_LT(max_abs_error(got, host_product(U, M, d1, d2, d3)), 1e-3);
 }
 
 int main(int argc, char** argv)

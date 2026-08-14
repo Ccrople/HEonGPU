@@ -681,4 +681,167 @@ namespace heongpu
         return stack;
     }
 
+
+    void HEBaePcmmOperator<Scheme::CKKS>::generate_modpack_keys(
+        HEKeyGenerator<Scheme::CKKS>& keygen, Secretkey<Scheme::CKKS>& sk,
+        const std::vector<int>& sk_coefficients)
+    {
+        const int k = layout_.k;
+        const int cols = layout_.cols;
+
+        if (static_cast<int>(sk_coefficients.size()) != n_)
+            throw std::invalid_argument(
+                "the secret coefficient vector must have length N");
+        for (int v : sk_coefficients)
+            if (v < -1 || v > 1)
+                throw std::invalid_argument("secret coefficients must be "
+                                            "ternary");
+
+        modpack_keys_.clear();
+        if (k == 1)
+        {
+            // ModPack is the identity here and no key is needed. Silently
+            // generating one anyway would make modpack_keys_generated() lie
+            // about what the k = 1 path depends on.
+            return;
+        }
+
+        modpack_keys_.reserve(k);
+        for (int j = 0; j < k; ++j)
+        {
+            // s_j is the X^j component of sk, embedded back into R_N as
+            // s_j(X^k): coefficient t of s_j sits at X^{t*k}. Both the
+            // extraction and the embedding are the decimation of App. A, and
+            // the composition is just "keep the coefficients congruent to j
+            // mod k, and slide them onto multiples of k".
+            std::vector<int> embedded(n_, 0);
+            for (int t = 0; t < cols; ++t)
+                embedded[static_cast<size_t>(t) * k] =
+                    sk_coefficients[static_cast<size_t>(t) * k + j];
+
+            Secretkey<Scheme::CKKS> sub(embedded, context_);
+            auto swk = std::make_unique<Switchkey<Scheme::CKKS>>(context_);
+            // (swk, new_sk, old_sk): transports FROM s_j TO sk, which is the
+            // direction that turns a ciphertext (Atilde_j, 0) under s_j into
+            // an encryption of Atilde_j * s_j under sk. Backwards produces
+            // noise, not an error.
+            keygen.generate_switch_key(*swk, sk, sub);
+            modpack_keys_.push_back(std::move(swk));
+        }
+    }
+
+    void HEBaePcmmOperator<Scheme::CKKS>::pcmm_packed(
+        std::vector<Ciphertext<Scheme::CKKS>>& out,
+        const std::vector<Ciphertext<Scheme::CKKS>*>& in,
+        HEArithmeticOperator<Scheme::CKKS>& ops, bool rescale)
+    {
+        const int k = layout_.k;
+        const int cols = layout_.cols;
+
+        if (k == 1)
+        {
+            pcmm(out, in, rescale);
+            return;
+        }
+        if (!modpack_keys_generated())
+            throw std::logic_error(
+                "ModPack needs the k sub-secret switching keys; call "
+                "generate_modpack_keys first");
+
+        DeviceVector<Data64> A, B;
+        int limbs = 0, depth = 0;
+        double scale = 0.0;
+        run_gemms(in, A, B, limbs, depth, scale);
+
+        if (d1_ % k != 0)
+            throw std::invalid_argument(
+                "the output row count must be a multiple of k, because one "
+                "packed ciphertext carries exactly k rows");
+        const int groups = d1_ / k;
+
+        BaeRange _r("BaePCMM.modpack");
+
+        out.clear();
+        out.reserve(groups);
+
+        const size_t poly = static_cast<size_t>(limbs) * n_;
+        DeviceVector<Data64> a_stage(static_cast<size_t>(k) * poly);
+        DeviceVector<Data64> b_stage(poly);
+
+        for (int g = 0; g < groups; ++g)
+        {
+            // Interleave this group's k MLWE rows back up to degree N.
+            bae_modpack_assemble_kernel<<<dim3((n_ + 255) / 256, limbs, k + 1),
+                                          256>>>(
+                a_stage.data(), b_stage.data(), A.data(), B.data(), d1_, cols,
+                k, limbs, g * k);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+            // Everything the key switch touches has to be in the NTT domain.
+            gpuntt::GPU_NTT_Inplace(a_stage.data(), context_->ntt_table_->data(),
+                                    context_->modulus_->data(),
+                                    forward_cfg(n_power_), k * limbs, limbs);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+            gpuntt::GPU_NTT_Inplace(b_stage.data(), context_->ntt_table_->data(),
+                                    context_->modulus_->data(),
+                                    forward_cfg(n_power_), limbs, limbs);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+            // mu = Btilde + sum_j Atilde_j * s_j. Each term is one key switch
+            // of (Atilde_j, 0) against the key carrying s_j: a key switch
+            // preserves a*old + b, so it hands back (a', b') with
+            // a'*sk + b' = Atilde_j * s_j exactly.
+            Ciphertext<Scheme::CKKS> acc(*in[0]);
+            bool have_acc = false;
+
+            for (int j = 0; j < k; ++j)
+            {
+                Ciphertext<Scheme::CKKS> term(*in[0]);
+                cudaMemsetAsync(term.data(), 0, 2 * poly * sizeof(Data64),
+                                cudaStreamDefault);
+                cudaMemcpyAsync(term.data(),
+                                a_stage.data() + static_cast<size_t>(j) * poly,
+                                poly * sizeof(Data64), cudaMemcpyDeviceToDevice,
+                                cudaStreamDefault);
+                HEONGPU_CUDA_CHECK(cudaGetLastError());
+                term.rescale_required_ = false;
+                term.relinearization_required_ = false;
+                term.in_ntt_domain_ = true;
+
+                Ciphertext<Scheme::CKKS> switched(*in[0]);
+                ops.keyswitch(term, switched, *modpack_keys_[j]);
+
+                if (!have_acc)
+                {
+                    acc = std::move(switched);
+                    have_acc = true;
+                }
+                else
+                {
+                    ops.add(acc, switched, acc);
+                }
+            }
+
+            // ... and the b polynomial, which rides for free in the b-part.
+            Ciphertext<Scheme::CKKS> btilde(*in[0]);
+            cudaMemsetAsync(btilde.data(), 0, 2 * poly * sizeof(Data64),
+                            cudaStreamDefault);
+            cudaMemcpyAsync(btilde.data() + poly, b_stage.data(),
+                            poly * sizeof(Data64), cudaMemcpyDeviceToDevice,
+                            cudaStreamDefault);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+            btilde.rescale_required_ = false;
+            btilde.relinearization_required_ = false;
+            btilde.in_ntt_domain_ = true;
+
+            ops.add(acc, btilde, acc);
+
+            acc.scale_ = scale * plain_scale_;
+            acc.rescale_required_ = rescale;
+            acc.in_ntt_domain_ = true;
+            out.push_back(std::move(acc));
+        }
+        HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
 } // namespace heongpu

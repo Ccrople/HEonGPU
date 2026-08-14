@@ -180,4 +180,33 @@ namespace heongpu
             B[(static_cast<size_t>(limb) * d1 + r) * n + t];
     }
 
+
+    __global__ void bae_modpack_assemble_kernel(
+        Data64* __restrict__ a_out, Data64* __restrict__ b_out,
+        const Data64* __restrict__ A, const Data64* __restrict__ B, int d1,
+        int cols, int k, int limbs, int row0)
+    {
+        const int idx = (blockIdx.x << 8) + threadIdx.x;
+        const int n = cols * k;
+        if (idx >= n)
+            return;
+        const int limb = blockIdx.y;
+        const int j = blockIdx.z; // component, or k for the b polynomial
+
+        const int u = idx % k; // which MLWE row inside the group
+        const int t = idx / k; // which column of that row
+        const int row = row0 + u;
+
+        if (j == k)
+        {
+            b_out[static_cast<size_t>(limb) * n + idx] =
+                B[(static_cast<size_t>(limb) * d1 + row) * cols + t];
+        }
+        else
+        {
+            a_out[(static_cast<size_t>(j) * limbs + limb) * n + idx] =
+                A[(static_cast<size_t>(limb) * d1 + row) * n + j * cols + t];
+        }
+    }
+
 } // namespace heongpu

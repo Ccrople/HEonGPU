@@ -153,6 +153,37 @@ namespace heongpu
                                          const Data64* __restrict__ B, int d1,
                                          int n, int limbs);
 
+
+    /**
+     * @brief ModPack step 1: interleave k MLWE rows back up to degree N.
+     *
+     * Algorithm 2 step 5. Output ciphertext i owns MLWE rows k*i .. k*i+k-1,
+     * and the degree-N polynomials it needs are
+     *
+     *     Atilde_j[t*k + u] = A'[k*i + u][j*cols + t]      (one per component j)
+     *     Btilde  [t*k + u] = B'[k*i + u][t]
+     *
+     * which is the exact inverse of the decimation ModDecomp performed --
+     * this is an interleave, and the SHIFT that bae_gather_a_kernel applied
+     * to the input is deliberately NOT undone, because it belonged to the
+     * input's own decomposition.
+     *
+     * What this kernel cannot do is finish the job: the k a-vectors of the
+     * output rows no longer share the "shifted decimation of one alpha"
+     * structure, so Atilde_j is not an a-part. It is a ring element that must
+     * be multiplied by the sub-secret s_j, and that is a key switch.
+     *
+     * @param a_out [j][limb][n] the k interleaved component polynomials.
+     * @param b_out [limb][n]    the interleaved b polynomial.
+     * @param A     [limb][d1][n] product a-part.
+     * @param B     [limb][d1][cols] product b-part.
+     * @param row0  k*i, the first MLWE row of this output ciphertext.
+     */
+    __global__ void bae_modpack_assemble_kernel(
+        Data64* __restrict__ a_out, Data64* __restrict__ b_out,
+        const Data64* __restrict__ A, const Data64* __restrict__ B, int d1,
+        int cols, int k, int limbs, int row0);
+
 } // namespace heongpu
 
 #endif // HEONGPU_KERNEL_BAEPCMM_H

@@ -110,8 +110,12 @@
 #include <heongpu/host/ckks/ciphertext.cuh>
 #include <heongpu/host/ckks/plaintext.cuh>
 #include <heongpu/host/ckks/operator.cuh>
+#include <heongpu/host/ckks/secretkey.cuh>
+#include <heongpu/host/ckks/evaluationkey.cuh>
+#include <heongpu/host/ckks/keygenerator.cuh>
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace heongpu
@@ -278,6 +282,58 @@ namespace heongpu
         BaeMlweStack
         pcmm_mlwe(const std::vector<Ciphertext<Scheme::CKKS>*>& in);
 
+
+        /**
+         * @brief Generate the k switching keys ModPack needs.
+         *
+         * ModPack (Algorithm 2 step 5) has to turn k rank-k MLWE rows back
+         * into one degree-N RLWE ciphertext. After the product the k output
+         * a-vectors no longer share the "shifted decimation of one alpha"
+         * structure ModDecomp gave the input, so they cannot simply be
+         * re-interleaved; each component polynomial has to be MULTIPLIED by
+         * the sub-secret it pairs with, and that is a key switch.
+         *
+         * The sub-secret s_j is the X^j component of sk, embedded back into
+         * R_N as s_j(X^k) -- coefficients at multiples of k, exactly the
+         * embedded-secret shape HERingSwitchOperator already uses. It is
+         * ternary because sk is, so it is a legal Secretkey.
+         *
+         * THIS IS A KEY-CEREMONY CHANGE AND IT IS WHY THE CALLER MUST SUPPLY
+         * sk's COEFFICIENTS. Secretkey stores NTT-domain RNS residues and
+         * cannot be read back, so there is no way to derive s_j from an
+         * already-generated key. Build the master secret with
+         * Secretkey(coefficients, context) and pass the same vector here.
+         *
+         * @param keygen          Key generator of this context.
+         * @param sk              The master secret, the key switches' target.
+         * @param sk_coefficients sk's N ternary coefficients.
+         */
+        void generate_modpack_keys(HEKeyGenerator<Scheme::CKKS>& keygen,
+                                   Secretkey<Scheme::CKKS>& sk,
+                                   const std::vector<int>& sk_coefficients);
+
+        bool modpack_keys_generated() const noexcept
+        {
+            return static_cast<int>(modpack_keys_.size()) == layout_.k;
+        }
+
+        /**
+         * @brief The complete Algorithm 2 for any k: RLWE in, RLWE out.
+         *
+         * ModDecomp, both GEMMs, the re-assembly, the rescale mark, and
+         * ModPack. At k == 1 ModPack is the identity and no switching key is
+         * touched, so this is pcmm() and needs no key generation; above that
+         * it costs k key switches per output ciphertext, d1 in total, and
+         * generate_modpack_keys must have run.
+         *
+         * @param out Receives d1 / k ciphertexts -- one per group of k output
+         *            rows, in the same decimated encoding as the input.
+         */
+        void pcmm_packed(std::vector<Ciphertext<Scheme::CKKS>>& out,
+                         const std::vector<Ciphertext<Scheme::CKKS>*>& in,
+                         HEArithmeticOperator<Scheme::CKKS>& ops,
+                         bool rescale = true);
+
         /**
          * @brief Cost model, in modular multiply-accumulates per RNS limb.
          *
@@ -307,6 +363,10 @@ namespace heongpu
         int d2_ = 0;
         int plain_depth_ = -1;
         double plain_scale_ = 0.0;
+
+        /// One switching key per sub-secret s_j, empty until
+        /// generate_modpack_keys runs. Never needed at k == 1.
+        std::vector<std::unique_ptr<Switchkey<Scheme::CKKS>>> modpack_keys_;
     };
 
 } // namespace heongpu
