@@ -3872,3 +3872,201 @@ stay redundant.
 5. **Nothing is measured at 8B width**, which is the OOM this session was told
    not to attempt. Every count in §25.3 is arithmetic over the shape, and the
    seam schedule in §25.6 was measured at `d_model` 4.
+
+
+---
+
+## 26. Does the batch-16 block satisfy the security? No — and the island that was supposed to save it does not build (2026-08-14)
+
+Worked out on `HEonGPU_LLama3_8B_batch16_security`, forked from
+`HEonGPU_LLama3_8B_batch16` @ `9aea2ba`. New module
+`llama3_security.{cuh,cu}` and `test/test_ckks_llama3_batch16_security.cpp`.
+
+§24 priced batch 16 with the cap on and concluded it had a legal parameter set
+by two bits. **It does not.** §24 checked the second of the library's three
+rules and missed the first.
+
+### 26.1 The check nobody had run
+
+`sec_level_type` defaults to **`sec128`**, so the security check is ON unless a
+caller opts out. Every Llama-3 driver and test in this tree opts out, explicitly
+and at every construction site — `sec_level_type::none` appears 179 times across
+58 files. The only runtime use of `sec128` anywhere is a parameter-feasibility
+probe that constructs no Llama-3 operator.
+
+So the question had never been put to the library. `llama3_security.cuh` puts
+it, and puts it with the library's **own** predicates rather than a paraphrase:
+`inspect()` calls `coefficient_validator()` and `heongpu_128bit_std_parms()`
+directly. The tests then check that the module and a real `HEContext` agree
+over fourteen parameter sets, in both directions and **on the reason, not only
+the verdict** — because a right answer for a wrong reason is exactly the failure
+being corrected.
+
+None of it needs a GPU. `set_poly_modulus_degree` and
+`set_coeff_modulus_bit_sizes` are host-side and all three rules run inside them,
+before `generate()` touches a device.
+
+### 26.2 Three rules, and §24 checked one
+
+| | rule | where |
+|---|---|---|
+| 1 | **the pair rule** — with `P_size` specials, every consecutive group of `P_size` Q primes sums to at most the TOTAL P | `util.cu:11`, called from `context.cu:72` and `:181` |
+| 2 | **the cap** — `sum(log Q) + sum(log P) <= heongpu_128bit_std_parms(N)` | `context.cu:113` and `:223` |
+| 3 | **the prime range** — every bit size in `[30, 60]`, `N` in `[4096, 65536]` | `util.cu:253`, `context.cu:35` |
+
+Rule 1 runs **first**. At `P_size = 1` it degenerates to *every individual
+`q_i <= P`*.
+
+> **§24.5's island — `Q = {41, 33}`, `P = {33}`, "107 <= 109, legal by two bits"
+> — throws.** `41 > 33`, so `coefficient_validator` rejects it before the cap is
+> ever consulted. It throws with the security check OFF as well, which makes
+> this a fact about the library rather than about security.
+
+And the obvious repair costs exactly the margin it was inside by: raising `P`
+to 41 clears rule 1 and puts `log QP` at **115 > 109**, which rule 2 then
+rejects.
+
+### 26.3 What N = 4096 actually admits
+
+Rules 1 and 2 pull against each other — rule 1 forces `P` to be at least as big
+as the widest Q prime it covers, and rule 2 counts `P` against the same budget
+as `Q`. At one special and uniform `w`-bit primes that is `(L + 1) * w <= cap`.
+
+**The whole of it, at N = 4096:**
+
+* **two Q primes, one special, nothing above 36 bits.** `{36, 36}` over `{36}`
+  is 108 of 109 — **one usable multiplicative level**, at a 36-bit scale
+  ceiling.
+* **three Q primes are impossible at ANY prime sizes.** Asserted by exhaustive
+  search over every `(q0, q1, q2, |P|, p)` in the library's own bit range, not
+  argued.
+* **method II is unreachable.** Two specials cost at least 60 bits and two Q
+  primes another 60 — 120 against 109 before anything is chosen. So the island
+  is method I **necessarily**, and hoisted rotation trains, which need method
+  II, are unavailable there by construction.
+
+### 26.4 The block, priced
+
+`Llama3Batch16Operator::chain_limbs_for(S) = 25 + S + 1`. The binding stretch is
+the attention sublayer, and no seam splits it.
+
+| | worst stretch | chain | admissible at N = 4096 | over by |
+|---|---:|---:|---:|---:|
+| block tests' cheap fits | 17 | **43** | 2 | **21.5x** |
+| the headers' own defaults | 35 | **61** | 2 | **30.5x** |
+
+And the fixtures that actually run, rebuilt from their literal arguments:
+
+| | `log QP` | cap | |
+|---|---:|---:|---:|
+| block test, 3 limbs | 260 | 109 | 2.39x |
+| block test, 49 limbs | 2100 | 109 | 19.27x |
+| block profiler, 62 limbs | 2620 | 109 | **24.04x** |
+
+**The two special primes alone are 120 bits**, so no batch-16 context in this
+tree can be rescued by shortening `Q`.
+
+### 26.5 Raising the batch does not rescue the production block
+
+The batch axis is the ring axis (`N = 2 * batch * head_dim`), hence the security
+axis. At 33-bit primes and one special the ladder is exactly §24.1's table, and
+the module reproduces it from the library's rules rather than from the table:
+
+| batch | N | cap | admissible Q primes |
+|---:|---:|---:|---:|
+| 16 | 4096 | 109 | 2 |
+| 32 | 8192 | 218 | 5 |
+| 64 | 16384 | 438 | 12 |
+| 128 | 32768 | 881 | 25 |
+| 256 | 65536 | 1761 | **52** |
+
+Two consequences, both new:
+
+1. **A refresh needs 27 limbs, so it does not fit below logN 16.** Batch 256 is
+   the smallest batch in this family that can bootstrap **at all**; every
+   smaller one must put its refresh at another ring.
+2. **The production-degree block fits at NO ring.** 61 Q primes plus one special
+   costs at least `62 * 30 = 1860` bits at the library's own prime floor,
+   against the largest cap it has, 1761. **The longest chain 128-bit security
+   admits anywhere in this library is 57 Q primes.** The cheap-fit chain (43) is
+   inside that and is carried single-ring at batch 256; the production one is
+   not, at any batch, at any prime size.
+
+So **shortening the chain is a security lever and not only a speed one**, which
+is why §26.7 is part of this section rather than a separate optimisation note.
+
+### 26.6 The two-ring pair that does close, and what it costs
+
+Both halves must clear on their own — composite security is the MIN of the two
+rings and the secrets are tied by `s_small(X) = s_big(X^k)`.
+
+| ring | Q | P | `log QP` | cap | |
+|---|---|---|---:|---:|---|
+| island 2^12 | `36, 36` | `36` | **108** | 109 | ✔ |
+| big 2^16 | `36, 36, 33 x 41` | `40 x 8` | **1745** | 1761 | ✔ |
+
+Built by extension rather than rebuilt, so the value prefix
+`HERingSwitchOperator` requires (`ringswitch.cuh:83`) holds by construction.
+
+> **The island's prime ceiling reaches into the big ring's bootstrap.** The
+> shared prefix means the island's 36-bit ceiling *is* the big ring's `q0`, and
+> `q0` is what a bootstrap's scale ratio is measured against. So the tightest
+> cap in the system constrains the precision of a refresh taken at a ring
+> sixteen times bigger — and bootstrap v2's `q0 = 41` is **not available at any
+> admissible island**. That is a cost no level ledger shows.
+
+### 26.7 What was unoptimised, and what was done about it
+
+**`set_hoisted_crossings` did not exist on this path.** `Llama3RectOperator` has
+had it all along (`llama3_rect.cuh:923`); here the lever was reachable only
+inside `use_fast_bridge()`, which has **zero callers anywhere in the repo** and
+also resizes the cache and restates the BSGS split. Meanwhile
+`BatchSoftmaxSeamConfig::hoisted_crossings` defaults **true** and a `HoistGuard`
+turns hoisting on for the seam and off again after. So **every batch-16
+measurement to date hoisted the attention crossings and left the norm and
+SwiGLU bridges — the other 88% of the block's bridged columns — unhoisted.**
+The single-lever accessor is now there.
+
+**`plan_refresh` replaces a measured default with a derived one.** §25.6 found
+by hand that 3 of the 5 default seams suffice at one set of fit degrees. That
+answer is not portable, and the search is 64 subsets, so it belongs in the
+library:
+
+* minimised on **bootstraps, not seams** — five positions are `d_model`
+  ciphertexts and the sixth is `hidden`, 14,336 against 4,096, so counting seams
+  gets the answer wrong on the one that matters most;
+* **it distinguishes a first block from a repeating one**, which §25.6 did not.
+  A block handed a fresh chain has all of it to spend before its first refresh;
+  a block in the middle of a stack has whatever the previous block left. The
+  cheapest schedule for block 0 is **not** a legal schedule for block 1, and it
+  fails as a level underflow inside a sublayer rather than at a seam.
+
+At the measured cheap-fit map, chain 43:
+
+| | seams | bootstraps |
+|---|---:|---:|
+| header defaults | 5 | 30,720 |
+| cheapest **repeating** block | 4 (`entry`, `after_attention_norm`, `after_attention`, `after_feed_forward_norm`) | **16,384** |
+
+**-46.7% at an identical chain**, and the entry seam — off by default — is the
+one that makes it a fixed point. `plan_refresh` also reports **infeasible**
+rather than letting a too-short chain throw halfway through a block.
+
+### 26.8 Open
+
+1. **Nothing here is timed.** This section is parameter arithmetic and host-side
+   planning; the hoisting lever is now reachable and has not been measured on
+   this path.
+2. **The two-ring block is still not wired.** `HERingSwitchOperator` is a
+   complete, tested subsystem and **no Llama-3 module references it** —
+   `Llama3Batch16Operator` holds one `Llama3BatchOperator&` and that reference
+   is its only ring-bearing member. §24.5's placement remains a design, not a
+   code path.
+3. **The modulus budget is half of a 128-bit claim.** `heongpu_128bit_std_parms`
+   is tabulated for a **uniform ternary** secret; the CKKS secret key defaults
+   to hamming weight `n/2` and the bootstrapping drivers use sparser keys still.
+   `sparse_secret_caveat()` exists so a report cannot omit this half.
+4. **A 36-bit island ceiling has not been checked for precision.** §7 already
+   flagged 27-bit primes as precision-unverified against a `d = 128`
+   contraction; 36 is better and still unmeasured, and it is now forced rather
+   than chosen.

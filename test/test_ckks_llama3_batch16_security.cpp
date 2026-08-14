@@ -142,8 +142,12 @@ TEST(Batch16Security, AgreesWithTheContextOnEveryPlan)
         // Admissible, and only just: the largest uniform set N = 4096 has.
         {"island max uniform", plan_of(4096, {36, 36}, {36}),
          sec_level_type::sec128},
-        // One bit more and the cap rejects it.
-        {"island one bit over", plan_of(4096, {37, 36}, {36}),
+        // One bit more on q0 and the PAIR rule takes it, not the cap -- which
+        // is the trap this whole file exists for.
+        {"island, q0 one bit over P", plan_of(4096, {37, 36}, {36}),
+         sec_level_type::sec128},
+        // Widen the special to match and the cap takes it instead.
+        {"island, both widened", plan_of(4096, {37, 36}, {37}),
          sec_level_type::sec128},
         // Section 24.5's island. Rejected by the PAIR rule, not the cap.
         {"flow doc island", plan_of(4096, {41, 33}, {33}),

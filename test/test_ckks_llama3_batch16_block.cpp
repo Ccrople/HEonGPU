@@ -1291,6 +1291,83 @@ namespace
 
 // The sequence driver at one block has to BE the single-block driver. If this
 // drifts, the two entry points are two models.
+// ======================================================================
+// 8. The hoisting lever, which this path had no way to pull
+// ======================================================================
+
+// set_hoisted_crossings shares one key-switch decomposition across the 15
+// baby shifts instead of paying 15, so a bridged column costs 8 decompositions
+// instead of 22. Llama3RectOperator has exposed it all along; here it was
+// reachable only inside use_fast_bridge(), which has no callers, so every
+// batch-16 measurement to date ran with the norm and SwiGLU bridges unhoisted
+// while the SoftMax seam hoisted itself through its own config.
+//
+// The lever is only worth having if it changes nothing, and "nothing" has to
+// be asserted rather than assumed: hoisting reassociates a sum of products, so
+// the two paths differ in the last bits and must not differ in more than that.
+// A whole block is the right unit here because the seam restores the flag
+// afterwards, so a narrower test would measure the flag the seam sets rather
+// than the one the caller does.
+TEST(HEonGPU, CKKS_Llama3Batch16Block_HoistingTheBridgeChangesNoAnswer)
+{
+    llama::Batch16Shape shape = SmallShape();
+    shape.d_model = 4;
+    shape.hidden = 8;
+    BlockSetup s = make_block(shape, 8191u);
+    Fixture f(shape, s.limbs);
+
+    const int d = Fixture::d;
+    const auto x = f.random_batch(d, shape.d_model, 31337u, 0.5);
+
+    // Two special primes, so the context is METHOD_II and there IS a
+    // decomposition to share. Under METHOD_I hoisting is a no-op and this
+    // test would pass by testing nothing, which is worth ruling out.
+    const int specials = f.context->get_key_modulus_count() -
+                         f.context->get_ciphertext_modulus_count();
+    ASSERT_GT(specials, 1) << "hoisting needs KEYSWITCHING_METHOD_II";
+
+    ASSERT_FALSE(f.nl->hoisted_crossings())
+        << "the operator default is off, and the whole point of this test is "
+           "that it did not have to be";
+
+    llama::BatchActivation a0 =
+        f.op->encrypt(x, d, shape.d_model, *f.encryptor, f.scale);
+    llama::BatchActivation plain =
+        f.nl->transformer_block(a0, s.w, s.cfg, *f.galois, *f.relin);
+    const auto plain_out = f.op->decrypt(plain, *f.decryptor, f.scale);
+
+    f.nl->set_hoisted_crossings(true);
+    ASSERT_TRUE(f.nl->hoisted_crossings());
+    // The forwarding must reach the operator that owns the bridge, not stop
+    // at this one.
+    ASSERT_TRUE(f.op->hoisted_crossings());
+
+    llama::BatchActivation a1 =
+        f.op->encrypt(x, d, shape.d_model, *f.encryptor, f.scale);
+    llama::BatchActivation hoisted =
+        f.nl->transformer_block(a1, s.w, s.cfg, *f.galois, *f.relin);
+    const auto hoisted_out = f.op->decrypt(hoisted, *f.decryptor, f.scale);
+
+    const double worst = worst_abs(plain_out, hoisted_out);
+    const double magnitude = mean_abs(plain_out);
+    std::cout << "hoisted vs unhoisted, whole block: worst " << worst
+              << " on a mean magnitude of " << magnitude << std::endl;
+    ASSERT_FALSE(std::isnan(worst));
+    // Reassociation only. Judged on the ratio, because an absolute bound says
+    // nothing across shapes.
+    EXPECT_LT(worst, 1e-6 + 1e-4 * magnitude);
+
+    // And it goes back off, so a caller can A/B without rebuilding anything.
+    f.nl->set_hoisted_crossings(false);
+    EXPECT_FALSE(f.nl->hoisted_crossings());
+    EXPECT_FALSE(f.op->hoisted_crossings());
+
+    // use_fast_bridge reaches the same flag, which is what made the lever
+    // look present when it was not separately reachable.
+    f.nl->use_fast_bridge();
+    EXPECT_TRUE(f.nl->hoisted_crossings());
+}
+
 TEST(HEonGPU, CKKS_Llama3Batch16Block_SequenceBlockAtOneBlockMatchesTheBlock)
 {
     llama::Batch16Shape shape = SmallShape();
