@@ -1343,6 +1343,122 @@ namespace
     }
 } // namespace
 
+// ======================================================================
+// 7bis. Can the refresh and the bridge be the same operation here?
+// ======================================================================
+
+// The bridge is the entire cost of the non-linear half -- 22 key switches and
+// a level per column -- and the library has an entry point that looks like it
+// removes one. coeff_to_slot_bootstrapping (reached as
+// Llama3Operator::bootstrap_to_slots) runs ModRaise -> CoeffToSlot -> EvalMod
+// and stops, handing back the CoeffToSlot output instead of undoing it. On the
+// RECT path that IS the crossing, and refresh_to_slots there replaces
+// bootstrap() followed by to_slots().
+//
+// Whether it is the crossing HERE is a different question, and it turns on
+// what a batch matrix encryption's natural slot reading is. Kang's Definition
+// 2 puts entry (i, j) coordinate t at coefficient i + d*t
+// (batchmatrix.cu:325), and the k coordinates of one entry are an inverse
+// length-k DFT across the batch axis -- so the coefficients are not the
+// values, and the CKKS slot transform of them need not be either.
+//
+// Decided rather than argued. A DELTA in the value domain -- one (instance,
+// token) set to one and every other set to zero -- comes back from a
+// permutation as a delta and from a linear mixture spread over many slots.
+// Nothing about anyone's index conventions has to be agreed on to read that.
+TEST(HEonGPU, CKKS_Llama3Batch16Block_WhereAFusedRefreshLeavesTheValues)
+{
+    llama::Batch16Shape shape = SmallShape();
+    shape.d_model = 2;
+    shape.hidden = 4;
+    const heongpu::BootstrappingConfig boot(3, 3, 11);
+    const int limbs = llama::Llama3Batch16Operator::chain_limbs_for(2, boot);
+    BootFixture f(shape, limbs);
+
+    const int d = BootFixture::d;
+    const int instances = BootFixture::instances;
+    const int cols = shape.d_model;
+    const int slot_count = static_cast<int>(BootFixture::degree) / 2;
+
+    // Several probes rather than one, so a law can be read off rather than a
+    // single point, and so one unlucky cancellation cannot decide it.
+    const std::vector<std::pair<int, int>> probes{
+        {0, 0}, {1, 0}, {0, 1}, {3, 5}, {15, 127}};
+
+    int spread_total = 0;
+    for (const auto& probe : probes)
+    {
+        const int b0 = probe.first;
+        const int u0 = probe.second;
+
+        std::vector<std::vector<double>> x(
+            instances,
+            std::vector<double>(static_cast<size_t>(d) * cols, 0.0));
+        x[static_cast<size_t>(b0)][static_cast<size_t>(u0) * cols] = 1.0;
+
+        llama::BatchActivation a =
+            f.op->encrypt(x, d, cols, *f.encryptor, f.scale);
+
+        // The entry point wants the bottom of the chain -- exactly one active
+        // prime -- which is where a seam actually reaches it.
+        heongpu::Ciphertext<S> c = a.column[0];
+        f.op->arith().drop_to_depth(c, limbs - 1);
+
+        heongpu::Ciphertext<S> out =
+            f.op->arith().bootstrap_to_slots(c, *f.boot_key, *f.relin);
+
+        heongpu::Ciphertext<S> copy = out;
+        heongpu::Plaintext<S> plain(f.context);
+        f.decryptor->decrypt(plain, copy);
+        std::vector<double> got;
+        f.encoder->decode(got, plain);
+        ASSERT_GE(static_cast<int>(got.size()), slot_count);
+
+        double peak = 0.0;
+        int peak_at = -1;
+        for (int s = 0; s < slot_count; ++s)
+        {
+            if (std::abs(got[static_cast<size_t>(s)]) > peak)
+            {
+                peak = std::abs(got[static_cast<size_t>(s)]);
+                peak_at = s;
+            }
+        }
+        int spread = 0;
+        for (int s = 0; s < slot_count; ++s)
+        {
+            if (std::abs(got[static_cast<size_t>(s)]) > 0.05 * peak)
+            {
+                spread++;
+            }
+        }
+        spread_total += spread;
+
+        std::cout << "delta at (instance " << b0 << ", token " << u0
+                  << "): peak " << peak << " at slot " << peak_at
+                  << ", slots above 5% of peak: " << spread << " of "
+                  << slot_count << "   [to_slots would put it at "
+                  << f.nl->slot_of(b0, u0) << "]" << std::endl;
+    }
+
+    const double mean_spread =
+        static_cast<double>(spread_total) / static_cast<double>(probes.size());
+    std::cout << "mean spread per delta: " << mean_spread << " slots of "
+              << slot_count << std::endl;
+
+    // Asserted in the direction the encoding predicts: the coefficients of a
+    // batch matrix encryption are a length-k DFT of the values across the
+    // batch axis and a Vandermonde sum across the rows, so the natural slot
+    // reading should be a MIXTURE and the fused refresh cannot be the bridge
+    // here. If this ever fails the other way the saving is real and large --
+    // which is why the number is printed rather than only compared.
+    EXPECT_GT(mean_spread, 2.0)
+        << "a value-domain delta survived the fused refresh AS a delta: the "
+           "natural slot reading is the value layout on this encoding after "
+           "all, and refresh_to_slots would replace bootstrap() + to_slots() "
+           "the way it does on the rect path";
+}
+
 // The sequence driver at one block has to BE the single-block driver. If this
 // drifts, the two entry points are two models.
 // ======================================================================
