@@ -73,9 +73,12 @@
 //    that it does not do ciphertext-ciphertext multiplication. So attention
 //    needs a partner primitive (Kang's Algorithm 4) and a crossing to reach
 //    it, and that crossing is the whole remaining integration cost. See
-//    §25.10. What this module delivers end to end is the FEED-FORWARD half of
-//    a block -- RMSNorm, SwiGLU, three projections and two residuals -- which
-//    is four of a block's seven projections and both of its RMSNorms.
+//    §25.10. What this module delivers END TO END is the FEED-FORWARD half of
+//    a block: RMSNorm, three projections, the SiLU, the gate product and the
+//    residual -- three of a block's seven projections. rms_norm() and
+//    project() are not specific to that half and serve the attention
+//    sublayer's norm and its four projections equally; what is missing there
+//    is only Q K^T and P V.
 
 #ifndef HEONGPU_CKKS_LLAMA3_BAE_H
 #define HEONGPU_CKKS_LLAMA3_BAE_H
