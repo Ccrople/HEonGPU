@@ -1432,3 +1432,149 @@ TEST(HEonGPU, CKKS_Llama3Batch16Block_TwoTokenBlocksWithARefreshRun)
             }
     }
 }
+
+// ======================================================================
+// 8. Which seams are load-bearing
+// ======================================================================
+
+// The refresh schedule was shipped with six named seams and no evidence about
+// WHICH of them a batch-16 block actually needs. This measures it, and the
+// method is the only honest one available: run the block ONCE with the refresh
+// off, record the depth at every seam point in execution order, and read the
+// stretches off. That is valid because a stage's level spend is a property of
+// its operations and not of the depth it starts at -- which is exactly why a
+// bootstrap can be moved without changing anything else.
+//
+// Then the search is host arithmetic over the 32 subsets of the five optional
+// seams, and it costs nothing. What it reports is the chain each schedule
+// implies, which is the number a caller has to pick before it can run at all.
+TEST(HEonGPU, CKKS_Llama3Batch16Block_WhichRefreshSeamsAreLoadBearing)
+{
+    llama::Batch16Shape shape = SmallShape();
+    shape.d_model = 4;
+    shape.hidden = 8;
+    BlockSetup s = make_block(shape, 71u);
+    Fixture f(shape, s.limbs);
+
+    // Every seam point of the block, in the order the circuit reaches them.
+    // `feed_forward.hidden` is the SwiGLU's internal seam, which cannot be
+    // driven from outside the sublayer and is therefore a flag rather than a
+    // list entry -- but it splits a stretch exactly as the others do.
+    const std::vector<std::string> points{
+        "block.entry",          "block.after_attention_norm",
+        "block.after_attention", "block.mid",
+        "block.after_feed_forward_norm", "feed_forward.hidden",
+        "block.out"};
+
+    std::vector<std::pair<std::string, int>> trace;
+    f.nl->depth_trace = [&](const char* name, int depth)
+    { trace.emplace_back(name, depth); };
+
+    const int d = Fixture::d;
+    const auto x = f.random_batch(d, shape.d_model, 13579u, 0.5);
+    llama::BatchActivation a =
+        f.op->encrypt(x, d, shape.d_model, *f.encryptor, f.scale);
+    llama::BatchActivation out =
+        f.nl->transformer_block(a, s.w, s.cfg, *f.galois, *f.relin);
+    f.nl->depth_trace = nullptr;
+    ASSERT_FALSE(out.column.empty());
+
+    // First occurrence of each point, in trace order.
+    std::vector<int> depth(points.size(), -1);
+    for (const auto& entry : trace)
+        for (size_t i = 0; i < points.size(); ++i)
+            if (depth[i] < 0 && entry.first == points[i])
+                depth[i] = entry.second;
+    for (size_t i = 0; i < points.size(); ++i)
+        ASSERT_GE(depth[i], 0) << "the block never reached seam " << points[i];
+    for (size_t i = 1; i < points.size(); ++i)
+        ASSERT_GT(depth[i], depth[i - 1])
+            << "seam " << points[i] << " must come after " << points[i - 1];
+
+    std::cout << "seam depths:";
+    for (size_t i = 0; i < points.size(); ++i)
+        std::cout << "  " << points[i] << "=" << depth[i];
+    std::cout << std::endl;
+
+    const heongpu::BootstrappingConfig boot(3, 3, 11);
+    // The five optional seams are the interior points; entry and out are the
+    // block's boundaries and are not a choice.
+    const int optional = static_cast<int>(points.size()) - 2;
+
+    auto worst_stretch = [&](unsigned mask)
+    {
+        int worst = 0;
+        int last = depth.front();
+        for (int i = 1; i <= optional; ++i)
+            if (mask & (1u << (i - 1)))
+            {
+                worst = std::max(worst, depth[static_cast<size_t>(i)] - last);
+                last = depth[static_cast<size_t>(i)];
+            }
+        return std::max(worst, depth.back() - last);
+    };
+
+    int best_chain = 1 << 30;
+    for (unsigned mask = 0; mask < (1u << optional); ++mask)
+        best_chain = std::min(
+            best_chain,
+            llama::Llama3Batch16Operator::chain_limbs_for(worst_stretch(mask),
+                                                          boot));
+
+    // The cheapest schedule that reaches that chain: fewest refreshes, because
+    // every one of them is a bootstrap per column and the chain is the same.
+    unsigned cheapest = (1u << optional) - 1;
+    int cheapest_count = optional;
+    for (unsigned mask = 0; mask < (1u << optional); ++mask)
+    {
+        const int chain =
+            llama::Llama3Batch16Operator::chain_limbs_for(worst_stretch(mask),
+                                                          boot);
+        int count = 0;
+        for (int i = 0; i < optional; ++i)
+            count += (mask >> i) & 1;
+        if (chain == best_chain && count < cheapest_count)
+        {
+            cheapest_count = count;
+            cheapest = mask;
+        }
+    }
+
+    const int all_on = (1u << optional) - 1;
+    std::cout << "all " << optional << " seams: chain "
+              << llama::Llama3Batch16Operator::chain_limbs_for(
+                     worst_stretch(static_cast<unsigned>(all_on)), boot)
+              << " limbs, worst stretch "
+              << worst_stretch(static_cast<unsigned>(all_on)) << std::endl;
+    std::cout << "minimum chain " << best_chain << " limbs, reached with "
+              << cheapest_count << " seam(s):";
+    for (int i = 0; i < optional; ++i)
+        if (cheapest & (1u << i))
+            std::cout << " " << points[static_cast<size_t>(i + 1)];
+    std::cout << std::endl;
+
+    // Turning every seam on cannot beat the best schedule -- a refresh never
+    // lengthens a stretch -- so all-on is one of the minimisers.
+    EXPECT_EQ(llama::Llama3Batch16Operator::chain_limbs_for(
+                  worst_stretch(static_cast<unsigned>(all_on)), boot),
+              best_chain);
+
+    // THE FINDING, and it is what makes this test worth its runtime: some of
+    // the six are redundant. The attention sublayer is by far the deepest
+    // stretch on this path, so seams that split a stretch already shorter than
+    // it buy nothing and cost a bootstrap per column of the stream.
+    EXPECT_LT(cheapest_count, optional)
+        << "if this ever fails, every named seam has become load-bearing and "
+           "the schedule is no longer over-provisioned";
+
+    // And the binding stretch really is the attention sublayer's, which is
+    // where any further saving has to come from.
+    const int attention_stretch = depth[2] - depth[1];
+    std::cout << "the binding stretch is the attention sublayer at "
+              << attention_stretch << " levels" << std::endl;
+    EXPECT_EQ(best_chain, llama::Llama3Batch16Operator::chain_limbs_for(
+                              attention_stretch, boot))
+        << "the chain is set by the attention sublayer, so a shorter chain "
+           "needs a seam INSIDE it -- the SoftMax's refresh_denominator is "
+           "the one that exists";
+}
