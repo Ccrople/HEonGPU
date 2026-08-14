@@ -4062,10 +4062,10 @@ Now plumbed. **Measured, and it does not say what it was expected to say:**
 | from depth 30 of a 40-limb chain | wide track | auxiliary track |
 |---|---:|---:|
 | output depth | 39 | **33** |
-| worst error vs a host RMSNorm | 6.4e-04 | 9.1e-03 / 1.5e-02 (two runs) |
+| worst error vs a host RMSNorm | 6.4e-04 | 9.1e-03 / 1.5e-02 / 2.0e-02 (three runs) |
 
-**Six levels back, for about a decimal digit** — 15-25x, varying because a
-bootstrap is randomised. The expectation was that moving the fit off the
+**Six levels back, for about a decimal digit** — 14-32x, and variable, because
+a bootstrap is randomised and the summed square it refreshes is small. The expectation was that moving the fit off the
 exhausted end of the chain would *help* precision; it does not. Running a
 degree-15 Chebyshev on the last limb costs almost nothing, and a v1 refresh
 costs more than that by running at all. So `refresh_sum` is a

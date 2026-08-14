@@ -1433,12 +1433,14 @@ TEST(HEonGPU, CKKS_Llama3Batch16Block_RefreshSumMovesTheFitOffTheWideTrack)
     // noise.
     //
     // MEASURED, and it refutes the reason one might reach for this: the
-    // auxiliary track is NOT more accurate. 6.4e-04 for the wide track
-    // against 9.1e-03 and 1.5e-02 on two runs of the auxiliary one -- 15-25x,
-    // near enough a decimal digit, varying because a bootstrap is randomised.
-    // It is the bootstrap's own precision that pays. The fit does not lose
-    // accuracy by running on the last limb of the chain; a v1 refresh loses
-    // more than that by running at all.
+    // auxiliary track is NOT more accurate. 6.4e-04 for the wide track, and
+    // 9.1e-03 / 1.5e-02 / 2.0e-02 on three runs of the auxiliary one --
+    // 14-32x, near enough a decimal digit, and VARIABLE because a bootstrap is
+    // randomised. It is the bootstrap's own precision that pays, on a summed
+    // square whose magnitude is small; the fit loses almost nothing by running
+    // on the last limb of the chain, and a v1 refresh loses more by running at
+    // all. The bounds below are set from the spread rather than from the first
+    // sample, because a test that flakes is worse than a loose one.
     //
     // So refresh_sum is a LEVELS-for-PRECISION trade and nothing else. Worth
     // it where levels are the binding constraint, which on this path is the
@@ -1453,12 +1455,14 @@ TEST(HEonGPU, CKKS_Llama3Batch16Block_RefreshSumMovesTheFitOffTheWideTrack)
               << "x)" << std::endl;
     ASSERT_FALSE(std::isnan(aux_err));
 
-    // The contract: still accurate enough to be useful.
-    EXPECT_LT(aux_err, 1e-4 + 3e-2 * magnitude);
+    // The contract: still accurate enough to be useful. 6e-2 against a
+    // measured worst of 2.3e-2 relative, i.e. about 2.5x head-room on the
+    // widest of three samples.
+    EXPECT_LT(aux_err, 1e-4 + 6e-2 * magnitude);
     // And a bound on the trade, so that a real regression -- a wrong level, a
     // dropped rescale -- still trips even though the measured cost is a digit.
-    EXPECT_LT(aux_err, 50.0 * wide_err + 1e-4)
-        << "the auxiliary track costs about 14x here; far more than that is a "
+    EXPECT_LT(aux_err, 100.0 * wide_err + 1e-4)
+        << "the auxiliary track costs 14-32x here; far more than that is a "
            "defect rather than bootstrap precision";
 
     // And the other direction, which is why this is a flag and not a default:
