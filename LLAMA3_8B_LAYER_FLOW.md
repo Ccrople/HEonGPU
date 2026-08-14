@@ -2366,12 +2366,14 @@ algorithm and the paper's own thesis is a CPU-with-OpenBLAS one.
   `k` key switches per output ciphertext, `d1` per projection, which is the
   43,008 §25.2 already charged.
 * **MaMBo**, the bootstrap fusion (§25.3). The big one.
-* **wiring into the BLOCK.** `HEBaePcmmOperator::project()` is a drop-in for
-  a projection and all seven of a block's run on it (§25.7), but
-  `Llama3RectOperator` itself still calls Algorithm 5: the two do not agree on
-  the activation layout (§25.3), so switching the *block* over means moving
-  every crossing, not changing a call. The products are done; the seams are
-  not.
+* ~~**wiring into the BLOCK.**~~ **DONE for everything but attention — §25.9**,
+  and the premise of this bullet was wrong. It said switching the block over
+  "means moving every crossing"; at `k = 1` the product commutes with the
+  encoding, so outside attention the crossings do not move, they cease to
+  exist. `Llama3BaeOperator` runs RMSNorm, three projections, the SwiGLU and
+  the residual with **no Galois key at all**, at 18 levels against the rect
+  path's 26. Attention is the one seam left, and §25.10 says why it is a
+  boundary of the construction rather than of the implementation.
 * Algorithms 3 and 4 (precomputation), which delete the a-part GEMM entirely
   at the price of switching keys that depend on `U`. **This is the fix for
   §25.2's `k = 32` blowup** and is the obvious next step if the token axis
@@ -2459,3 +2461,171 @@ which is what "wrong secret" looks like and what "too much noise" does not.
 **Read this as a warning about the `k = 1` tests, not as reassurance.** Any
 property that is symmetric in the two ciphertext components is untestable at
 `k = 1`, and `k = 1` is the configuration everything else in §25 recommends.
+
+### 25.9 The block, and the crossings do not move — they cease to exist (2026-08-14)
+
+§25.5 left the block wiring open, and said switching it over "means moving
+every crossing, not changing a call". **That was the wrong shape of answer.**
+Outside attention there is nothing to move.
+
+**The observation.** At `k = 1` the Bae product is
+
+    out_i = sum_j U[i][j] * ct_j,
+
+a scalar multiply-accumulate over WHOLE ciphertexts. ModDecomp and ModPack are
+the identity, no coefficient ever meets another coefficient, and nothing inside
+a ciphertext is touched. A linear combination of whole ciphertexts commutes
+with every linear map — with the NTT, and therefore with the canonical
+embedding too. **So at `k = 1` the product does not care what a ciphertext
+encodes.** That is strictly stronger than §25.3's "projections chain with each
+other": it says the projection can be taken *in slot form*.
+
+**What follows.** Hold the stream as **one channel per ciphertext, tokens in
+the slots**. Then
+
+| leg | on this encoding |
+|---|---|
+| projection | the Bae product, in place, in slot form. 1 level, no rotation, no Galois key, no relinearisation, and with `set_transform_free` not even an NTT |
+| RMSNorm | the channel axis IS the ciphertext axis, so the sum of squares is an **addition across ciphertexts** — no rotation, no mask, no Galois key, no reduction level |
+| the learned gain | a per-channel **constant**, so it folds exactly into the next projection's weight on the host, for nothing |
+| SwiGLU | elementwise, so elementwise |
+| residual | an addition |
+
+None of those wants a coefficient reading, so **none of them crosses**. The
+eight crossings §25.3 inventoried do not relocate; outside attention they are
+gone, and with them every Galois key the sublayer owns. `Llama3BaeOperator`
+takes a `Relinkey` and nothing else, and **the test fixture holds no Galois key
+at all** — a rotation appearing anywhere in this path would not give a worse
+answer, it would fail to run.
+
+(This is the same structural fact `batch16-nonlinear` measured for Kang's
+Algorithm 1 — "a channel is a whole ciphertext, so RMSNorm's channel reduction
+is a slot-wise ADDITION" — reached without Algorithm 1's constraint that the
+batch size choose the ring.)
+
+#### The arithmetic is EXACTLY Algorithm 5's, and that is the point
+
+Both products cost **4 modular multiply-accumulates per (input channel, output
+channel, token) per RNS limb**, and the two derivations meet on the nose:
+
+* Algorithm 5, per call: `d * d * half * (N/d) * 2 = d * half * N * 2`, and a
+  call covers `half` in-channels by `half` out-channels by `d` tokens, so
+  `2N / half = 4`.
+* Bae at `k = 1` in slot form: `2 * d1 * d2 * N` per limb, carrying `N/2` real
+  tokens, so `2N / (N/2) = 4`.
+
+Same number for the same reason — each product touches the whole ring twice per
+unit of data. Density matches too: a RECT ciphertext carries `d * (N/2d)` =
+`N/2` values with its upper coefficients identically zero, and a slot-resident
+Bae ciphertext carries `N/2` tokens of one channel. **Same arithmetic, same
+working set, and zero key switches instead of `N/2` per call plus 2047 Galois
+keys.**
+
+So this configuration **dominates Algorithm 5 outright** on the feed-forward
+half. It is not a trade.
+
+There *is* a trade, and it is against the other Bae configuration:
+
+| | MACs per (in, out, token) per limb | crossings |
+|---|---:|---|
+| **A. slot-resident, `k = 1`** (built) | **4** | **0** |
+| B. coefficient-resident, `k = 1` | **2** | CoeffToSlot + SlotToCoeff at every non-linear layer |
+| C. rect / Algorithm 5 (today) | 4 | 8 levels in the feed-forward half alone |
+
+B is twice as cheap arithmetically because it fills all `N` coefficients rather
+than `N/2` real slots, and it cannot be had at the same time as A: packing two
+tokens per slot puts one of them on the imaginary axis, where a slot-wise SiLU
+does not evaluate the function you asked for. B's crossing is the bootstrap's
+own DFT and is what MaMBo would absorb (§25.3), so B is the configuration to
+revisit if MaMBo is ever built. **A is the one that works today.**
+
+#### Measured, Sicily GPU 2 — 13 of 13, and 15 of 15 on the product suite
+
+`N = 4096`, 64 tokens, decrypted against a host reference at every stage.
+
+**The level ledger of the feed-forward half, read off a run:**
+
+```
+block.entry                     depth  0
+block.after_feed_forward_norm   depth  8      RMSNorm            8
+block.after_feed_forward        depth 17      SwiGLU sublayer    9
+block.out                       depth 18      residual           1
+```
+
+Against the rect path's own measured table (`llama3_rect.cuh`, RMSNorm 12,
+"gate and up, to_slots, SiLU, the gate product" 10, "from_slots, W_down, the
+residual" 4):
+
+| | rect | Bae, slot-resident |
+|---|---:|---:|
+| RMSNorm | 12 | **8** |
+| SwiGLU sublayer + residual | 14 | **10** |
+| **feed-forward half** | **26** | **18** |
+| of which crossings | **8** | **0** |
+
+The decomposition checks: rect's norm is crossing 2 + square 1 + masked
+reduction 1 + degree-15 fit 5 + apply 1 + return crossing 2 = 12; this one is
+square 1 + degree-31 fit 6 + apply 1 = 8. The two non-crossing differences —
+rect's masked reduction (+1) and its lower fit degree (−1) — cancel, which is
+why the 8 levels saved are exactly the 8 crossing levels and not approximately
+them.
+
+**Other results:**
+
+* `AProjectionIsTakenInSlotFormAndMatchesTheHost` — the activation goes in
+  through `HEEncoder::encode` and comes back through `HEEncoder::decode`, which
+  a coefficient-encoded ciphertext does not survive. That the product is right
+  IS the statement that it commutes with the canonical embedding.
+  `HEBaePcmmOperator` was written entirely in the coefficient domain and knows
+  none of this.
+* `TheTransformFreePathAgreesWithTheTransformingOne` — dropping the INTT/NTT
+  round trip is **bit for bit** identical, asserted as exact equality, not to a
+  tolerance. Two transforms per ciphertext per projection, removed.
+* `FoldingTheGainIntoTheNextWeightIsExact` — the gain fold agrees with the
+  ciphertext multiply to 1e-4 and lands **one level shallower**.
+* `TheFeedForwardHalfOfABlockRunsWithNoGaloisKey` — RMSNorm, three projections,
+  a SiLU, a gate product and a residual, end to end, against a stage-by-stage
+  host reference, on a key set of one relinearisation key.
+
+#### Two library traps this cost a cycle each
+
+**`cipher_size_` is stale on every ciphertext that has met a product.**
+`relinearize_inplace` clears `relinearization_required_` and never writes
+`cipher_size_` back to 2, so the field reports three for the rest of that
+ciphertext's life. The Bae product was reading it as a guard and therefore
+rejected *every activation a real block hands to a projection* — RMSNorm's
+output, the SwiGLU's output, the whole sublayer. The flag is the library's
+authority and `operator.cuh` derives the size from it. **This is the identical
+fault the batch-16 merge found in Kang's `pcmm`**, in the same field, four
+weeks apart; outputs are now stamped rather than inheriting it.
+
+**Comparing two paths means comparing two paths on ONE ciphertext.** The
+transform-free test first encrypted twice and reported 3.4e-09 where the truth
+is zero — that number was the difference between two encryption noises, and it
+would have hidden a real divergence of the same size. Encrypt once, copy, and
+assert exact equality.
+
+### 25.10 Attention, and why it is not here
+
+It is not an oversight and it is not nearly ready. In this packing a score is
+
+    S[t][t'] = sum_c Q[c][t] * K[c][t'],
+
+and the token axis is the slot axis, so recovering the off-diagonal entries
+means one ciphertext-ciphertext product per (channel, token offset): `head_dim
+* tokens` per head. At `head_dim = 128` and 2048 tokens that is 262,144
+products a head and **8.4 million a sublayer**, against 22,528 for the whole
+feed-forward half. The score matrix is also quadratic in the very axis this
+encoding spends the ring on — `tokens^2` per head is 65,536 ciphertexts at the
+8B head count, about 51 GB at 12 limbs. Both numbers say the same thing:
+**attention cannot live in a packing whose ring is full of tokens.** Bae's
+paper says outright that it does not do ciphertext-ciphertext multiplication,
+so this is a boundary of the construction and not of the implementation.
+
+**The plan that follows from it, stated as a plan and not as a result.** Leave
+attention on Kang's Algorithm 4, which wants `d = 128` tokens per ciphertext,
+and cross only at its boundary — Q, K, V in and the value product out. The
+block then pays **2 crossings instead of 8**, both inside the attention
+sublayer, and the feed-forward half stays free. What that crossing costs is
+**not measured and not modelled here**: it is a gather across ciphertexts and
+slots (the transpose §25.3 named), and pricing it needs it built.
