@@ -334,6 +334,36 @@ namespace heongpu
                          HEArithmeticOperator<Scheme::CKKS>& ops,
                          bool rescale = true);
 
+
+        /**
+         * @brief A Llama projection, as Llama3RectOperator::project drives
+         *        Algorithm 5 -- but on the Bae product.
+         *
+         * This is the drop-in. It takes the weight in the transposed
+         * row-major form the host already stores (@c in_channels x
+         * @c out_channels, which is the transpose of the mathematical
+         * weight), transposes it for free on the host into Bae's U, encodes
+         * it at the prime the following rescale divides by so the product
+         * lands back on the activation's own scale one level down, runs the
+         * product, and spends the rescale.
+         *
+         * Orientation, restated because it is the one thing that cannot be
+         * chosen: the encrypted matrix is X^T, channels down the rows and
+         * TOKENS along the columns, because U must act on the channel axis
+         * and only left multiplication is available.
+         *
+         * @param out  Receives out_channels / k ciphertexts.
+         * @param x    in_channels / k ciphertexts.
+         */
+        void project(std::vector<Ciphertext<Scheme::CKKS>>& out,
+                     const std::vector<Ciphertext<Scheme::CKKS>*>& x,
+                     const std::vector<double>& weight, int in_channels,
+                     int out_channels,
+                     HEArithmeticOperator<Scheme::CKKS>& ops);
+
+        /** @brief The prime a rescale at this depth divides by. */
+        double rescale_prime(int depth) const;
+
         /**
          * @brief Cost model, in modular multiply-accumulates per RNS limb.
          *

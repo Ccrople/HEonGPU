@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <memory>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace
@@ -588,6 +589,99 @@ TEST(BaePcmm, ModPackKeysAreNotGeneratedAtKOne)
         f.ops->rescale_inplace(c);
     auto got = f.decrypt_matrix(out, d1, std::pow(2.0, 40));
     EXPECT_LT(max_abs_error(got, host_product(U, M, d1, d2, d3)), 1e-3);
+}
+
+
+// ---------------------------------------------------------------------------
+// All seven of a Llama-3 block's projections, on the Bae product
+// ---------------------------------------------------------------------------
+
+TEST(BaePcmm, EverySeventhBlockProjectionRunsOnTheBaeProduct)
+{
+    // The whole point of the exercise: every PCMM a Llama-3-8B block
+    // performs, run through the Bae product instead of Algorithm 5, at the
+    // real 128-token shape (k = 32) and therefore through ModPack. Widths are
+    // scaled down by 32 so the seven products fit alongside another user's
+    // job on a shared A6000; the SHAPE RATIOS are Llama-3-8B's exactly --
+    // d_model : kv : hidden = 128 : 32 : 448 is 4096 : 1024 : 14336 / 32.
+    const int d_model = 128, kv = 32, hidden = 448, tokens = 128;
+    BaeFixture f(12, tokens, {60, 40, 40, 40, 40, 40, 40, 40, 40});
+    const double ct_scale = std::pow(2.0, 40);
+    const int k = f.bae->k();
+    ASSERT_EQ(k, 32);
+
+    f.bae->generate_modpack_keys(*f.keygen, *f.secret, f.sk_coefficients);
+
+    // The activation is X^T: channels down the rows, tokens along the
+    // columns. That orientation is forced, not chosen.
+    auto X = random_matrix(d_model, tokens, 201, -0.5, 0.5);
+    auto ct = f.encrypt_matrix(X, d_model, ct_scale);
+    ASSERT_EQ(static_cast<int>(ct.size()), d_model / k);
+
+    struct Proj
+    {
+        const char* name;
+        int in_ch, out_ch;
+        unsigned seed;
+    };
+    const std::vector<Proj> projections = {
+        {"attn.q", d_model, d_model, 211}, {"attn.k", d_model, kv, 212},
+        {"attn.v", d_model, kv, 213},      {"attn.o", d_model, d_model, 214},
+        {"ffn.gate", d_model, hidden, 215}, {"ffn.up", d_model, hidden, 216},
+        {"ffn.down", hidden, d_model, 217},
+    };
+
+    // Six run off the residual stream; ffn.down needs a hidden-width input,
+    // so it is fed by ffn.up's own output, which also proves a Bae product
+    // consumes a Bae product with NO conversion between them.
+    std::vector<heongpu::Ciphertext<S>> up_out;
+    std::vector<double> up_ref;
+
+    for (const auto& p : projections)
+    {
+        auto W = random_matrix(p.in_ch, p.out_ch, p.seed, -0.1, 0.1);
+
+        std::vector<heongpu::Ciphertext<S>*> in;
+        const std::vector<double>* src_ref = &X;
+        int src_depth = 0;
+        if (std::string(p.name) == "ffn.down")
+        {
+            ASSERT_FALSE(up_out.empty()) << "ffn.up must have run first";
+            for (auto& c : up_out)
+                in.push_back(&c);
+            src_ref = &up_ref;
+            src_depth = up_out.front().depth();
+        }
+        else
+        {
+            for (auto& c : ct)
+                in.push_back(&c);
+        }
+
+        std::vector<heongpu::Ciphertext<S>> out;
+        f.bae->project(out, in, W, p.in_ch, p.out_ch, *f.ops);
+        ASSERT_EQ(static_cast<int>(out.size()), p.out_ch / k) << p.name;
+        EXPECT_EQ(out.front().depth(), src_depth + 1)
+            << p.name << " must spend exactly one level";
+
+        // Reference: U = W^T applied to the source matrix.
+        std::vector<double> U(static_cast<size_t>(p.out_ch) * p.in_ch);
+        for (int i = 0; i < p.in_ch; ++i)
+            for (int j = 0; j < p.out_ch; ++j)
+                U[static_cast<size_t>(j) * p.in_ch + i] =
+                    W[static_cast<size_t>(i) * p.out_ch + j];
+        auto want = host_product(U, *src_ref, p.out_ch, p.in_ch, tokens);
+
+        auto got = f.decrypt_matrix(out, p.out_ch, ct_scale);
+        const double err = max_abs_error(got, want);
+        EXPECT_LT(err, 5e-2) << p.name << " worst absolute error " << err;
+
+        if (std::string(p.name) == "ffn.up")
+        {
+            up_out = std::move(out);
+            up_ref = std::move(want);
+        }
+    }
 }
 
 int main(int argc, char** argv)

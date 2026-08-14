@@ -847,4 +847,53 @@ namespace heongpu
         HEONGPU_CUDA_CHECK(cudaDeviceSynchronize());
     }
 
+
+    double HEBaePcmmOperator<Scheme::CKKS>::rescale_prime(int depth) const
+    {
+        const int active = q_size_ - depth;
+        if (active < 1)
+            throw std::invalid_argument("no active limbs at that depth");
+        return static_cast<double>(
+            context_->get_key_modulus()[active - 1].value);
+    }
+
+    void HEBaePcmmOperator<Scheme::CKKS>::project(
+        std::vector<Ciphertext<Scheme::CKKS>>& out,
+        const std::vector<Ciphertext<Scheme::CKKS>*>& x,
+        const std::vector<double>& weight, int in_channels, int out_channels,
+        HEArithmeticOperator<Scheme::CKKS>& ops)
+    {
+        const int k = layout_.k;
+        if (static_cast<int>(x.size()) * k != in_channels)
+            throw std::invalid_argument(
+                "the activation must carry in_channels / k ciphertexts");
+        if (weight.size() != static_cast<size_t>(in_channels) *
+                                 static_cast<size_t>(out_channels))
+            throw std::invalid_argument(
+                "the weight must be in_channels by out_channels, row major, "
+                "which is the transpose of the mathematical weight");
+        if (out_channels % k != 0)
+            throw std::invalid_argument(
+                "out_channels must be a multiple of k");
+
+        BaeRange _r("BaePCMM.project");
+
+        // U = weight^T, out_channels x in_channels. A transpose on the host
+        // is free, and it is the only preparation this plaintext ever needs:
+        // no diagonals, no encoding, no NTT, no cache.
+        std::vector<double> U(static_cast<size_t>(out_channels) * in_channels);
+        for (int i = 0; i < in_channels; ++i)
+            for (int j = 0; j < out_channels; ++j)
+                U[static_cast<size_t>(j) * in_channels + i] =
+                    weight[static_cast<size_t>(i) * out_channels + j];
+
+        const int depth = x.front()->depth_;
+        upload_plaintext(U, out_channels, in_channels, depth,
+                         rescale_prime(depth));
+
+        pcmm_packed(out, x, ops, /*rescale=*/true);
+        for (auto& c : out)
+            ops.rescale_inplace(c);
+    }
+
 } // namespace heongpu
